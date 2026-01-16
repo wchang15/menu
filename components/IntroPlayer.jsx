@@ -4,7 +4,8 @@ import { useEffect, useRef, useState } from 'react';
 import { useRouter } from 'next/navigation';
 import { KEYS, loadLocalBlob, saveBlob, syncBlobFromCloud } from '@/lib/storage';
 import { getSignedAssetUrl, uploadAsset } from '@/lib/cloudAssets';
-import { getCurrentUser } from '@/lib/session';
+import { clearCurrentUser, setCurrentUser } from '@/lib/session';
+import { supabase } from '@/lib/supabaseClient';
 
 const LANG_KEY = 'APP_LANG_V1';
 const INTRO_ASSET_KEY = 'intro-video';
@@ -27,12 +28,25 @@ export default function IntroPlayer() {
   };
 
   useEffect(() => {
-    const current = getCurrentUser();
-    if (!current) {
-      router.replace('/login');
-      return;
-    }
-    setUserReady(true);
+    let alive = true;
+
+    (async () => {
+      const { data } = await supabase.auth.getSession();
+      const session = data?.session;
+
+      if (!session?.user?.id) {
+        clearCurrentUser();
+        router.replace('/login');
+        return;
+      }
+
+      setCurrentUser(session.user.id);
+      if (alive) setUserReady(true);
+    })();
+
+    return () => {
+      alive = false;
+    };
   }, [router]);
 
   useEffect(() => {

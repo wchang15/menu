@@ -12,7 +12,7 @@ import {
   syncBlobFromCloud,
   syncJsonFromCloud,
 } from '@/lib/storage';
-import { clearCurrentUser, getCurrentUser } from '@/lib/session';
+import { clearCurrentUser, setCurrentUser } from '@/lib/session';
 import { supabase } from '@/lib/supabaseClient';
 import CustomCanvas from './CustomCanvas';
 import TemplateCanvas from './TemplateCanvas';
@@ -283,13 +283,29 @@ export default function MenuEditor() {
   }, [userId]);
 
   useEffect(() => {
-    const current = getCurrentUser();
-    if (!current) {
-      router.replace('/login');
-      return;
-    }
-    setUserId(current);
-    setUserReady(true);
+    let alive = true;
+
+    (async () => {
+      const { data } = await supabase.auth.getSession();
+      const session = data?.session;
+
+      if (!session?.user?.id) {
+        clearCurrentUser();
+        router.replace('/login');
+        return;
+      }
+
+      const uid = session.user.id;
+      setCurrentUser(uid);
+      if (!alive) return;
+
+      setUserId(uid);
+      setUserReady(true);
+    })();
+
+    return () => {
+      alive = false;
+    };
   }, [router]);
 
   // ✅ 비밀번호 설정(변경) 모달
