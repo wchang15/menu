@@ -57,9 +57,10 @@ export default function IntroPlayer() {
     let cancelled = false;
 
     (async () => {
+      let localBlob = null;
       try {
         // 1) 로컬 캐시 (오프라인/즉시 렌더)
-        const localBlob = await loadLocalBlob(KEYS.INTRO_VIDEO);
+        localBlob = await loadLocalBlob(KEYS.INTRO_VIDEO);
         if (!cancelled && localBlob) setVideoBlob(localBlob);
       } catch {
         // ignore
@@ -67,36 +68,49 @@ export default function IntroPlayer() {
         if (!cancelled) setLoading(false);
       }
 
+      const hasLocal = !!localBlob;
+
       // 2) 원격 변경 여부 확인 후 필요할 때만 다운로드
       const syncResult = await syncBlobFromCloud(KEYS.INTRO_VIDEO, {
         onRemoteDiff: () => {
           if (!cancelled) setLoading(true);
         },
       });
+      const updated = !!syncResult?.data;
       if (!cancelled && syncResult?.data) {
         setVideoBlob(syncResult.data);
         setVideoUrl(null);
       }
       if (!cancelled) setLoading(false);
 
-      // 3) 원격 signed URL은 뒤에서 받아서 (가능하면) 스트리밍 + 캐시 갱신
-      try {
-        const signedUrl = await getSignedAssetUrl(INTRO_ASSET_KEY, { expiresInSec: 60 * 30 });
-        if (!cancelled && signedUrl) {
-          // 캐시 버스터(특히 iOS WebView)
-          setVideoUrl(`${signedUrl}${signedUrl.includes('?') ? '&' : '?'}v=${Date.now()}`);
-
-          // ✅ 오프라인 대비: 백그라운드로 파일을 내려받아 로컬 캐시에 저장(네트워크가 느려도 UX를 막지 않음)
-          // iOS WebView에서 큰 파일은 시간이 걸릴 수 있으니 실패해도 무시
-          fetch(`${signedUrl}${signedUrl.includes('?') ? '&' : '?'}dl=1`, { cache: 'no-store' })
-            .then((r) => (r.ok ? r.blob() : null))
-            .then((b) => {
-              if (b) return saveBlob(KEYS.INTRO_VIDEO, b);
-            })
-            .catch(() => {});
+      // 3) 원격 signed URL은 로컬이 없을 때만 사용
+      if (!hasLocal && !updated) {
+        try {
+          const signedUrl = await getSignedAssetUrl(INTRO_ASSET_KEY, { expiresInSec: 60 * 30 });
+          if (!cancelled && signedUrl) {
+            // 캐시 버스터(특히 iOS WebView)
+            setVideoUrl(`${signedUrl}${signedUrl.includes('?') ? '&' : '?'}v=${Date.now()}`);
+          }
+        } catch {
+          // ignore
         }
-      } catch {
-        // ignore
+      }
+
+      // 4) 로컬이 없거나 업데이트가 있으면 전체 다운로드로 캐시 갱신
+      if (!hasLocal || updated) {
+        try {
+          const signedUrl = await getSignedAssetUrl(INTRO_ASSET_KEY, { expiresInSec: 60 * 30 });
+          if (signedUrl) {
+            fetch(`${signedUrl}${signedUrl.includes('?') ? '&' : '?'}dl=1`, { cache: 'no-store' })
+              .then((r) => (r.ok ? r.blob() : null))
+              .then((b) => {
+                if (b) return saveBlob(KEYS.INTRO_VIDEO, b);
+              })
+              .catch(() => {});
+          }
+        } catch {
+          // ignore
+        }
       }
     })();
 
