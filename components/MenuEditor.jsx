@@ -350,7 +350,7 @@ export default function MenuEditor() {
   };
 
   const loadBackgrounds = useCallback(async (isCancelled) => {
-    setBgLoading(false);
+    setBgLoading(true);
     setBgAssetsReady(false);
     try {
       const bg = await loadLocalBlob(KEYS.MENU_BG);
@@ -371,6 +371,7 @@ export default function MenuEditor() {
       } catch {}
     } catch {}
 
+    if (!isCancelled?.()) setBgLoading(false);
     if (isCancelled?.()) return;
 
     try {
@@ -828,6 +829,10 @@ export default function MenuEditor() {
   };
 
   const submitPin = () => {
+    if (!(pinInput || '').trim()) {
+      setPinError(lang === 'ko' ? '비밀번호를 입력해 주세요.' : 'Please enter your PIN.');
+      return;
+    }
     if ((pinInput || '').trim() === pin) {
       setPinModalOpen(false);
       setEdit(true);
