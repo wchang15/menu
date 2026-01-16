@@ -124,7 +124,6 @@ export default function IntroPlayer() {
   // blob -> objectURL (로컬/동기화 blob 재생)
   useEffect(() => {
     if (!videoBlob) return;
-    if (videoUrl) return; // signed URL이 이미 있으면 덮어쓰지 않음
 
     const url = URL.createObjectURL(videoBlob);
     setVideoUrl(url);
@@ -132,7 +131,7 @@ export default function IntroPlayer() {
     return () => {
       URL.revokeObjectURL(url);
     };
-  }, [videoBlob, videoUrl]);
+  }, [videoBlob]);
 
   // 자동재생
   useEffect(() => {
