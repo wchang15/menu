@@ -129,6 +129,7 @@ const TEXT = {
     recoverSetPasswordLoading: 'Updating...',
   },
 };
+
 const INITIAL_LOGIN_FORM = { id: '', password: '' };
 const INITIAL_SIGNUP_FORM = { email: '', password: '', confirm: '', otp: '' };
 const INITIAL_OTP_STATE = { sending: false, sent: false, verifying: false, verified: false };
@@ -141,11 +142,15 @@ const INITIAL_PASSWORD_RECOVERY = {
   updating: false,
 };
 
+// ✅ “이미 가입된 이메일” 판단을 위한 안전 임계치(분)
+// - OTP verify 후 세션이 생겼는데, user.created_at이 너무 오래 전이면(기존 계정)
+// - 회원가입 플로우를 막고 비번찾기로 유도
+const EXISTING_ACCOUNT_CUTOFF_MS = 5 * 60 * 1000; // 5 minutes
+
 export default function LoginPage() {
   const router = useRouter();
 
   const [form, setForm] = useState(INITIAL_LOGIN_FORM);
-
   const [signUpForm, setSignUpForm] = useState(INITIAL_SIGNUP_FORM);
 
   const [activeView, setActiveView] = useState('login');
@@ -156,10 +161,7 @@ export default function LoginPage() {
   const [signUpMessageKey, setSignUpMessageKey] = useState(null);
   const [passwordRecoveryMessageKey, setPasswordRecoveryMessageKey] = useState(null);
 
-  const translate = useCallback(
-    (key) => TEXT[lang]?.[key] ?? TEXT.en[key] ?? key,
-    [lang]
-  );
+  const translate = useCallback((key) => TEXT[lang]?.[key] ?? TEXT.en[key] ?? key, [lang]);
 
   // ✅ 로그인 메시지/로딩
   const [loginMessage, setLoginMessage] = useState('');
@@ -224,13 +226,11 @@ export default function LoginPage() {
           .catch(() => {});
       }
     }
-  }, []);
+  }, [translate]);
 
   // ✅ 로그인 페이지 접근 시 세션/입력값 초기화
   useEffect(() => {
-    if (typeof window !== 'undefined' && window.location.hash.includes('type=recovery')) {
-      return;
-    }
+    if (typeof window !== 'undefined' && window.location.hash.includes('type=recovery')) return;
 
     supabase.auth
       .signOut()
@@ -278,7 +278,7 @@ export default function LoginPage() {
     return () => {
       authListener?.subscription?.unsubscribe();
     };
-  }, []);
+  }, [translate]);
 
   const handleChange = (event) => {
     const { name, value } = event.target;
@@ -296,10 +296,7 @@ export default function LoginPage() {
       const email = (form.id || '').trim();
       const password = form.password;
 
-      const { data, error } = await supabase.auth.signInWithPassword({
-        email,
-        password,
-      });
+      const { data, error } = await supabase.auth.signInWithPassword({ email, password });
 
       if (error) {
         setLoginMessage(error.message);
@@ -319,9 +316,10 @@ export default function LoginPage() {
   };
 
   /**
-   * ✅ 회원가입 완료 버튼 동작
-   * - 이메일 OTP 인증(verifyOtp) 성공 → 세션 생성 이후
-   * - updateUser({password})로 비번을 세팅하면 "이메일 인증 + 비밀번호 설정" 완료
+   * ✅ 회원가입 완료 버튼 동작 (방법 A)
+   * - OTP verify 성공 → 세션 생성됨
+   * - "기존 계정"이면 비밀번호 변경(덮어쓰기) 위험이 있으니 막고, 비번찾기로 유도
+   * - 신규 계정이면 updateUser({password})로 비밀번호 설정 후 가입 완료
    */
   const handleSignUp = async (event) => {
     event.preventDefault();
@@ -349,6 +347,28 @@ export default function LoginPage() {
     setIsSigningUp(true);
 
     try {
+      // ✅ 현재 로그인된 유저(verifyOtp로 세션 생김) 확인
+      const { data: userData, error: userErr } = await supabase.auth.getUser();
+      if (userErr || !userData?.user) {
+        setSignUpMessage(translate('signupGenericError'));
+        setSignUpMessageKey('signupGenericError');
+        return;
+      }
+
+      // ✅ 기존 계정 안전장치: created_at이 너무 오래전이면 "이미 가입된 이메일"로 처리
+      const createdAt = userData.user.created_at ? Date.parse(userData.user.created_at) : 0;
+      const ageMs = createdAt ? Date.now() - createdAt : 0;
+
+      if (createdAt && ageMs > EXISTING_ACCOUNT_CUTOFF_MS) {
+        setSignUpMessage(translate('signupExistingEmail'));
+        setSignUpMessageKey('signupExistingEmail');
+        // 기존 계정으로 로그인된 상태일 수 있으니 로그아웃 처리
+        await supabase.auth.signOut().catch(() => {});
+        setOtpState(INITIAL_OTP_STATE);
+        return;
+      }
+
+      // ✅ 신규 계정이면 비밀번호 세팅(회원가입 완료)
       const { data, error } = await supabase.auth.updateUser({ password: signUpForm.password });
 
       if (error) {
@@ -371,8 +391,9 @@ export default function LoginPage() {
   };
 
   /**
-   * ✅ 이메일 OTP 보내기
-   * - Supabase 설정이 8자리면 8자리로 옴 (앱에서 8자리 받도록 변경)
+   * ✅ 이메일 OTP 보내기 (방법 A)
+   * - "기존 유저 체크(shouldCreateUser:false)" 제거
+   * - 그냥 보내기만 함 (신규면 생성, 기존이면 로그인 OTP)
    */
   const handleSendEmailOtp = async () => {
     setSignUpMessage('');
@@ -394,31 +415,10 @@ export default function LoginPage() {
     }));
 
     try {
-      const { error: existingUserError } = await supabase.auth.signInWithOtp({
-        email,
-        options: {
-          shouldCreateUser: false,
-        },
-      });
-
-      if (!existingUserError) {
-        setSignUpMessage(translate('signupExistingEmail'));
-        setSignUpMessageKey('signupExistingEmail');
-        setOtpState((prev) => ({ ...prev, sending: false, sent: false }));
-        return;
-      }
-
-      const notFound = (existingUserError.message || '').toLowerCase().includes('not found');
-      if (!notFound) {
-        setSignUpMessage(existingUserError.message);
-        setSignUpMessageKey(null);
-        setOtpState((prev) => ({ ...prev, sending: false, sent: false }));
-        return;
-      }
-
       const { error } = await supabase.auth.signInWithOtp({
         email,
         options: {
+          // ✅ 핵심: 유저 없으면 생성 허용 (또는 options 자체 제거해도 됨)
           shouldCreateUser: true,
         },
       });
@@ -442,6 +442,8 @@ export default function LoginPage() {
 
   /**
    * ✅ 이메일 OTP 검증 (8자리)
+   * - verify 성공 시 세션 생성됨
+   * - 여기서 "기존 계정"이면 바로 안내하고 세션을 끊어서 비번 덮어쓰기 사고 방지
    */
   const handleVerifyEmailOtp = async () => {
     setSignUpMessage('');
@@ -462,7 +464,6 @@ export default function LoginPage() {
       return;
     }
 
-    // ✅ 8자리 숫자만
     if (!/^\d{8}$/.test(token)) {
       setSignUpMessage(translate('signupOtpInvalidFormat'));
       setSignUpMessageKey('signupOtpInvalidFormat');
@@ -485,8 +486,22 @@ export default function LoginPage() {
         return;
       }
 
-      if (data?.session?.user?.id) {
-        setCurrentUser(data.session.user.id);
+      const user = data?.session?.user;
+      if (user?.id) setCurrentUser(user.id);
+
+      // ✅ 기존 계정 안전장치 (verify 단계에서 바로 차단)
+      const createdAt = user?.created_at ? Date.parse(user.created_at) : 0;
+      const ageMs = createdAt ? Date.now() - createdAt : 0;
+
+      if (createdAt && ageMs > EXISTING_ACCOUNT_CUTOFF_MS) {
+        setSignUpMessage(translate('signupExistingEmail'));
+        setSignUpMessageKey('signupExistingEmail');
+        setOtpState((prev) => ({ ...prev, verifying: false, verified: false, sent: true }));
+
+        // 기존 계정으로 로그인된 세션이 생겼으니 끊어줌 (비번 덮어쓰기 방지)
+        await supabase.auth.signOut().catch(() => {});
+        clearCurrentUser();
+        return;
       }
 
       setOtpState((prev) => ({ ...prev, verifying: false, verified: true }));
@@ -914,12 +929,12 @@ export default function LoginPage() {
                   }}
                 >
                   {otpState.verifying ? translate('signupVerifyLoading') : translate('signupVerify')}
-              </button>
-            </div>
-            {otpState.verified && (
-              <div style={{ color: '#5ce1e6', fontSize: '13px' }}>{translate('signupVerifiedNotice')}</div>
-            )}
-          </label>
+                </button>
+              </div>
+              {otpState.verified && (
+                <div style={{ color: '#5ce1e6', fontSize: '13px' }}>{translate('signupVerifiedNotice')}</div>
+              )}
+            </label>
 
             <label style={{ display: 'flex', flexDirection: 'column', gap: '8px', color: '#d8dce5' }}>
               {translate('signupPasswordLabel')}
@@ -985,7 +1000,7 @@ export default function LoginPage() {
                 }}
               >
                 {isSigningUp ? translate('signupSubmitLoading') : translate('signupSubmit')}
-            </button>
+              </button>
 
               {!!signUpMessage && (
                 <div style={{ marginTop: '6px', color: '#f1b3b3', fontSize: '14px' }}>{signUpMessage}</div>

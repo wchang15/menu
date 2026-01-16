@@ -350,7 +350,7 @@ export default function MenuEditor() {
   };
 
   const loadBackgrounds = useCallback(async (isCancelled) => {
-    setBgLoading(false);
+    setBgLoading(true);
     setBgAssetsReady(false);
     try {
       const bg = await loadLocalBlob(KEYS.MENU_BG);
@@ -371,6 +371,7 @@ export default function MenuEditor() {
       } catch {}
     } catch {}
 
+    if (!isCancelled?.()) setBgLoading(false);
     if (isCancelled?.()) return;
 
     try {
@@ -642,53 +643,14 @@ export default function MenuEditor() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [bgUrl]);
 
-  const uploadAssetToCloud = async (file) => {
-    const { data } = await supabase.auth.getSession();
-    const token = data?.session?.access_token;
-
-    if (!token) {
-      throw new Error('로그인이 필요합니다. 다시 로그인해 주세요.');
-    }
-
+  const uploadAssetToCloud = async (file, assetKey, successMessage = '클라우드 업로드 완료!') => {
     setAssetUploading(true);
-    setAssetUploadMessage('업로드 URL 생성 중...');
+    setAssetUploadMessage('스토리지에 업로드 중...');
 
     try {
-      const presignResponse = await fetch('/api/assets/presign', {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-          Authorization: `Bearer ${token}`,
-        },
-        body: JSON.stringify({
-          filename: file.name,
-          contentType: file.type || 'application/octet-stream',
-          sizeBytes: file.size,
-        }),
-      });
-
-      if (!presignResponse.ok) {
-        const errBody = await presignResponse.json().catch(() => null);
-        throw new Error(errBody?.error || '업로드 URL 생성에 실패했습니다.');
-      }
-
-      const presign = await presignResponse.json();
-      setAssetUploadMessage('스토리지에 업로드 중...');
-
-      const uploadResponse = await fetch(presign.uploadUrl, {
-        method: 'PUT',
-        headers: {
-          'Content-Type': file.type || 'application/octet-stream',
-        },
-        body: file,
-      });
-
-      if (!uploadResponse.ok) {
-        throw new Error('파일 업로드에 실패했습니다.');
-      }
-
-      setAssetUploadMessage('클라우드 업로드 완료!');
-      return presign.path;
+      await saveBlob(assetKey, file);
+      setAssetUploadMessage(successMessage);
+      return assetKey;
     } catch (error) {
       setAssetUploadMessage(error.message || '업로드 중 문제가 발생했습니다.');
       throw error;
@@ -700,12 +662,11 @@ export default function MenuEditor() {
   const uploadBg = async (file) => {
     if (!file) return;
     try {
-      await uploadAssetToCloud(file);
+      await uploadAssetToCloud(file, KEYS.MENU_BG);
     } catch (e) {
       console.error(e);
     }
 
-    await saveBlob(KEYS.MENU_BG, file);
     setBgBlob(file);
     // ✅ 업로드 즉시 맨위로
     setTimeout(() => hardResetScrollTop('auto'), 0);
@@ -716,15 +677,14 @@ export default function MenuEditor() {
     if (!file) return;
 
     try {
-      await uploadAssetToCloud(file);
+      await uploadAssetToCloud(
+        file,
+        KEYS.INTRO_VIDEO,
+        lang === 'ko' ? '인트로 영상이 변경되었습니다.' : 'Intro video has been updated.'
+      );
     } catch (e) {
       console.error(e);
     }
-
-    await saveBlob(KEYS.INTRO_VIDEO, file);
-    setAssetUploadMessage(
-      lang === 'ko' ? '인트로 영상이 변경되었습니다.' : 'Intro video has been updated.'
-    );
 
     if (introVideoInputRef.current) {
       introVideoInputRef.current.value = '';
@@ -737,12 +697,11 @@ export default function MenuEditor() {
     if (!file || !Number.isFinite(p) || p < 1) return;
 
     try {
-      await uploadAssetToCloud(file);
+      await uploadAssetToCloud(file, bgPageKey(p));
     } catch (e) {
       console.error(e);
     }
 
-    await saveBlob(bgPageKey(p), file);
     setBgOverrides((prev) => ({ ...(prev || {}), [p]: file }));
 
     // overrides 인덱스 저장
@@ -870,6 +829,10 @@ export default function MenuEditor() {
   };
 
   const submitPin = () => {
+    if (!(pinInput || '').trim()) {
+      setPinError(lang === 'ko' ? '비밀번호를 입력해 주세요.' : 'Please enter your PIN.');
+      return;
+    }
     if ((pinInput || '').trim() === pin) {
       setPinModalOpen(false);
       setEdit(true);
