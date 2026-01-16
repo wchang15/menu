@@ -2,7 +2,7 @@
 'use client';
 
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
-import { usePathname, useRouter } from 'next/navigation';
+import { useRouter } from 'next/navigation';
 import {
   KEYS,
   loadLocalBlob,
@@ -220,7 +220,6 @@ const tpBtn = {
 
 export default function MenuEditor() {
   const router = useRouter();
-  const pathname = usePathname();
 
   // ✅ 기본 배경(전체 페이지 default)
   const [bgBlob, setBgBlob] = useState(null);
@@ -246,8 +245,8 @@ export default function MenuEditor() {
   const pageBgInputRef = useRef(null);
 
   const [dragOver, setDragOver] = useState(false);
-  const [loading, setLoading] = useState(true);
-  const [bgLoading, setBgLoading] = useState(true);
+  const [loading, setLoading] = useState(false);
+  const [bgLoading, setBgLoading] = useState(false);
   const [bgAssetsReady, setBgAssetsReady] = useState(false);
   const [assetUploading, setAssetUploading] = useState(false);
   const [assetUploadMessage, setAssetUploadMessage] = useState('');
@@ -353,8 +352,6 @@ export default function MenuEditor() {
   const loadBackgrounds = useCallback(async (isCancelled) => {
     setBgLoading(false);
     setBgAssetsReady(false);
-    setBgBlob(null);
-    setBgOverrides({});
     try {
       const bg = await loadLocalBlob(KEYS.MENU_BG);
       if (!isCancelled?.() && bg) setBgBlob(bg);
@@ -417,14 +414,13 @@ export default function MenuEditor() {
 
   useEffect(() => {
     if (!userReady) return;
-    if (pathname !== '/menu') return;
     let cancelled = false;
     const isCancelled = () => cancelled;
     loadBackgrounds(isCancelled);
     return () => {
       cancelled = true;
     };
-  }, [userReady, pathname, loadBackgrounds]);
+  }, [userReady, loadBackgrounds]);
 
   useEffect(() => {
     if (!userReady) return;
