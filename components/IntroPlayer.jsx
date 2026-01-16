@@ -2,7 +2,7 @@
 
 import { useEffect, useRef, useState } from 'react';
 import { useRouter } from 'next/navigation';
-import { KEYS, loadBlob, saveBlob } from '@/lib/storage';
+import { KEYS, loadLocalBlob, saveBlob, syncBlobFromCloud } from '@/lib/storage';
 import { getSignedAssetUrl, uploadAsset } from '@/lib/cloudAssets';
 import { getCurrentUser } from '@/lib/session';
 
@@ -15,7 +15,7 @@ export default function IntroPlayer() {
 
   const [videoBlob, setVideoBlob] = useState(null);
   const [videoUrl, setVideoUrl] = useState(null);
-  const [muted, setMuted] = useState(true); // 처음엔 음소거
+  const [muted, setMuted] = useState(true);
   const [loading, setLoading] = useState(true);
   const [userReady, setUserReady] = useState(false);
   const [lang, setLang] = useState('en');
@@ -38,28 +38,25 @@ export default function IntroPlayer() {
   useEffect(() => {
     try {
       const saved = localStorage.getItem(LANG_KEY);
-      if (saved === 'en' || saved === 'ko') {
-        setLang(saved);
-      }
+      if (saved === 'en' || saved === 'ko') setLang(saved);
     } catch {
       // ignore
     }
   }, []);
 
-
-  // ✅ 인트로 비디오 로드
-  // - 먼저 Signed URL(스트리밍)로 시도 → 매우 빠름(전체 Blob 다운로드 안 함)
-  // - 없으면 로컬 캐시(Blob) fallback
   useEffect(() => {
     if (!userReady) return;
 
-    // ✅ 0.1s 체감 목표: 로컬 캐시를 먼저 즉시 보여주고, 원격은 백그라운드로 갱신
     let cancelled = false;
 
+    const cacheBust = (url) => `${url}${url.includes('?') ? '&' : '?'}v=${Date.now()}`;
+
     (async () => {
+      let localBlob = null;
+
+      // 1) 로컬 먼저: 여기서 바로 화면이 떠야 함
       try {
-        // 1) 로컬 캐시 (오프라인/즉시 렌더)
-        const localBlob = await loadBlob(KEYS.INTRO_VIDEO);
+        localBlob = await loadLocalBlob(KEYS.INTRO_VIDEO);
         if (!cancelled && localBlob) setVideoBlob(localBlob);
       } catch {
         // ignore
@@ -67,24 +64,55 @@ export default function IntroPlayer() {
         if (!cancelled) setLoading(false);
       }
 
-      // 2) 원격 signed URL은 뒤에서 받아서 (가능하면) 스트리밍 + 캐시 갱신
-      try {
-        const signedUrl = await getSignedAssetUrl(INTRO_ASSET_KEY, { expiresInSec: 60 * 30 });
-        if (!cancelled && signedUrl) {
-          // 캐시 버스터(특히 iOS WebView)
-          setVideoUrl(`${signedUrl}${signedUrl.includes('?') ? '&' : '?'}v=${Date.now()}`);
+      const hasLocal = !!localBlob;
 
-          // ✅ 오프라인 대비: 백그라운드로 파일을 내려받아 로컬 캐시에 저장(네트워크가 느려도 UX를 막지 않음)
-          // iOS WebView에서 큰 파일은 시간이 걸릴 수 있으니 실패해도 무시
-          fetch(`${signedUrl}${signedUrl.includes('?') ? '&' : '?'}dl=1`, { cache: 'no-store' })
-            .then((r) => (r.ok ? r.blob() : null))
-            .then((b) => {
-              if (b) return saveBlob(KEYS.INTRO_VIDEO, b);
-            })
-            .catch(() => {});
+      // 2) 원격 변경 체크 + 필요할 때만 다운로드 (버전 다를 때만)
+      let syncedBlob = null;
+      try {
+        const syncResult = await syncBlobFromCloud(KEYS.INTRO_VIDEO, {
+          onRemoteDiff: () => {
+            if (!cancelled) setLoading(true);
+          },
+        });
+        syncedBlob = syncResult?.data || null;
+
+        if (!cancelled && syncedBlob) {
+          setVideoBlob(syncedBlob);
+          setVideoUrl(null); // blob URL 재생성 유도
         }
       } catch {
         // ignore
+      } finally {
+        if (!cancelled) setLoading(false);
+      }
+
+      // ✅ 여기부터 signed URL은 "필요할 때만" 1번만 받자
+      const needStream = !hasLocal && !syncedBlob; // 로컬도 없고, sync로도 못 받았을 때만 스트리밍 허용
+      const needDownloadToCache = !hasLocal && !syncedBlob; // 로컬 캐시가 아예 없을 때만 dl=1로 캐시 만들기 시도
+
+      if (!needStream && !needDownloadToCache) return;
+
+      let signedUrl = null;
+      try {
+        signedUrl = await getSignedAssetUrl(INTRO_ASSET_KEY, { expiresInSec: 60 * 30 });
+      } catch {
+        signedUrl = null;
+      }
+      if (cancelled || !signedUrl) return;
+
+      // 3) 스트리밍 URL 세팅 (로컬이 없을 때만)
+      if (needStream && !cancelled) {
+        setVideoUrl(cacheBust(signedUrl));
+      }
+
+      // 4) 로컬이 없을 때만: dl=1로 내려받아 로컬 캐시 생성 (중복 다운로드 방지)
+      if (needDownloadToCache) {
+        fetch(`${signedUrl}${signedUrl.includes('?') ? '&' : '?'}dl=1`, { cache: 'no-store' })
+          .then((r) => (r.ok ? r.blob() : null))
+          .then((b) => {
+            if (b) return saveBlob(KEYS.INTRO_VIDEO, b);
+          })
+          .catch(() => {});
       }
     })();
 
@@ -93,14 +121,10 @@ export default function IntroPlayer() {
     };
   }, [userReady]);
 
-  // blob -> objectURL (로컬 fallback일 때만)
+  // blob -> objectURL (로컬/동기화 blob 재생)
   useEffect(() => {
-    if (!videoBlob) {
-      return;
-    }
-
-    // 이미 Signed URL로 세팅된 경우엔 덮어쓰지 않음
-    if (videoUrl) return;
+    if (!videoBlob) return;
+    if (videoUrl) return; // signed URL이 이미 있으면 덮어쓰지 않음
 
     const url = URL.createObjectURL(videoBlob);
     setVideoUrl(url);
@@ -110,7 +134,7 @@ export default function IntroPlayer() {
     };
   }, [videoBlob, videoUrl]);
 
-  // 자동재생 시도
+  // 자동재생
   useEffect(() => {
     if (!videoUrl) return;
     const v = videoRef.current;
@@ -133,9 +157,8 @@ export default function IntroPlayer() {
       console.error(error);
     }
     await saveBlob(KEYS.INTRO_VIDEO, file);
-    // 업로드 직후에는 로컬 Blob로 즉시 반영(UX)
     setVideoBlob(file);
-    setVideoUrl(null); // blob URL 재생성 유도
+    setVideoUrl(null);
   };
 
   const goMenu = () => router.push('/menu');
@@ -149,7 +172,6 @@ export default function IntroPlayer() {
     }
   };
 
-  // 🔁 Sound On / Off 토글
   const toggleSound = async () => {
     const v = videoRef.current;
     if (!v) return;
@@ -165,7 +187,6 @@ export default function IntroPlayer() {
     }
   };
 
-  // ✅ 끝나면 메뉴로 가지 말고 다시 재생(루프 보강)
   const handleEnded = async () => {
     const v = videoRef.current;
     if (!v) return;
@@ -174,7 +195,6 @@ export default function IntroPlayer() {
       v.currentTime = 0;
       await v.play();
     } catch (e) {
-      // 일부 브라우저에서 autoplay 정책 때문에 실패할 수 있음
       console.log('Loop replay blocked:', e);
     }
   };
@@ -184,10 +204,7 @@ export default function IntroPlayer() {
       <div style={styles.langWrap}>
         <div style={styles.langRow}>
           <button
-            style={{
-              ...styles.langButton,
-              ...(lang === 'en' ? styles.langButtonActive : {}),
-            }}
+            style={{ ...styles.langButton, ...(lang === 'en' ? styles.langButtonActive : {}) }}
             onClick={() => setLanguage('en')}
             aria-label="English"
             title="English"
@@ -195,10 +212,7 @@ export default function IntroPlayer() {
             🇺🇸
           </button>
           <button
-            style={{
-              ...styles.langButton,
-              ...(lang === 'ko' ? styles.langButtonActive : {}),
-            }}
+            style={{ ...styles.langButton, ...(lang === 'ko' ? styles.langButtonActive : {}) }}
             onClick={() => setLanguage('ko')}
             aria-label="한국어"
             title="한국어"
@@ -207,6 +221,7 @@ export default function IntroPlayer() {
           </button>
         </div>
       </div>
+
       {loading ? null : !videoUrl ? (
         <div style={styles.uploadBox}>
           <input type="file" accept="video/*" onChange={(e) => upload(e.target.files?.[0])} />
@@ -220,18 +235,15 @@ export default function IntroPlayer() {
             autoPlay
             muted={muted}
             playsInline
-            loop // ✅ 기본 루프
-            onEnded={handleEnded} // ✅ 루프가 안 먹는 환경 대비 보강
+            loop
+            onEnded={handleEnded}
             style={styles.video}
           />
 
-          {/* 오른쪽 하단 버튼 */}
           <div style={styles.actionRow}>
             <button onClick={toggleSound} style={styles.soundBtn}>
               {muted ? T.soundOn : T.soundOff}
             </button>
-
-            {/* ✅ SKIP 대신 Go to Menu */}
             <button onClick={goMenu} style={styles.menuBtn}>
               {T.goMenu}
             </button>
