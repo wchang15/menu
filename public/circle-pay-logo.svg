@@ -1,0 +1,10 @@
+<svg width="360" height="140" viewBox="0 0 360 140" xmlns="http://www.w3.org/2000/svg" role="img" aria-labelledby="title desc">
+  <title id="title">Circle Pay Logo</title>
+  <desc id="desc">Rounded square with stylised letter C next to the Circle Pay wordmark.</desc>
+  <rect width="360" height="140" fill="white" rx="16"/>
+  <rect x="18" y="18" width="104" height="104" rx="24" fill="#2E3C9D"/>
+  <rect x="34" y="34" width="72" height="72" rx="16" fill="white"/>
+  <rect x="48" y="48" width="44" height="44" rx="10" fill="#E75231"/>
+  <rect x="54" y="54" width="32" height="32" rx="6" fill="white"/>
+  <text x="140" y="86" font-family="serif" font-size="48" fill="#161616">Circle Pay</text>
+</svg>
