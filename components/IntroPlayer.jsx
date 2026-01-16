@@ -77,30 +77,26 @@ export default function IntroPlayer() {
         },
       });
       const updated = !!syncResult?.data;
+      const syncedBlob = syncResult?.data || null;
       if (!cancelled && syncResult?.data) {
         setVideoBlob(syncResult.data);
         setVideoUrl(null);
       }
       if (!cancelled) setLoading(false);
 
-      // 3) 원격 signed URL은 로컬이 없을 때만 사용
-      if (!hasLocal && !updated) {
+      // 3) signed URL은 필요할 때만 한 번 요청해서 재사용
+      if (!hasLocal && (!updated || !syncedBlob)) {
         try {
           const signedUrl = await getSignedAssetUrl(INTRO_ASSET_KEY, { expiresInSec: 60 * 30 });
-          if (!cancelled && signedUrl) {
+          if (!signedUrl) return;
+
+          if (!cancelled && !hasLocal && !updated) {
             // 캐시 버스터(특히 iOS WebView)
             setVideoUrl(`${signedUrl}${signedUrl.includes('?') ? '&' : '?'}v=${Date.now()}`);
           }
-        } catch {
-          // ignore
-        }
-      }
 
-      // 4) 로컬이 없거나 업데이트가 있으면 전체 다운로드로 캐시 갱신
-      if (!hasLocal || updated) {
-        try {
-          const signedUrl = await getSignedAssetUrl(INTRO_ASSET_KEY, { expiresInSec: 60 * 30 });
-          if (signedUrl) {
+          // 4) 로컬이 없고, sync로 못 받은 경우에만 전체 다운로드
+          if (!hasLocal && !syncedBlob) {
             fetch(`${signedUrl}${signedUrl.includes('?') ? '&' : '?'}dl=1`, { cache: 'no-store' })
               .then((r) => (r.ok ? r.blob() : null))
               .then((b) => {
