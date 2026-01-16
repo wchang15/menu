@@ -3,7 +3,15 @@
 
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { usePathname, useRouter } from 'next/navigation';
-import { KEYS, loadBlob, saveBlob, loadJson, saveJson } from '@/lib/storage';
+import {
+  KEYS,
+  loadLocalBlob,
+  loadLocalJson,
+  saveBlob,
+  saveJson,
+  syncBlobFromCloud,
+  syncJsonFromCloud,
+} from '@/lib/storage';
 import { clearCurrentUser, getCurrentUser } from '@/lib/session';
 import { supabase } from '@/lib/supabaseClient';
 import CustomCanvas from './CustomCanvas';
@@ -342,37 +350,80 @@ export default function MenuEditor() {
     sc.scrollTo({ top: 0, behavior });
   };
 
-  const loadBackgrounds = useCallback(async () => {
-    setBgLoading(true);
+  const loadBackgrounds = useCallback(async (isCancelled) => {
+    setBgLoading(false);
     setBgAssetsReady(false);
     setBgBlob(null);
     setBgOverrides({});
     try {
-      const bg = await loadBlob(KEYS.MENU_BG);
-      if (bg) setBgBlob(bg);
+      const bg = await loadLocalBlob(KEYS.MENU_BG);
+      if (!isCancelled?.() && bg) setBgBlob(bg);
 
       // ✅ 페이지별 배경 오버라이드 로드
       try {
-        const overrides = (await loadJson(BG_OVERRIDES_KEY)) || {};
+        const overrides = (await loadLocalJson(BG_OVERRIDES_KEY)) || {};
         const pages = Object.keys(overrides || {});
         const map = {};
         for (const p of pages) {
           const pn = Number(p);
           if (!Number.isFinite(pn) || pn < 1) continue;
-          const blob = await loadBlob(bgPageKey(pn));
+          const blob = await loadLocalBlob(bgPageKey(pn));
           if (blob) map[pn] = blob;
         }
-        setBgOverrides(map);
+        if (!isCancelled?.()) setBgOverrides(map);
+      } catch {}
+    } catch {}
+
+    if (isCancelled?.()) return;
+
+    try {
+      const syncResult = await syncBlobFromCloud(KEYS.MENU_BG, {
+        onRemoteDiff: () => {
+          if (!isCancelled?.()) setBgLoading(true);
+        },
+      });
+      if (!isCancelled?.() && syncResult?.data) setBgBlob(syncResult.data);
+
+      try {
+        const overridesSync = await syncJsonFromCloud(BG_OVERRIDES_KEY, {
+          onRemoteDiff: () => {
+            if (!isCancelled?.()) setBgLoading(true);
+          },
+        });
+        const overrides = overridesSync?.data || (await loadLocalJson(BG_OVERRIDES_KEY)) || {};
+        const pages = Object.keys(overrides || {});
+        const map = {};
+        for (const p of pages) {
+          const pn = Number(p);
+          if (!Number.isFinite(pn) || pn < 1) continue;
+          const blobSync = await syncBlobFromCloud(bgPageKey(pn), {
+            onRemoteDiff: () => {
+              if (!isCancelled?.()) setBgLoading(true);
+            },
+          });
+          if (blobSync?.data) {
+            map[pn] = blobSync.data;
+          } else {
+            const localBlob = await loadLocalBlob(bgPageKey(pn));
+            if (localBlob) map[pn] = localBlob;
+          }
+        }
+        if (!isCancelled?.()) setBgOverrides(map);
       } catch {}
     } catch {} finally {
-      setBgLoading(false);
+      if (!isCancelled?.()) setBgLoading(false);
     }
   }, []);
 
   useEffect(() => {
     if (!userReady) return;
     if (pathname !== '/menu') return;
-    loadBackgrounds();
+    let cancelled = false;
+    const isCancelled = () => cancelled;
+    loadBackgrounds(isCancelled);
+    return () => {
+      cancelled = true;
+    };
   }, [userReady, pathname, loadBackgrounds]);
 
   useEffect(() => {
@@ -400,12 +451,12 @@ export default function MenuEditor() {
 
   useEffect(() => {
     if (!userReady) return;
+    let cancelled = false;
     (async () => {
-      setLoading(true);
       try {
         const key = menuLayoutKey(lang);
-        const saved = await loadJson(key);
-        const legacy = saved ? null : await loadJson(KEYS.MENU_LAYOUT);
+        const saved = await loadLocalJson(key);
+        const legacy = saved ? null : await loadLocalJson(KEYS.MENU_LAYOUT);
         const lay = saved || legacy || DEFAULT_LAYOUT;
 
         const safeLay = {
@@ -413,18 +464,40 @@ export default function MenuEditor() {
           ...(lay || {}),
           templateData: lay?.templateData ?? null,
         };
-        setLayout(safeLay);
+        if (!cancelled) setLayout(safeLay);
 
         if (!saved && legacy) {
           await saveJson(key, safeLay);
         }
 
         // ✅ 로드 직후 스크롤 잔상 방지
-        setTimeout(() => hardResetScrollTop('auto'), 0);
+        if (!cancelled) setTimeout(() => hardResetScrollTop('auto'), 0);
       } finally {
-        setLoading(false);
+        if (!cancelled) setLoading(false);
       }
+
+      const syncResult = await syncJsonFromCloud(menuLayoutKey(lang), {
+        onRemoteDiff: () => {
+          if (!cancelled) setLoading(true);
+        },
+      });
+      if (!cancelled && syncResult?.data) {
+        const remoteLay = syncResult.data;
+        const safeLay = {
+          ...DEFAULT_LAYOUT,
+          ...(remoteLay || {}),
+          templateData: remoteLay?.templateData ?? null,
+        };
+        setLayout(safeLay);
+        setTimeout(() => hardResetScrollTop('auto'), 0);
+      }
+
+      if (!cancelled) setLoading(false);
     })();
+
+    return () => {
+      cancelled = true;
+    };
   }, [userReady, lang]);
 
   // ✅ 보기 모드에서 텍스트 길게 눌러도 선택/터치 콜아웃이 뜨지 않도록 body 단위 차단
@@ -678,7 +751,7 @@ export default function MenuEditor() {
 
     // overrides 인덱스 저장
     try {
-      const nextIndex = { ...(await loadJson(BG_OVERRIDES_KEY)) };
+      const nextIndex = { ...(await loadLocalJson(BG_OVERRIDES_KEY)) };
       nextIndex[p] = true;
       await saveJson(BG_OVERRIDES_KEY, nextIndex);
     } catch {
@@ -700,7 +773,7 @@ export default function MenuEditor() {
     });
 
     try {
-      const idx = (await loadJson(BG_OVERRIDES_KEY)) || {};
+      const idx = (await loadLocalJson(BG_OVERRIDES_KEY)) || {};
       const nextIdx = { ...(idx || {}) };
       delete nextIdx[p];
       await saveJson(BG_OVERRIDES_KEY, nextIdx);

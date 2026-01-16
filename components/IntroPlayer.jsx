@@ -2,7 +2,7 @@
 
 import { useEffect, useRef, useState } from 'react';
 import { useRouter } from 'next/navigation';
-import { KEYS, loadBlob, saveBlob } from '@/lib/storage';
+import { KEYS, loadLocalBlob, saveBlob, syncBlobFromCloud } from '@/lib/storage';
 import { getSignedAssetUrl, uploadAsset } from '@/lib/cloudAssets';
 import { getCurrentUser } from '@/lib/session';
 
@@ -59,7 +59,7 @@ export default function IntroPlayer() {
     (async () => {
       try {
         // 1) 로컬 캐시 (오프라인/즉시 렌더)
-        const localBlob = await loadBlob(KEYS.INTRO_VIDEO);
+        const localBlob = await loadLocalBlob(KEYS.INTRO_VIDEO);
         if (!cancelled && localBlob) setVideoBlob(localBlob);
       } catch {
         // ignore
@@ -67,7 +67,19 @@ export default function IntroPlayer() {
         if (!cancelled) setLoading(false);
       }
 
-      // 2) 원격 signed URL은 뒤에서 받아서 (가능하면) 스트리밍 + 캐시 갱신
+      // 2) 원격 변경 여부 확인 후 필요할 때만 다운로드
+      const syncResult = await syncBlobFromCloud(KEYS.INTRO_VIDEO, {
+        onRemoteDiff: () => {
+          if (!cancelled) setLoading(true);
+        },
+      });
+      if (!cancelled && syncResult?.data) {
+        setVideoBlob(syncResult.data);
+        setVideoUrl(null);
+      }
+      if (!cancelled) setLoading(false);
+
+      // 3) 원격 signed URL은 뒤에서 받아서 (가능하면) 스트리밍 + 캐시 갱신
       try {
         const signedUrl = await getSignedAssetUrl(INTRO_ASSET_KEY, { expiresInSec: 60 * 30 });
         if (!cancelled && signedUrl) {
