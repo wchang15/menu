@@ -2,7 +2,7 @@
 
 import { useEffect, useRef, useState } from 'react';
 import { useRouter } from 'next/navigation';
-import { KEYS, loadBlob, saveBlob } from '@/lib/storage';
+import { KEYS, loadLocalBlob, saveBlob, syncBlobFromCloud } from '@/lib/storage';
 import { getSignedAssetUrl, uploadAsset } from '@/lib/cloudAssets';
 import { getCurrentUser } from '@/lib/session';
 
@@ -57,9 +57,10 @@ export default function IntroPlayer() {
     let cancelled = false;
 
     (async () => {
+      let localBlob = null;
       try {
         // 1) 로컬 캐시 (오프라인/즉시 렌더)
-        const localBlob = await loadBlob(KEYS.INTRO_VIDEO);
+        localBlob = await loadLocalBlob(KEYS.INTRO_VIDEO);
         if (!cancelled && localBlob) setVideoBlob(localBlob);
       } catch {
         // ignore
@@ -67,24 +68,45 @@ export default function IntroPlayer() {
         if (!cancelled) setLoading(false);
       }
 
-      // 2) 원격 signed URL은 뒤에서 받아서 (가능하면) 스트리밍 + 캐시 갱신
-      try {
-        const signedUrl = await getSignedAssetUrl(INTRO_ASSET_KEY, { expiresInSec: 60 * 30 });
-        if (!cancelled && signedUrl) {
-          // 캐시 버스터(특히 iOS WebView)
-          setVideoUrl(`${signedUrl}${signedUrl.includes('?') ? '&' : '?'}v=${Date.now()}`);
+      const hasLocal = !!localBlob;
 
-          // ✅ 오프라인 대비: 백그라운드로 파일을 내려받아 로컬 캐시에 저장(네트워크가 느려도 UX를 막지 않음)
-          // iOS WebView에서 큰 파일은 시간이 걸릴 수 있으니 실패해도 무시
-          fetch(`${signedUrl}${signedUrl.includes('?') ? '&' : '?'}dl=1`, { cache: 'no-store' })
-            .then((r) => (r.ok ? r.blob() : null))
-            .then((b) => {
-              if (b) return saveBlob(KEYS.INTRO_VIDEO, b);
-            })
-            .catch(() => {});
+      // 2) 원격 변경 여부 확인 후 필요할 때만 다운로드
+      const syncResult = await syncBlobFromCloud(KEYS.INTRO_VIDEO, {
+        onRemoteDiff: () => {
+          if (!cancelled) setLoading(true);
+        },
+      });
+      const updated = !!syncResult?.data;
+      const syncedBlob = syncResult?.data || null;
+      if (!cancelled && syncResult?.data) {
+        setVideoBlob(syncResult.data);
+        setVideoUrl(null);
+      }
+      if (!cancelled) setLoading(false);
+
+      // 3) signed URL은 필요할 때만 한 번 요청해서 재사용
+      if (!hasLocal && (!updated || !syncedBlob)) {
+        try {
+          const signedUrl = await getSignedAssetUrl(INTRO_ASSET_KEY, { expiresInSec: 60 * 30 });
+          if (!signedUrl) return;
+
+          if (!cancelled && !hasLocal && !updated) {
+            // 캐시 버스터(특히 iOS WebView)
+            setVideoUrl(`${signedUrl}${signedUrl.includes('?') ? '&' : '?'}v=${Date.now()}`);
+          }
+
+          // 4) 로컬이 없고, sync로 못 받은 경우에만 전체 다운로드
+          if (!hasLocal && !syncedBlob) {
+            fetch(`${signedUrl}${signedUrl.includes('?') ? '&' : '?'}dl=1`, { cache: 'no-store' })
+              .then((r) => (r.ok ? r.blob() : null))
+              .then((b) => {
+                if (b) return saveBlob(KEYS.INTRO_VIDEO, b);
+              })
+              .catch(() => {});
+          }
+        } catch {
+          // ignore
         }
-      } catch {
-        // ignore
       }
     })();
 
