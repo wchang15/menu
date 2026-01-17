@@ -18,6 +18,9 @@ export default function IntroPlayer() {
   const [videoUrl, setVideoUrl] = useState(null);
   const [muted, setMuted] = useState(true);
   const [loading, setLoading] = useState(true);
+  // ✅ 로컬/클라우드에서 인트로가 "있는지" 확인되기 전까지는
+  //    업로드 박스가 잠깐 뜨는 플래시를 막기 위한 상태
+  const [introResolved, setIntroResolved] = useState(false);
   const [userReady, setUserReady] = useState(false);
   const [lang, setLang] = useState('en');
 
@@ -93,6 +96,8 @@ export default function IntroPlayer() {
     const cacheBust = (url) => `${url}${url.includes('?') ? '&' : '?'}v=${Date.now()}`;
 
     (async () => {
+      // ✅ 로그인 직후: 아직 인트로가 있는지 없는지 확정 전
+      setIntroResolved(false);
       let localBlob = null;
 
       // 1) 로컬 먼저: 여기서 바로 화면이 떠야 함
@@ -102,7 +107,11 @@ export default function IntroPlayer() {
       } catch {
         // ignore
       } finally {
-        if (!cancelled) setLoading(false);
+        // 로컬이 있으면 여기서 바로 끝(바로 재생)
+        if (!cancelled && localBlob) {
+          setIntroResolved(true);
+          setLoading(false);
+        }
       }
 
       const hasLocal = !!localBlob;
@@ -120,11 +129,16 @@ export default function IntroPlayer() {
         if (!cancelled && syncedBlob) {
           setVideoBlob(syncedBlob);
           setVideoUrl(null); // blob URL 재생성 유도
+          setIntroResolved(true);
         }
       } catch {
         // ignore
       } finally {
-        if (!cancelled) setLoading(false);
+        if (!cancelled) {
+          // 로컬/원격 모두 확인 끝
+          setIntroResolved(true);
+          setLoading(false);
+        }
       }
 
       // ✅ 여기부터 signed URL은 "필요할 때만" 1번만 받자
@@ -262,7 +276,8 @@ export default function IntroPlayer() {
         </div>
       </div>
 
-      {loading ? null : !videoUrl ? (
+      {/* ✅ 확인 전/Blob->URL 변환 중에는 업로드 박스를 보여주지 않음(플래시 방지) */}
+      {loading || !introResolved || (videoBlob && !videoUrl) ? null : !videoUrl ? (
         <div style={styles.uploadBox}>
           <input type="file" accept="video/*" onChange={(e) => upload(e.target.files?.[0])} />
         </div>

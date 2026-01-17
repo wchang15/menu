@@ -30,6 +30,11 @@ const LONG_PRESS_MS = 3000;
 const PIN_KEY = 'MENU_EDITOR_PIN_V1';
 const DEFAULT_PIN = '0000';
 
+// ✅ Blob/File 체크 (createObjectURL 안전)
+const isBlobLike = (v) =>
+  v && (typeof Blob !== 'undefined') && (v instanceof Blob || v instanceof File);
+
+
 // ✅ 언어
 const LANG_KEY = 'APP_LANG_V1';
 
@@ -47,10 +52,16 @@ const PAGE_WIDTH = 1080;
 // ✅ T2 사진 슬롯과 동일
 const MAX_PHOTOS = 8;
 
-// ✅✅ 페이지별 배경 오버라이드 저장 키
-const BG_OVERRIDES_KEY = 'MENU_BG_OVERRIDES_V1';
-// 각 페이지 blob 키: `${KEYS.MENU_BG}__P${page}`
-const bgPageKey = (page) => `${KEYS.MENU_BG}__P${page}`;
+// ✅✅ 페이지별 배경 오버라이드 저장 키 (언어별로 분리)
+const LEGACY_BG_OVERRIDES_KEY = 'MENU_BG_OVERRIDES_V1';
+const bgOverridesKey = (language) => `MENU_BG_OVERRIDES_V1_${language || 'en'}`;
+
+// ✅ 기본 배경 키도 언어별로 분리
+const menuBgKey = (language) => `${KEYS.MENU_BG}_${language || 'en'}`;
+
+// 각 페이지 blob 키: `${menuBgKey(lang)}__P${page}`
+const bgPageKey = (page, language) => `${menuBgKey(language)}__P${page}`;
+const legacyBgPageKey = (page) => `${KEYS.MENU_BG}__P${page}`;
 
 // ✅ 보기모드 페이지 전환 튜닝
 const TURN_ANIM_MS = 320;
@@ -388,19 +399,37 @@ export default function MenuEditor() {
     setBgLoading(true);
     setBgAssetsReady(false);
     try {
-      const bg = await loadLocalBlob(KEYS.MENU_BG);
-      if (!isCancelled?.() && bg) setBgBlob(bg);
+      const bgKey = menuBgKey(lang);
+      const localBgLang = await loadLocalBlob(bgKey);
+      const localBgLegacy = localBgLang ? null : await loadLocalBlob(KEYS.MENU_BG);
+      const bg = localBgLang || localBgLegacy;
+      // ✅ legacy -> language key migrate (1회)
+      if (!localBgLang && localBgLegacy) {
+        try { await saveBlob(bgKey, localBgLegacy); } catch {}
+      }
+      if (!isCancelled?.() && isBlobLike(bg)) setBgBlob(bg);
 
       // ✅ 페이지별 배경 오버라이드 로드
       try {
-        const overrides = (await loadLocalJson(BG_OVERRIDES_KEY)) || {};
+        const idxKey = bgOverridesKey(lang);
+        const overridesLang = await loadLocalJson(idxKey);
+        const overridesLegacy = overridesLang ? null : await loadLocalJson(LEGACY_BG_OVERRIDES_KEY);
+        const overrides = overridesLang || overridesLegacy || {};
+        if (!overridesLang && overridesLegacy) {
+          try { await saveJson(idxKey, overridesLegacy); } catch {}
+        }
         const pages = Object.keys(overrides || {});
         const map = {};
         for (const p of pages) {
           const pn = Number(p);
           if (!Number.isFinite(pn) || pn < 1) continue;
-          const blob = await loadLocalBlob(bgPageKey(pn));
-          if (blob) map[pn] = blob;
+          const blobLang = await loadLocalBlob(bgPageKey(pn, lang));
+          const blobLegacy = blobLang ? null : await loadLocalBlob(legacyBgPageKey(pn));
+          const blob = blobLang || blobLegacy;
+          if (!blobLang && blobLegacy) {
+            try { await saveBlob(bgPageKey(pn, lang), blobLegacy); } catch {}
+          }
+          if (isBlobLike(blob)) map[pn] = blob;
         }
         if (!isCancelled?.()) setBgOverrides(map);
       } catch {}
@@ -410,35 +439,35 @@ export default function MenuEditor() {
     if (isCancelled?.()) return;
 
     try {
-      const syncResult = await syncBlobFromCloud(KEYS.MENU_BG, {
+      const syncResult = await syncBlobFromCloud(menuBgKey(lang), {
         onRemoteDiff: () => {
           if (!isCancelled?.()) setBgLoading(true);
         },
       });
-      if (!isCancelled?.() && syncResult?.data) setBgBlob(syncResult.data);
+      if (!isCancelled?.() && isBlobLike(syncResult?.data)) setBgBlob(syncResult.data);
 
       try {
-        const overridesSync = await syncJsonFromCloud(BG_OVERRIDES_KEY, {
+        const overridesSync = await syncJsonFromCloud(bgOverridesKey(lang), {
           onRemoteDiff: () => {
             if (!isCancelled?.()) setBgLoading(true);
           },
         });
-        const overrides = overridesSync?.data || (await loadLocalJson(BG_OVERRIDES_KEY)) || {};
+        const overrides = overridesSync?.data || (await loadLocalJson(bgOverridesKey(lang))) || (await loadLocalJson(LEGACY_BG_OVERRIDES_KEY)) || {};
         const pages = Object.keys(overrides || {});
         const map = {};
         for (const p of pages) {
           const pn = Number(p);
           if (!Number.isFinite(pn) || pn < 1) continue;
-          const blobSync = await syncBlobFromCloud(bgPageKey(pn), {
+          const blobSync = await syncBlobFromCloud(bgPageKey(pn, lang), {
             onRemoteDiff: () => {
               if (!isCancelled?.()) setBgLoading(true);
             },
           });
-          if (blobSync?.data) {
+          if (isBlobLike(blobSync?.data)) {
             map[pn] = blobSync.data;
           } else {
-            const localBlob = await loadLocalBlob(bgPageKey(pn));
-            if (localBlob) map[pn] = localBlob;
+            const localBlob = await loadLocalBlob(bgPageKey(pn, lang));
+            if (isBlobLike(localBlob)) map[pn] = localBlob;
           }
         }
         if (!isCancelled?.()) setBgOverrides(map);
@@ -446,7 +475,7 @@ export default function MenuEditor() {
     } catch {} finally {
       if (!isCancelled?.()) setBgLoading(false);
     }
-  }, []);
+  }, [lang]);
 
   useEffect(() => {
     if (!userReady) return;
@@ -482,82 +511,37 @@ export default function MenuEditor() {
   }, []);
 
   useEffect(() => {
-  if (!userReady) return;
-  let cancelled = false;
+    if (!userReady) return;
+    let cancelled = false;
+    (async () => {
+      try {
+        const key = menuLayoutKey(lang);
+        const saved = await loadLocalJson(key);
+        const legacy = saved ? null : await loadLocalJson(KEYS.MENU_LAYOUT);
+        const lay = saved || legacy || DEFAULT_LAYOUT;
 
-  const otherLang = lang === 'ko' ? 'en' : 'ko';
+        const safeLay = {
+          ...DEFAULT_LAYOUT,
+          ...(lay || {}),
+          templateData: lay?.templateData ?? null,
+        };
+        if (!cancelled) setLayout(safeLay);
 
-  (async () => {
-    setLoading(true);
+        if (!saved && legacy) {
+          await saveJson(key, safeLay);
+        }
 
-    try {
-      const key = menuLayoutKey(lang);
-      const keyAlt = menuLayoutKey(otherLang);
-
-      // 1) local: 현재 언어 -> 다른 언어 -> legacy(KEYS.MENU_LAYOUT) -> default
-      const localCur = await loadLocalJson(key);
-      const localAlt = localCur ? null : await loadLocalJson(keyAlt);
-      const legacy = localCur || localAlt ? null : await loadLocalJson(KEYS.MENU_LAYOUT);
-
-      const lay = localCur || localAlt || legacy || DEFAULT_LAYOUT;
-
-      const safeLay = {
-        ...DEFAULT_LAYOUT,
-        ...(lay || {}),
-        templateData: lay?.templateData ?? null,
-      };
-
-      if (!cancelled) setLayout(safeLay);
-
-      // ✅ fallback으로 가져온 경우엔 현재 언어 키로 복사해 둠(다음부터 바로 뜸)
-      if (!localCur && (localAlt || legacy)) {
-        await saveJson(key, safeLay);
+        // ✅ 로드 직후 스크롤 잔상 방지
+        if (!cancelled) setTimeout(() => hardResetScrollTop('auto'), 0);
+      } finally {
+        if (!cancelled) setLoading(false);
       }
 
-      // ✅ 로드 직후 스크롤 잔상 방지
-      if (!cancelled) setTimeout(() => hardResetScrollTop('auto'), 0);
-    } catch (e) {
-      console.error('Failed to load local layout', e);
-    } finally {
-      if (!cancelled) setLoading(false);
-    }
-
-    // 2) cloud sync: 현재 언어 -> (없으면) 다른 언어 -> (없으면) legacy
-    try {
-      // (a) current lang cloud
-      let syncResult = await syncJsonFromCloud(menuLayoutKey(lang), {
+      const syncResult = await syncJsonFromCloud(menuLayoutKey(lang), {
         onRemoteDiff: () => {
           if (!cancelled) setLoading(true);
         },
       });
-
-      // (b) fallback cloud other lang
-      if (!syncResult?.data) {
-        syncResult = await syncJsonFromCloud(menuLayoutKey(otherLang), {
-          onRemoteDiff: () => {
-            if (!cancelled) setLoading(true);
-          },
-        });
-
-        // 다른 언어에서 받아오면 -> 현재 언어 키로 복사 저장(로컬+클라우드 둘 다)
-        if (syncResult?.data) {
-          const remoteLay = syncResult.data;
-          const safeLay = {
-            ...DEFAULT_LAYOUT,
-            ...(remoteLay || {}),
-            templateData: remoteLay?.templateData ?? null,
-          };
-
-          if (!cancelled) setLayout(safeLay);
-          await saveJson(menuLayoutKey(lang), safeLay);
-          setTimeout(() => hardResetScrollTop('auto'), 0);
-
-          if (!cancelled) setLoading(false);
-          return; // ✅ 여기서 끝 (이미 해결)
-        }
-      }
-
-      // (c) current lang cloud success
       if (!cancelled && syncResult?.data) {
         const remoteLay = syncResult.data;
         const safeLay = {
@@ -566,20 +550,16 @@ export default function MenuEditor() {
           templateData: remoteLay?.templateData ?? null,
         };
         setLayout(safeLay);
-        await saveJson(menuLayoutKey(lang), safeLay);
         setTimeout(() => hardResetScrollTop('auto'), 0);
       }
-    } catch (e) {
-      console.error('Failed to sync layout', e);
-    } finally {
-      if (!cancelled) setLoading(false);
-    }
-  })();
 
-  return () => {
-    cancelled = true;
-  };
-}, [userReady, lang]);
+      if (!cancelled) setLoading(false);
+    })();
+
+    return () => {
+      cancelled = true;
+    };
+  }, [userReady, lang]);
 
   // ✅ 보기 모드에서 텍스트 길게 눌러도 선택/터치 콜아웃이 뜨지 않도록 body 단위 차단
   useEffect(() => {
@@ -645,11 +625,25 @@ export default function MenuEditor() {
   }, [edit, preview]);
 
   const setLanguage = (next) => {
-    setLang(next);
-    try {
-      localStorage.setItem(LANG_KEY, next);
-    } catch {}
-  };
+  if (next === lang) return;
+
+  // ✅ 언어 전환 시 무조건 1페이지로
+  setPageIndex(1);
+
+  // ✅ 언어 전환 시, 이전 언어의 배경/페이지오버라이드가 잠깐 보이는 현상 방지
+  setBgBlob(null);
+  setBgOverrides({});
+  setBgAssetsReady(false);
+  setBgLoading(true);
+
+  setLang(next);
+  try {
+    localStorage.setItem(LANG_KEY, next);
+  } catch {}
+
+  // ✅ 화면 스크롤 맨 위로
+  setTimeout(() => hardResetScrollTop('auto'), 0);
+};
 
   // ✅ 영상으로 돌아가기
   const goIntro = () => router.push('/intro');
@@ -665,7 +659,7 @@ export default function MenuEditor() {
 
   // ✅ 기본 배경 URL
   const bgUrl = useMemo(() => {
-    if (!bgBlob) return null;
+    if (!isBlobLike(bgBlob)) return null;
     return URL.createObjectURL(bgBlob);
   }, [bgBlob]);
 
@@ -673,7 +667,7 @@ export default function MenuEditor() {
   const bgOverrideUrls = useMemo(() => {
     const map = {};
     for (const [k, blob] of Object.entries(bgOverrides || {})) {
-      if (blob) map[k] = URL.createObjectURL(blob);
+      if (isBlobLike(blob)) map[k] = URL.createObjectURL(blob);
     }
     return map;
   }, [bgOverrides]);
@@ -746,7 +740,7 @@ export default function MenuEditor() {
   const uploadBg = async (file) => {
     if (!file) return;
     try {
-      await uploadAssetToCloud(file, KEYS.MENU_BG);
+      await uploadAssetToCloud(file, menuBgKey(lang));
     } catch (e) {
       console.error(e);
     }
@@ -781,7 +775,7 @@ export default function MenuEditor() {
     if (!file || !Number.isFinite(p) || p < 1) return;
 
     try {
-      await uploadAssetToCloud(file, bgPageKey(p));
+      await uploadAssetToCloud(file, bgPageKey(p, lang));
     } catch (e) {
       console.error(e);
     }
@@ -790,12 +784,13 @@ export default function MenuEditor() {
 
     // overrides 인덱스 저장
     try {
-      const nextIndex = { ...(await loadLocalJson(BG_OVERRIDES_KEY)) };
+      const idxKey = bgOverridesKey(lang);
+      const nextIndex = { ...(await loadLocalJson(idxKey)) };
       nextIndex[p] = true;
-      await saveJson(BG_OVERRIDES_KEY, nextIndex);
+      await saveJson(bgOverridesKey(lang), nextIndex);
     } catch {
       try {
-        await saveJson(BG_OVERRIDES_KEY, { [p]: true });
+        await saveJson(bgOverridesKey(lang), { [p]: true });
       } catch {}
     }
   };
@@ -812,10 +807,10 @@ export default function MenuEditor() {
     });
 
     try {
-      const idx = (await loadLocalJson(BG_OVERRIDES_KEY)) || {};
+      const idx = (await loadLocalJson(bgOverridesKey(lang))) || {};
       const nextIdx = { ...(idx || {}) };
       delete nextIdx[p];
-      await saveJson(BG_OVERRIDES_KEY, nextIdx);
+      await saveJson(bgOverridesKey(lang), nextIdx);
     } catch {}
   };
 
