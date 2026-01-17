@@ -12,7 +12,7 @@ import {
   syncBlobFromCloud,
   syncJsonFromCloud,
 } from '@/lib/storage';
-import { clearCurrentUser, getCurrentUser } from '@/lib/session';
+import { clearCurrentUser, setCurrentUser } from '@/lib/session';
 import { supabase } from '@/lib/supabaseClient';
 import CustomCanvas from './CustomCanvas';
 import TemplateCanvas from './TemplateCanvas';
@@ -283,13 +283,48 @@ export default function MenuEditor() {
   }, [userId]);
 
   useEffect(() => {
-    const current = getCurrentUser();
-    if (!current) {
-      router.replace('/login');
-      return;
-    }
-    setUserId(current);
-    setUserReady(true);
+    let alive = true;
+    let unsubscribe = null;
+
+    const finalize = (session) => {
+      const uid = session?.user?.id;
+      if (!uid) {
+        clearCurrentUser();
+        router.replace('/login');
+        return;
+      }
+      setCurrentUser(uid);
+      if (!alive) return;
+      setUserId(uid);
+      setUserReady(true);
+    };
+
+    (async () => {
+      const { data } = await supabase.auth.getSession();
+      if (data?.session?.user?.id) {
+        finalize(data.session);
+        return;
+      }
+
+      const { data: sub } = supabase.auth.onAuthStateChange((event, session) => {
+        if (!alive) return;
+        if (event === 'INITIAL_SESSION' || event === 'SIGNED_IN' || event === 'TOKEN_REFRESHED') {
+          finalize(session);
+        }
+      });
+      unsubscribe = () => sub?.subscription?.unsubscribe?.();
+
+      setTimeout(async () => {
+        if (!alive) return;
+        const { data: again } = await supabase.auth.getSession();
+        if (again?.session?.user?.id) finalize(again.session);
+      }, 1200);
+    })();
+
+    return () => {
+      alive = false;
+      if (unsubscribe) unsubscribe();
+    };
   }, [router]);
 
   // ✅ 비밀번호 설정(변경) 모달
@@ -447,37 +482,82 @@ export default function MenuEditor() {
   }, []);
 
   useEffect(() => {
-    if (!userReady) return;
-    let cancelled = false;
-    (async () => {
-      try {
-        const key = menuLayoutKey(lang);
-        const saved = await loadLocalJson(key);
-        const legacy = saved ? null : await loadLocalJson(KEYS.MENU_LAYOUT);
-        const lay = saved || legacy || DEFAULT_LAYOUT;
+  if (!userReady) return;
+  let cancelled = false;
 
-        const safeLay = {
-          ...DEFAULT_LAYOUT,
-          ...(lay || {}),
-          templateData: lay?.templateData ?? null,
-        };
-        if (!cancelled) setLayout(safeLay);
+  const otherLang = lang === 'ko' ? 'en' : 'ko';
 
-        if (!saved && legacy) {
-          await saveJson(key, safeLay);
-        }
+  (async () => {
+    setLoading(true);
 
-        // ✅ 로드 직후 스크롤 잔상 방지
-        if (!cancelled) setTimeout(() => hardResetScrollTop('auto'), 0);
-      } finally {
-        if (!cancelled) setLoading(false);
+    try {
+      const key = menuLayoutKey(lang);
+      const keyAlt = menuLayoutKey(otherLang);
+
+      // 1) local: 현재 언어 -> 다른 언어 -> legacy(KEYS.MENU_LAYOUT) -> default
+      const localCur = await loadLocalJson(key);
+      const localAlt = localCur ? null : await loadLocalJson(keyAlt);
+      const legacy = localCur || localAlt ? null : await loadLocalJson(KEYS.MENU_LAYOUT);
+
+      const lay = localCur || localAlt || legacy || DEFAULT_LAYOUT;
+
+      const safeLay = {
+        ...DEFAULT_LAYOUT,
+        ...(lay || {}),
+        templateData: lay?.templateData ?? null,
+      };
+
+      if (!cancelled) setLayout(safeLay);
+
+      // ✅ fallback으로 가져온 경우엔 현재 언어 키로 복사해 둠(다음부터 바로 뜸)
+      if (!localCur && (localAlt || legacy)) {
+        await saveJson(key, safeLay);
       }
 
-      const syncResult = await syncJsonFromCloud(menuLayoutKey(lang), {
+      // ✅ 로드 직후 스크롤 잔상 방지
+      if (!cancelled) setTimeout(() => hardResetScrollTop('auto'), 0);
+    } catch (e) {
+      console.error('Failed to load local layout', e);
+    } finally {
+      if (!cancelled) setLoading(false);
+    }
+
+    // 2) cloud sync: 현재 언어 -> (없으면) 다른 언어 -> (없으면) legacy
+    try {
+      // (a) current lang cloud
+      let syncResult = await syncJsonFromCloud(menuLayoutKey(lang), {
         onRemoteDiff: () => {
           if (!cancelled) setLoading(true);
         },
       });
+
+      // (b) fallback cloud other lang
+      if (!syncResult?.data) {
+        syncResult = await syncJsonFromCloud(menuLayoutKey(otherLang), {
+          onRemoteDiff: () => {
+            if (!cancelled) setLoading(true);
+          },
+        });
+
+        // 다른 언어에서 받아오면 -> 현재 언어 키로 복사 저장(로컬+클라우드 둘 다)
+        if (syncResult?.data) {
+          const remoteLay = syncResult.data;
+          const safeLay = {
+            ...DEFAULT_LAYOUT,
+            ...(remoteLay || {}),
+            templateData: remoteLay?.templateData ?? null,
+          };
+
+          if (!cancelled) setLayout(safeLay);
+          await saveJson(menuLayoutKey(lang), safeLay);
+          setTimeout(() => hardResetScrollTop('auto'), 0);
+
+          if (!cancelled) setLoading(false);
+          return; // ✅ 여기서 끝 (이미 해결)
+        }
+      }
+
+      // (c) current lang cloud success
       if (!cancelled && syncResult?.data) {
         const remoteLay = syncResult.data;
         const safeLay = {
@@ -486,16 +566,20 @@ export default function MenuEditor() {
           templateData: remoteLay?.templateData ?? null,
         };
         setLayout(safeLay);
+        await saveJson(menuLayoutKey(lang), safeLay);
         setTimeout(() => hardResetScrollTop('auto'), 0);
       }
-
+    } catch (e) {
+      console.error('Failed to sync layout', e);
+    } finally {
       if (!cancelled) setLoading(false);
-    })();
+    }
+  })();
 
-    return () => {
-      cancelled = true;
-    };
-  }, [userReady, lang]);
+  return () => {
+    cancelled = true;
+  };
+}, [userReady, lang]);
 
   // ✅ 보기 모드에서 텍스트 길게 눌러도 선택/터치 콜아웃이 뜨지 않도록 body 단위 차단
   useEffect(() => {

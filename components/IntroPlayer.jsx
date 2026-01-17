@@ -4,7 +4,8 @@ import { useEffect, useRef, useState } from 'react';
 import { useRouter } from 'next/navigation';
 import { KEYS, loadLocalBlob, saveBlob, syncBlobFromCloud } from '@/lib/storage';
 import { getSignedAssetUrl, uploadAsset } from '@/lib/cloudAssets';
-import { getCurrentUser } from '@/lib/session';
+import { clearCurrentUser, setCurrentUser } from '@/lib/session';
+import { supabase } from '@/lib/supabaseClient';
 
 const LANG_KEY = 'APP_LANG_V1';
 const INTRO_ASSET_KEY = 'intro-video';
@@ -27,12 +28,52 @@ export default function IntroPlayer() {
   };
 
   useEffect(() => {
-    const current = getCurrentUser();
-    if (!current) {
-      router.replace('/login');
-      return;
-    }
-    setUserReady(true);
+    let alive = true;
+    let unsubscribe = null;
+
+    const finalize = (session) => {
+      const uid = session?.user?.id;
+      if (!uid) {
+        clearCurrentUser();
+        router.replace('/login');
+        return;
+      }
+      setCurrentUser(uid);
+      if (alive) setUserReady(true);
+    };
+
+    (async () => {
+      // 1) Fast path: already in memory/storage
+      const { data } = await supabase.auth.getSession();
+      if (data?.session?.user?.id) {
+        finalize(data.session);
+        return;
+      }
+
+      // 2) Mobile WebView: session restoration can lag behind mount.
+      // Wait for INITIAL_SESSION (definitive) or SIGNED_IN.
+      const { data: sub } = supabase.auth.onAuthStateChange((event, session) => {
+        if (!alive) return;
+        if (event === 'INITIAL_SESSION' || event === 'SIGNED_IN' || event === 'TOKEN_REFRESHED') {
+          finalize(session);
+        }
+      });
+
+      unsubscribe = () => sub?.subscription?.unsubscribe?.();
+
+      // Safety: if nothing happens, re-check once.
+      setTimeout(async () => {
+        if (!alive) return;
+        const { data: again } = await supabase.auth.getSession();
+        if (again?.session?.user?.id) finalize(again.session);
+      }, 1200);
+
+    })();
+
+    return () => {
+      alive = false;
+      if (unsubscribe) unsubscribe();
+    };
   }, [router]);
 
   useEffect(() => {
@@ -236,6 +277,10 @@ export default function IntroPlayer() {
             playsInline
             loop
             onEnded={handleEnded}
+            onError={() => {
+              const v = videoRef.current;
+              console.log('VIDEO_ERROR', v?.error?.code, v?.error?.message, videoUrl);
+            }}
             style={styles.video}
           />
 
