@@ -19,13 +19,17 @@ const SHAPES = [
 ];
 
 const PRESET_KEY = 'MENU_CUSTOM_PRESETS_V1';
-const SNAP_THRESHOLD = 8;
+const SNAP_THRESHOLD = 4;
+const ALIGN_GUIDE_THRESHOLD = 3;
+const SPACING_GUIDE_THRESHOLD = 2;
 const INSPECTOR_ENABLED = true;
 const DEFAULT_BORDER_COLOR = 'rgba(255,255,255,0.22)';
 
-// ✅ 드래그 중 자동 스크롤
 const AUTO_SCROLL_ZONE = 80;
 const AUTO_SCROLL_SPEED = 18;
+
+const GUIDE_COLOR = 'rgba(59,130,246,0.68)';
+const GUIDE_ACCENT = 'rgba(59,130,246,0.88)';
 
 export default function CustomCanvas({
   items = [],
@@ -35,12 +39,10 @@ export default function CustomCanvas({
   editing = false,
   lang = 'ko',
   inspectorTop = 118,
-
-  // ✅ NEW: 'edit' | 'preview'
   uiMode = 'edit',
-
-  // ✅ MenuEditor stage scroll ref
   scrollRef,
+  pageWidth = 1080,
+  pageHeight = 2200,
 }) {
   const t = useMemo(() => getTexts(lang), [lang]);
   const incomingItems = useMemo(() => (Array.isArray(items) ? items : []), [items]);
@@ -50,60 +52,62 @@ export default function CustomCanvas({
   const safeItems = useMemo(() => (Array.isArray(draft) ? draft : []), [draft]);
 
   const [dirty, setDirty] = useState(false);
-
-  // ✅ 선택 유지
   const [selectedIds, setSelectedIds] = useState([]);
   const selectedId = selectedIds[0] || null;
-
-  // ✅ 드래그 중 선택 풀림 방지
   const [isDragging, setIsDragging] = useState(false);
 
-  // ✅ 스냅/그리드
-  const [snapOn, setSnapOn] = useState(true);
-  const [gridOn, setGridOn] = useState(false);
-  const [gridSize, setGridSize] = useState(10);
+  const [snapOn] = useState(true);
 
-  // ✅ 프리셋
   const [presets, setPresets] = useState([]);
   const [presetSelectedId, setPresetSelectedId] = useState('');
 
-  // ✅ Inspector 표시/자동숨김
   const [inspectorVisible, setInspectorVisible] = useState(false);
   const hideTimerRef = useRef(null);
-  const hideReasonRef = useRef(null); // 'select' | 'add'
+  const hideReasonRef = useRef(null);
 
-  // ✅ 툴바 숨김/표시
   const [toolbarVisible, setToolbarVisible] = useState(false);
+  const [dragGuides, setDragGuides] = useState([]);
+  const [historyVersion, setHistoryVersion] = useState(0);
 
-  // ✅ 멀티 드래그 이동용
+  const undoStackRef = useRef([]);
+  const redoStackRef = useRef([]);
+
   const dragAnchorRef = useRef(null);
+  const dragSessionRef = useRef(null);
+  const layerRef = useRef(null);
+  const marqueeBaseSelectionRef = useRef([]);
+  const marqueeStartRef = useRef(null);
+  const draggedItemRef = useRef(false);
+  const dragStartPosRef = useRef(null);
+  const suppressNextLayerClickRef = useRef(false);
+  const marqueeHasMovedRef = useRef(false);
+
+  const [marquee, setMarquee] = useState(null);
 
   const selected = useMemo(
     () => safeItems.find((it) => it.id === selectedId) || null,
     [safeItems, selectedId]
   );
+
   const resolvedBorderColor = useMemo(
     () => (selected ? resolveBorderColor(selected) : DEFAULT_BORDER_COLOR),
     [selected]
   );
+
   const borderColorValue = useMemo(
     () => normalizeColorInputValue(resolvedBorderColor),
     [resolvedBorderColor]
   );
-  const isBorderTransparent = resolvedBorderColor === 'transparent';
 
+  const isBorderTransparent = resolvedBorderColor === 'transparent';
   const isEdit = !!editing;
   const isPreview = uiMode === 'preview';
 
-  // -----------------------------
-  // Presets load
-  // -----------------------------
   useEffect(() => {
     setPresets(loadPresets());
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
-  // ✅ 편집모드 아니면 UI OFF (하지만 draft는 유지됨)
   useEffect(() => {
     if (!editing) {
       setIsDragging(false);
@@ -112,14 +116,15 @@ export default function CustomCanvas({
       clearInspectorHideTimer();
       hideReasonRef.current = null;
       setToolbarVisible(false);
+      setDragGuides([]);
     } else {
       setInspectorVisible(false);
       setToolbarVisible(false);
+      setDragGuides([]);
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [editing]);
 
-  // ✅ preview 모드 들어가면 UI 싹 숨김(선택/인스펙터/툴바)
   useEffect(() => {
     if (isPreview) {
       setSelectedIds([]);
@@ -127,25 +132,66 @@ export default function CustomCanvas({
       clearInspectorHideTimer();
       hideReasonRef.current = null;
       setToolbarVisible(false);
-    } else {
-      if (editing) {
-        setInspectorVisible(false);
-        setToolbarVisible(false);
-      }
+      setDragGuides([]);
+    } else if (editing) {
+      setInspectorVisible(false);
+      setToolbarVisible(false);
+      setDragGuides([]);
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [isPreview]);
+  }, [isPreview, editing]);
 
-  // ✅ 편집 중(dirty)에는 부모 items로 덮어쓰기 금지
   useEffect(() => {
     if (dirty) return;
     setDraft(incomingItems);
     setOrigin(incomingItems);
     setSelectedIds([]);
     setDirty(false);
+    undoStackRef.current = [];
+    redoStackRef.current = [];
+    setHistoryVersion((v) => v + 1);
   }, [incomingItems, dirty]);
 
-  const commit = (next) => {
+  const commit = (next, options = {}) => {
+    const { skipHistory = false, previousState = safeItems } = options;
+    if (!skipHistory) {
+      undoStackRef.current.push(previousState);
+      if (undoStackRef.current.length > 100) undoStackRef.current.shift();
+      redoStackRef.current = [];
+      setHistoryVersion((v) => v + 1);
+    }
+    setDraft(next);
+    setDirty(true);
+    onChangeItems?.(next);
+  };
+
+  const undo = () => {
+    const previous = undoStackRef.current.pop();
+    if (!previous) return;
+    redoStackRef.current.push(safeItems);
+    setHistoryVersion((v) => v + 1);
+    setDraft(previous);
+    setDirty(true);
+    onChangeItems?.(previous);
+    setSelectedIds((prev) => prev.filter((id) => previous.some((item) => item.id === id)));
+  };
+
+  const redo = () => {
+    const nextState = redoStackRef.current.pop();
+    if (!nextState) return;
+    undoStackRef.current.push(safeItems);
+    setHistoryVersion((v) => v + 1);
+    setDraft(nextState);
+    setDirty(true);
+    onChangeItems?.(nextState);
+    setSelectedIds((prev) => prev.filter((id) => nextState.some((item) => item.id === id)));
+  };
+
+  const canUndo = undoStackRef.current.length > 0;
+  const canRedo = redoStackRef.current.length > 0;
+
+
+  const applyDraftPreview = (next) => {
     setDraft(next);
     setDirty(true);
     onChangeItems?.(next);
@@ -171,9 +217,6 @@ export default function CustomCanvas({
 
   const newId = () => (crypto.randomUUID?.() || String(Date.now() + Math.random()));
 
-  // -----------------------------
-  // ✅ Drag auto-scroll (iPad)
-  // -----------------------------
   const autoScrollWhileDrag = (evt) => {
     const sc = scrollRef?.current;
     if (!sc) return;
@@ -193,9 +236,6 @@ export default function CustomCanvas({
     else if (clientY > bottomZone) sc.scrollTop += AUTO_SCROLL_SPEED;
   };
 
-  // -----------------------------
-  // Inspector helpers
-  // -----------------------------
   const clearInspectorHideTimer = () => {
     if (hideTimerRef.current) {
       clearTimeout(hideTimerRef.current);
@@ -212,24 +252,19 @@ export default function CustomCanvas({
   }, [selected]);
 
   const showInspectorBySelect = () => {
-    if (!INSPECTOR_ENABLED) return;
-    if (isPreview) return;
+    if (!INSPECTOR_ENABLED || isPreview) return;
     setInspectorVisible(true);
     hideReasonRef.current = 'select';
     clearInspectorHideTimer();
   };
 
   const showInspectorByAdd = () => {
-    if (!INSPECTOR_ENABLED) return;
-    if (isPreview) return;
+    if (!INSPECTOR_ENABLED || isPreview) return;
     setInspectorVisible(true);
     hideReasonRef.current = 'add';
     clearInspectorHideTimer();
   };
 
-  // -----------------------------
-  // Adders
-  // -----------------------------
   const addFoodName = () => {
     if (isPreview) return;
     const id = newId();
@@ -293,8 +328,7 @@ export default function CustomCanvas({
   };
 
   const addPhoto = async (file) => {
-    if (isPreview) return;
-    if (!file) return;
+    if (isPreview || !file) return;
     const src = await fileToDataUrl(file);
     const id = newId();
     const next = [
@@ -321,9 +355,39 @@ export default function CustomCanvas({
     showInspectorByAdd();
   };
 
-  // -----------------------------
-  // Selection
-  // -----------------------------
+
+  const addVideo = async (file) => {
+    if (isPreview || !file) return;
+    const src = await fileToDataUrl(file);
+    const id = newId();
+    const next = [
+      ...safeItems,
+      {
+        id,
+        type: 'video',
+        x: 80,
+        y: 120,
+        w: 360,
+        h: 240,
+        src,
+        shape: 'rounded',
+        radius: 18,
+        fit: 'cover',
+        opacity: 1,
+        z: maxZ(safeItems) + 1,
+        locked: false,
+        groupId: null,
+        autoplay: true,
+        loop: true,
+        muted: true,
+        playsInline: true,
+      },
+    ];
+    commit(next);
+    setSelectedIds([id]);
+    showInspectorByAdd();
+  };
+
   const clearSelect = () => {
     setSelectedIds([]);
     clearInspectorHideTimer();
@@ -331,12 +395,104 @@ export default function CustomCanvas({
     setInspectorVisible(false);
   };
 
-  // -----------------------------
-  // Save / Cancel
-  // -----------------------------
+  const pointToLayer = (clientX, clientY) => {
+    const layer = layerRef.current;
+    if (!layer) return null;
+    const rect = layer.getBoundingClientRect();
+    return {
+      x: clamp(clientX - rect.left, 0, rect.width),
+      y: clamp(clientY - rect.top, 0, rect.height),
+    };
+  };
+
+  const getMarqueeRect = (start, current) => {
+    const left = Math.min(start.x, current.x);
+    const top = Math.min(start.y, current.y);
+    const width = Math.abs(current.x - start.x);
+    const height = Math.abs(current.y - start.y);
+    return { left, top, width, height };
+  };
+
+  const getMarqueeSelectedIds = (rect) => {
+    if (!rect) return [];
+    return safeItems
+      .filter((it) => rectsIntersect(rect, { left: it.x, top: it.y, width: it.w, height: it.h }))
+      .map((it) => it.id);
+  };
+
+  const startMarqueeSelect = (e) => {
+    if (!isEdit || isPreview) return;
+    if (e.button !== 0) return;
+    if (e.target !== e.currentTarget) return;
+
+    suppressNextLayerClickRef.current = false;
+    marqueeHasMovedRef.current = false;
+
+    const point = pointToLayer(e.clientX, e.clientY);
+    if (!point) return;
+
+    marqueeBaseSelectionRef.current = e.shiftKey ? selectedIds : [];
+    marqueeStartRef.current = point;
+    setMarquee({ ...getMarqueeRect(point, point), active: true });
+
+    if (!e.shiftKey) {
+      setSelectedIds([]);
+      setInspectorVisible(false);
+      clearInspectorHideTimer();
+      hideReasonRef.current = null;
+    }
+  };
+
+  const updateMarqueeSelect = (e) => {
+    if (!marqueeStartRef.current) return;
+    const point = pointToLayer(e.clientX, e.clientY);
+    if (!point) return;
+
+    const rect = getMarqueeRect(marqueeStartRef.current, point);
+    if (rect.width > 2 || rect.height > 2) {
+      marqueeHasMovedRef.current = true;
+      suppressNextLayerClickRef.current = true;
+    }
+    const hitIds = getMarqueeSelectedIds(rect);
+    const merged = Array.from(new Set([...(marqueeBaseSelectionRef.current || []), ...hitIds]));
+
+    setMarquee({ ...rect, active: true });
+    setSelectedIds(merged);
+    if (merged.length) showInspectorBySelect();
+  };
+
+  const endMarqueeSelect = () => {
+    if (marqueeHasMovedRef.current) {
+      suppressNextLayerClickRef.current = true;
+    }
+    marqueeStartRef.current = null;
+    marqueeBaseSelectionRef.current = [];
+    marqueeHasMovedRef.current = false;
+    setMarquee(null);
+  };
+
+  const handleItemClick = (e, itemId) => {
+    if (!isEdit || isPreview) return;
+    if (draggedItemRef.current) {
+      draggedItemRef.current = false;
+      return;
+    }
+
+    e.stopPropagation();
+    setSelectedIds((prev) => {
+      if (!e.shiftKey) return [itemId];
+      if (prev.includes(itemId)) return prev.filter((x) => x !== itemId);
+      return [...prev, itemId];
+    });
+    showInspectorBySelect();
+  };
+
   const doSave = () => {
     setOrigin(safeItems);
     setDirty(false);
+    undoStackRef.current = [];
+    redoStackRef.current = [];
+    setHistoryVersion((v) => v + 1);
     onSave?.(safeItems);
   };
 
@@ -347,17 +503,40 @@ export default function CustomCanvas({
     clearInspectorHideTimer();
     hideReasonRef.current = null;
     setInspectorVisible(false);
+    undoStackRef.current = [];
+    redoStackRef.current = [];
+    setHistoryVersion((v) => v + 1);
     onCancel?.(origin);
   };
 
-  // -----------------------------
-  // Keyboard
-  // -----------------------------
   useEffect(() => {
-    if (!editing) return;
-    if (isPreview) return;
+    if (!editing || isPreview) return;
 
     const onKey = (e) => {
+      const target = e.target;
+      const isTypingTarget =
+        target instanceof HTMLElement &&
+        (target.tagName === 'INPUT' ||
+          target.tagName === 'TEXTAREA' ||
+          target.tagName === 'SELECT' ||
+          target.isContentEditable);
+
+      if (isTypingTarget) return;
+
+      const modKey = e.metaKey || e.ctrlKey;
+
+      if (modKey && e.key.toLowerCase() === 'z' && !e.shiftKey) {
+        e.preventDefault();
+        undo();
+        return;
+      }
+
+      if (modKey && (e.key.toLowerCase() === 'y' || (e.key.toLowerCase() === 'z' && e.shiftKey))) {
+        e.preventDefault();
+        redo();
+        return;
+      }
+
       if ((e.key === 'Delete' || e.key === 'Backspace') && selectedIds.length) {
         e.preventDefault();
         removeMany(selectedIds);
@@ -366,7 +545,8 @@ export default function CustomCanvas({
       if (selectedIds.length && ['ArrowUp', 'ArrowDown', 'ArrowLeft', 'ArrowRight'].includes(e.key)) {
         e.preventDefault();
         const step = e.shiftKey ? 10 : 2;
-        let dx = 0, dy = 0;
+        let dx = 0;
+        let dy = 0;
         if (e.key === 'ArrowUp') dy = -step;
         if (e.key === 'ArrowDown') dy = step;
         if (e.key === 'ArrowLeft') dx = -step;
@@ -383,11 +563,23 @@ export default function CustomCanvas({
     window.addEventListener('keydown', onKey);
     return () => window.removeEventListener('keydown', onKey);
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [editing, selectedIds, safeItems, origin, isPreview]);
+  }, [editing, selectedIds, safeItems, origin, isPreview, historyVersion]);
 
-  // -----------------------------
-  // Move / Snap
-  // -----------------------------
+  useEffect(() => {
+    if (!isEdit || isPreview) return;
+
+    const onMove = (e) => updateMarqueeSelect(e);
+    const onUp = () => endMarqueeSelect();
+
+    window.addEventListener('mousemove', onMove);
+    window.addEventListener('mouseup', onUp);
+
+    return () => {
+      window.removeEventListener('mousemove', onMove);
+      window.removeEventListener('mouseup', onUp);
+    };
+  }, [isEdit, isPreview, safeItems, selectedIds]);
+
   const moveMany = (ids, dx, dy) => {
     const set = new Set(ids);
     const next = safeItems.map((it) => {
@@ -399,56 +591,149 @@ export default function CustomCanvas({
   };
 
   const applySnap = (movingId, x, y, w, h) => {
-    let nx = x;
-    let ny = y;
-
-    if (gridOn) {
-      nx = Math.round(nx / gridSize) * gridSize;
-      ny = Math.round(ny / gridSize) * gridSize;
-    }
-
-    if (!snapOn) return { x: nx, y: ny };
-
-    const others = safeItems.filter((it) => it.id !== movingId);
-    const xCandidates = [];
-    const yCandidates = [];
-
-    for (const o of others) {
-      xCandidates.push(o.x, o.x + o.w, o.x + o.w / 2);
-      yCandidates.push(o.y, o.y + o.h, o.y + o.h / 2);
-    }
-
-    nx = snapBest(nx, [
-      ...xCandidates,
-      ...xCandidates.map((c) => c - w),
-      ...xCandidates.map((c) => c - w / 2),
-    ]);
-
-    ny = snapBest(ny, [
-      ...yCandidates,
-      ...yCandidates.map((c) => c - h),
-      ...yCandidates.map((c) => c - h / 2),
-    ]);
-
-    return { x: Math.round(nx), y: Math.round(ny) };
+    if (!snapOn) return { x, y, guides: [] };
+    return computeDragAssist(movingId, x, y, w, h);
   };
 
-  function snapBest(value, candidates) {
-    let best = value;
-    let bestDist = SNAP_THRESHOLD + 1;
-    for (const c of candidates) {
-      const d = Math.abs(value - c);
-      if (d <= SNAP_THRESHOLD && d < bestDist) {
-        best = c;
-        bestDist = d;
+  const clearDragGuides = () => setDragGuides([]);
+
+  const buildSpacingGuides = (movingItem, x, y) => {
+    if (!movingItem || movingItem.type !== 'text' || movingItem.role !== 'name') return [];
+
+    const moved = { ...movingItem, x, y };
+    const peers = safeItems
+      .filter((it) => it.id !== movingItem.id && it.type === 'text' && it.role === 'name')
+      .slice()
+      .sort((a, b) => a.y - b.y);
+
+    if (peers.length < 2) return [];
+
+    const all = [...peers, moved].sort((a, b) => a.y - b.y);
+    const idx = all.findIndex((it) => it.id === moved.id);
+    if (idx <= 0 || idx >= all.length - 1) return [];
+
+    const prev = all[idx - 1];
+    const next = all[idx + 1];
+    const gapAbove = moved.y - (prev.y + prev.h);
+    const gapBelow = next.y - (moved.y + moved.h);
+
+    if (gapAbove < -1 || gapBelow < -1) return [];
+    if (Math.abs(gapAbove - gapBelow) > SPACING_GUIDE_THRESHOLD) return [];
+
+    const left = Math.min(prev.x, moved.x, next.x);
+    const right = Math.max(prev.x + prev.w, moved.x + moved.w, next.x + next.w);
+    const centerX = left + (right - left) / 2;
+
+    return [
+      {
+        kind: 'spacing',
+        orientation: 'vertical-segment',
+        x: centerX,
+        y1: prev.y + prev.h,
+        y2: moved.y,
+        label: `${Math.round((gapAbove + gapBelow) / 2)}px`,
+      },
+      {
+        kind: 'spacing',
+        orientation: 'vertical-segment',
+        x: centerX,
+        y1: moved.y + moved.h,
+        y2: next.y,
+        label: `${Math.round((gapAbove + gapBelow) / 2)}px`,
+      },
+    ];
+  };
+
+  const computeDragAssist = (movingId, x, y, w, h) => {
+    const movingItem = safeItems.find((it) => it.id === movingId);
+    if (!movingItem) return { x, y, guides: [] };
+
+    let nx = x;
+    let ny = y;
+    const guides = [];
+    const others = safeItems.filter((it) => it.id !== movingId);
+
+    const movingLines = {
+      left: nx,
+      centerX: nx + w / 2,
+      right: nx + w,
+      top: ny,
+      centerY: ny + h / 2,
+      bottom: ny + h,
+    };
+
+    for (const o of others) {
+      const targetLines = {
+        left: o.x,
+        centerX: o.x + o.w / 2,
+        right: o.x + o.w,
+        top: o.y,
+        centerY: o.y + o.h / 2,
+        bottom: o.y + o.h,
+      };
+
+      const xPairs = [
+        ['left', 'left', targetLines.left],
+        ['centerX', 'centerX', targetLines.centerX],
+        ['right', 'right', targetLines.right],
+      ];
+      const yPairs = [
+        ['top', 'top', targetLines.top],
+        ['centerY', 'centerY', targetLines.centerY],
+        ['bottom', 'bottom', targetLines.bottom],
+      ];
+
+      for (const [movingKey, targetKey, target] of xPairs) {
+        const delta = target - movingLines[movingKey];
+        if (Math.abs(delta) <= SNAP_THRESHOLD) {
+          nx += delta;
+          movingLines.left += delta;
+          movingLines.centerX += delta;
+          movingLines.right += delta;
+
+          if (Math.abs(delta) <= ALIGN_GUIDE_THRESHOLD) {
+            guides.push({
+              kind: 'align',
+              orientation: 'vertical',
+              x: target,
+              y1: Math.min(ny, o.y),
+              y2: Math.max(ny + h, o.y + o.h),
+              target: targetKey,
+            });
+          }
+          break;
+        }
+      }
+
+      for (const [movingKey, targetKey, target] of yPairs) {
+        const delta = target - movingLines[movingKey];
+        if (Math.abs(delta) <= SNAP_THRESHOLD) {
+          ny += delta;
+          movingLines.top += delta;
+          movingLines.centerY += delta;
+          movingLines.bottom += delta;
+
+          if (Math.abs(delta) <= ALIGN_GUIDE_THRESHOLD) {
+            guides.push({
+              kind: 'align',
+              orientation: 'horizontal',
+              y: target,
+              x1: Math.min(nx, o.x),
+              x2: Math.max(nx + w, o.x + o.w),
+              target: targetKey,
+            });
+          }
+          break;
+        }
       }
     }
-    return best;
-  }
 
-  // -----------------------------
-  // Group / Lock
-  // -----------------------------
+    const spacingGuides = buildSpacingGuides(movingItem, nx, ny);
+    if (spacingGuides.length) guides.push(...spacingGuides);
+
+    return { x: Math.round(nx), y: Math.round(ny), guides };
+  };
+
   const lockSelected = () => updateMany(selectedIds, { locked: true });
   const unlockSelected = () => updateMany(selectedIds, { locked: false });
 
@@ -460,9 +745,6 @@ export default function CustomCanvas({
 
   const ungroupSelected = () => updateMany(selectedIds, { groupId: null });
 
-  // -----------------------------
-  // Z-order / Duplicate
-  // -----------------------------
   const bringForward = () => {
     if (!selectedIds.length) return;
     let z = maxZ(safeItems) + 1;
@@ -501,15 +783,13 @@ export default function CustomCanvas({
     showInspectorByAdd();
   };
 
-  // -----------------------------
-  // Align (Multi)
-  // -----------------------------
   const alignLeft = () => {
     if (selectedIds.length < 2) return;
     const sel = safeItems.filter((it) => selectedIds.includes(it.id));
     const minX = Math.min(...sel.map((it) => it.x));
     updateMany(selectedIds, { x: minX });
   };
+
   const alignRight = () => {
     if (selectedIds.length < 2) return;
     const sel = safeItems.filter((it) => selectedIds.includes(it.id));
@@ -521,6 +801,7 @@ export default function CustomCanvas({
     });
     commit(next);
   };
+
   const alignCenter = () => {
     if (selectedIds.length < 2) return;
     const sel = safeItems.filter((it) => selectedIds.includes(it.id));
@@ -532,12 +813,14 @@ export default function CustomCanvas({
     });
     commit(next);
   };
+
   const alignTop = () => {
     if (selectedIds.length < 2) return;
     const sel = safeItems.filter((it) => selectedIds.includes(it.id));
     const minY = Math.min(...sel.map((it) => it.y));
     updateMany(selectedIds, { y: minY });
   };
+
   const alignBottom = () => {
     if (selectedIds.length < 2) return;
     const sel = safeItems.filter((it) => selectedIds.includes(it.id));
@@ -549,6 +832,7 @@ export default function CustomCanvas({
     });
     commit(next);
   };
+
   const alignMiddle = () => {
     if (selectedIds.length < 2) return;
     const sel = safeItems.filter((it) => selectedIds.includes(it.id));
@@ -561,9 +845,6 @@ export default function CustomCanvas({
     commit(next);
   };
 
-  // -----------------------------
-  // Presets
-  // -----------------------------
   const savePreset = () => {
     if (isPreview) return;
     const name = prompt(t.presetNamePrompt, t.presetNameDefault);
@@ -577,10 +858,8 @@ export default function CustomCanvas({
   };
 
   const loadPreset = (presetId) => {
-    if (isPreview) return;
-    if (!INSPECTOR_ENABLED) {
-      return;
-    }
+    if (isPreview || !INSPECTOR_ENABLED) return;
+
     const all = loadPresets();
     const p = all.find((x) => x.id === presetId);
     if (!p) return;
@@ -614,18 +893,15 @@ export default function CustomCanvas({
     const next = all.filter((x) => x.id !== id);
     persistPresets(next);
     setPresets(next);
-
     setPresetSelectedId('');
     alert(t.presetDeletedAlert);
   };
 
-  // -----------------------------
-  // Multi-drag helpers
-  // -----------------------------
   const beginMultiDrag = (activeId) => {
     const snapshot = safeItems
       .filter((it) => selectedIds.includes(it.id))
       .map((it) => ({ id: it.id, x: it.x, y: it.y, w: it.w, h: it.h, locked: !!it.locked }));
+
     const active = safeItems.find((it) => it.id === activeId);
     dragAnchorRef.current = {
       id: activeId,
@@ -633,11 +909,69 @@ export default function CustomCanvas({
       startY: active?.y ?? 0,
       snapshot,
     };
+    dragSessionRef.current = {
+      type: 'multi',
+      activeId,
+      startItems: safeItems,
+    };
+  };
+
+  const buildMultiDragState = (activeId, newX, newY) => {
+    const anchor = dragAnchorRef.current;
+    if (!anchor || anchor.id !== activeId) return null;
+
+    const dx = newX - anchor.startX;
+    const dy = newY - anchor.startY;
+    const set = new Set(selectedIds);
+
+    let next = safeItems.map((it) => {
+      if (!set.has(it.id) || it.locked) return it;
+
+      const snapBase = anchor.snapshot.find((s) => s.id === it.id);
+      if (!snapBase) return it;
+
+      return {
+        ...it,
+        x: snapBase.x + dx,
+        y: snapBase.y + dy,
+      };
+    });
+
+    const activeItem = safeItems.find((x) => x.id === activeId);
+    if (activeItem) {
+      const activeSnapBase = anchor.snapshot.find((s) => s.id === activeId);
+      if (activeSnapBase) {
+        const ax = activeSnapBase.x + dx;
+        const ay = activeSnapBase.y + dy;
+        const { x: sx, y: sy, guides } = applySnap(activeId, ax, ay, activeItem.w, activeItem.h);
+        const fixDx = sx - ax;
+        const fixDy = sy - ay;
+
+        next = next.map((it) => {
+          if (!set.has(it.id) || it.locked) return it;
+          return { ...it, x: it.x + fixDx, y: it.y + fixDy };
+        });
+
+        return { next, guides: guides || [] };
+      }
+    }
+
+    return { next, guides: [] };
+  };
+
+  const applyMultiDragPreview = (activeId, newX, newY) => {
+    const state = buildMultiDragState(activeId, newX, newY);
+    if (!state) return;
+    setDragGuides(state.guides || []);
+    applyDraftPreview(state.next);
   };
 
   const applyMultiDragStop = (activeId, newX, newY) => {
     const anchor = dragAnchorRef.current;
+    const dragSession = dragSessionRef.current;
     dragAnchorRef.current = null;
+    dragSessionRef.current = null;
+    clearDragGuides();
 
     if (!anchor || anchor.id !== activeId) {
       const it = safeItems.find((x) => x.id === activeId);
@@ -647,58 +981,15 @@ export default function CustomCanvas({
       return;
     }
 
-    const dx = newX - anchor.startX;
-    const dy = newY - anchor.startY;
-
-    const set = new Set(selectedIds);
-    const next = safeItems.map((it) => {
-      if (!set.has(it.id)) return it;
-      if (it.locked) return it;
-
-      const snapBase = anchor.snapshot.find((s) => s.id === it.id);
-      if (!snapBase) return it;
-
-      let nx = snapBase.x + dx;
-      let ny = snapBase.y + dy;
-
-      if (gridOn) {
-        nx = Math.round(nx / gridSize) * gridSize;
-        ny = Math.round(ny / gridSize) * gridSize;
-      }
-
-      return { ...it, x: nx, y: ny };
-    });
-
-    const activeItem = safeItems.find((x) => x.id === activeId);
-    if (activeItem) {
-      const activeSnapBase = anchor.snapshot.find((s) => s.id === activeId);
-      if (activeSnapBase) {
-        const ax = activeSnapBase.x + dx;
-        const ay = activeSnapBase.y + dy;
-        const { x: sx, y: sy } = applySnap(activeId, ax, ay, activeItem.w, activeItem.h);
-        const fixDx = sx - ax;
-        const fixDy = sy - ay;
-
-        const next2 = next.map((it) => {
-          if (!set.has(it.id)) return it;
-          if (it.locked) return it;
-          return { ...it, x: it.x + fixDx, y: it.y + fixDy };
-        });
-
-        commit(next2);
-        return;
-      }
-    }
-
-    commit(next);
+    const state = buildMultiDragState(activeId, newX, newY);
+    if (!state) return;
+    const previousState = dragSession?.startItems || safeItems;
+    if (JSON.stringify(previousState) === JSON.stringify(state.next)) return;
+    commit(state.next, { previousState });
   };
 
-  // -----------------------------
-  // UI
-  // -----------------------------
   return (
-    <>
-      {/* ✅ 편집모드 + 미리보기 아니면: 툴바 */}
+    <div style={{ ...styles.root, width: pageWidth, height: pageHeight }}>
       {isEdit && !isPreview && (
         <>
           {!toolbarVisible && (
@@ -722,33 +1013,30 @@ export default function CustomCanvas({
                     type="file"
                     accept="image/*"
                     style={{ display: 'none' }}
-                    onChange={(e) => addPhoto(e.target.files?.[0])}
+                    onChange={(e) => {
+                      addPhoto(e.target.files?.[0]);
+                      e.target.value = '';
+                    }}
+                  />
+                </label>
+
+                <label style={{ ...styles.toolBtn, display: 'inline-flex', alignItems: 'center', gap: 8 }}>
+                  {t.addVideo}
+                  <input
+                    type="file"
+                    accept="video/mp4,video/webm,video/quicktime,video/*"
+                    style={{ display: 'none' }}
+                    onChange={(e) => {
+                      addVideo(e.target.files?.[0]);
+                      e.target.value = '';
+                    }}
                   />
                 </label>
 
                 <span style={styles.sep} />
 
-                <label style={styles.chk}>
-                  <input type="checkbox" checked={snapOn} onChange={(e) => setSnapOn(e.target.checked)} />
-                  {t.snap}
-                </label>
-
-                <label style={styles.chk}>
-                  <input type="checkbox" checked={gridOn} onChange={(e) => setGridOn(e.target.checked)} />
-                  {t.grid}
-                </label>
-
-                {gridOn && (
-                  <input
-                    type="number"
-                    min={4}
-                    max={100}
-                    value={gridSize}
-                    onChange={(e) => setGridSize(Number(e.target.value || 10))}
-                    style={styles.gridNum}
-                    title="Grid Size"
-                  />
-                )}
+                <button style={styles.toolBtnSm} onClick={undo} disabled={!canUndo}>{t.undo}</button>
+                <button style={styles.toolBtnSm} onClick={redo} disabled={!canRedo}>{t.redo}</button>
 
                 <span style={styles.sep} />
 
@@ -790,21 +1078,43 @@ export default function CustomCanvas({
           )}
 
           <div style={styles.saveBar} onMouseDown={(e) => e.stopPropagation()}>
+            <button style={{ ...styles.toolBtnSm, minWidth: 72 }} onClick={undo} disabled={!canUndo}>{t.undo}</button>
+            <button style={{ ...styles.toolBtnSm, minWidth: 72 }} onClick={redo} disabled={!canRedo}>{t.redo}</button>
             <button style={styles.saveBtn} onClick={doSave}>{t.save}</button>
             <button style={styles.cancelBtn} onClick={doCancel}>{t.cancel}</button>
           </div>
         </>
       )}
 
-      {/* Canvas */}
       <div
+        ref={layerRef}
         style={styles.layer}
+        onMouseDown={startMarqueeSelect}
         onClick={(e) => {
-          if (!isEdit) return;
-          if (isPreview) return;
-          if (e.target === e.currentTarget && !isDragging) clearSelect();
+          if (!isEdit || isPreview) return;
+          if (suppressNextLayerClickRef.current) {
+            suppressNextLayerClickRef.current = false;
+            return;
+          }
+          if (e.target === e.currentTarget && !isDragging && !marqueeStartRef.current) clearSelect();
         }}
       >
+        {dragGuides.map((guide, index) => (
+          <GuideOverlay key={`${guide.kind}-${guide.orientation}-${index}`} guide={guide} />
+        ))}
+
+        {marquee?.active && marquee.width > 0 && marquee.height > 0 && (
+          <div
+            style={{
+              ...styles.marquee,
+              left: marquee.left,
+              top: marquee.top,
+              width: marquee.width,
+              height: marquee.height,
+            }}
+          />
+        )}
+
         {safeItems
           .slice()
           .sort((a, b) => (a.z || 0) - (b.z || 0))
@@ -818,28 +1128,24 @@ export default function CustomCanvas({
                 bounds="parent"
                 size={{ width: it.w, height: it.h }}
                 position={{ x: it.x, y: it.y }}
-
                 disableDragging={!isEdit || isLocked || isPreview}
                 enableResizing={!isEdit ? false : (isLocked || isPreview ? false : undefined)}
-
                 onMouseDown={(e) => {
-                  if (!isEdit) return;
-                  if (isPreview) return;
-
-                  e.stopPropagation();
-
-                  setSelectedIds((prev) => {
-                    if (!e.shiftKey) return [it.id];
-                    if (prev.includes(it.id)) return prev.filter((x) => x !== it.id);
-                    return [...prev, it.id];
-                  });
-
-                  showInspectorBySelect();
-                }}
-
-                onDragStart={() => {
                   if (!isEdit || isPreview) return;
+                  e.stopPropagation();
+                }}
+                onClick={(e) => handleItemClick(e, it.id)}
+                onDragStart={(e, d) => {
+                  if (!isEdit || isPreview) return;
+                  draggedItemRef.current = false;
+                  dragStartPosRef.current = { x: d.x, y: d.y };
+                  dragSessionRef.current = { type: 'single', itemId: it.id, startItems: safeItems };
                   setIsDragging(true);
+                  clearDragGuides();
+
+                  if (!selectedIds.includes(it.id)) {
+                    setSelectedIds([it.id]);
+                  }
 
                   if (selectedIds.length >= 2 && selectedIds.includes(it.id)) {
                     beginMultiDrag(it.id);
@@ -847,18 +1153,50 @@ export default function CustomCanvas({
                     dragAnchorRef.current = null;
                   }
                 }}
-
-                onDrag={(e) => {
-                  if (!isEdit || isPreview) return;
+                onDrag={(e, d) => {
+                  if (!isEdit || isPreview || isLocked) return;
                   autoScrollWhileDrag(e);
+
+                  const dragStart = dragStartPosRef.current;
+                  if (dragStart) {
+                    const moved = Math.abs(d.x - dragStart.x) > 5 || Math.abs(d.y - dragStart.y) > 5;
+                    if (moved) draggedItemRef.current = true;
+                  }
+
+                  if (selectedIds.length >= 2 && selectedIds.includes(it.id)) {
+                    applyMultiDragPreview(it.id, d.x, d.y);
+                    return;
+                  }
+
+                  const assist = computeDragAssist(it.id, d.x, d.y, it.w, it.h);
+                  setDragGuides(assist.guides || []);
+                  applyDraftPreview(
+                    safeItems.map((item) => (item.id === it.id ? { ...item, x: assist.x, y: assist.y } : item))
+                  );
                 }}
-
-                onResizeStart={() => isEdit && !isPreview && setIsDragging(true)}
-
+                onResizeStart={() => {
+                  if (isEdit && !isPreview) {
+                    dragSessionRef.current = { type: 'resize', itemId: it.id, startItems: safeItems };
+                    setIsDragging(true);
+                    clearDragGuides();
+                  }
+                }}
                 onDragStop={(e, d) => {
                   if (!isEdit || isPreview) return;
                   setIsDragging(false);
-                  if (isLocked) return;
+                  clearDragGuides();
+                  if (isLocked) {
+                    dragSessionRef.current = null;
+                    return;
+                  }
+
+                  const dragStart = dragStartPosRef.current;
+                  dragStartPosRef.current = null;
+                  const movedEnough = !dragStart || Math.abs(d.x - dragStart.x) > 5 || Math.abs(d.y - dragStart.y) > 5;
+                  if (!movedEnough) {
+                    dragSessionRef.current = null;
+                    return;
+                  }
 
                   if (selectedIds.length >= 2 && selectedIds.includes(it.id)) {
                     applyMultiDragStop(it.id, d.x, d.y);
@@ -866,21 +1204,32 @@ export default function CustomCanvas({
                   }
 
                   const { x: sx, y: sy } = applySnap(it.id, d.x, d.y, it.w, it.h);
-                  updateItem(it.id, { x: sx, y: sy });
+                  const dragSession = dragSessionRef.current;
+                  dragSessionRef.current = null;
+                  const next = safeItems.map((item) => (item.id === it.id ? { ...item, x: sx, y: sy } : item));
+                  const previousState = dragSession?.startItems || safeItems;
+                  if (JSON.stringify(previousState) === JSON.stringify(next)) return;
+                  commit(next, { previousState });
                 }}
-
                 onResizeStop={(e, dir, ref, delta, pos) => {
                   if (!isEdit || isPreview) return;
                   setIsDragging(false);
-                  if (isLocked) return;
+                  clearDragGuides();
+                  if (isLocked) {
+                    dragSessionRef.current = null;
+                    return;
+                  }
 
                   const w = ref.offsetWidth;
                   const h = ref.offsetHeight;
-
                   const { x: sx, y: sy } = applySnap(it.id, pos.x, pos.y, w, h);
-                  updateItem(it.id, { w, h, x: sx, y: sy });
+                  const dragSession = dragSessionRef.current;
+                  dragSessionRef.current = null;
+                  const next = safeItems.map((item) => (item.id === it.id ? { ...item, w, h, x: sx, y: sy } : item));
+                  const previousState = dragSession?.startItems || safeItems;
+                  if (JSON.stringify(previousState) === JSON.stringify(next)) return;
+                  commit(next, { previousState });
                 }}
-
                 style={{ zIndex: it.z || 0 }}
               >
                 <ItemBox item={it} selected={isEdit && isSelected && !isPreview} />
@@ -889,7 +1238,6 @@ export default function CustomCanvas({
           })}
       </div>
 
-      {/* ✅ Inspector: 편집 + 미리보기X + inspectorVisible */}
       {INSPECTOR_ENABLED && isEdit && !isPreview && inspectorVisible && (
         <div
           style={{ ...styles.inspector, top: inspectorTop }}
@@ -899,15 +1247,6 @@ export default function CustomCanvas({
 
           {selectedIds.length >= 2 && (
             <div style={styles.multiBox}>
-              <div style={styles.multiGrid}>
-                <button style={styles.actionBtn} onClick={alignLeft}>{t.left}</button>
-                <button style={styles.actionBtn} onClick={alignCenter}>{t.center}</button>
-                <button style={styles.actionBtn} onClick={alignRight}>{t.right}</button>
-                <button style={styles.actionBtn} onClick={alignTop}>{t.top}</button>
-                <button style={styles.actionBtn} onClick={alignMiddle}>{t.middle}</button>
-                <button style={styles.actionBtn} onClick={alignBottom}>{t.bottom}</button>
-              </div>
-
               <div style={styles.multiGrid}>
                 <button style={styles.actionBtn} onClick={groupSelected}>{t.group}</button>
                 <button style={styles.actionBtn} onClick={ungroupSelected}>{t.ungroup}</button>
@@ -927,6 +1266,7 @@ export default function CustomCanvas({
               <hr style={{ margin: '12px 0', border: 'none', borderTop: '1px solid #eee' }} />
             </div>
           )}
+
           {selected ? (
             <>
               <div style={styles.row}>
@@ -934,7 +1274,9 @@ export default function CustomCanvas({
                 <div style={styles.value}>
                   {selected.type === 'text'
                     ? (selected.role === 'price' ? t.textPrice : t.textName)
-                    : t.photo}
+                    : selected.type === 'video'
+                      ? t.video
+                      : t.photo}
                 </div>
               </div>
 
@@ -1084,7 +1426,7 @@ export default function CustomCanvas({
                 </>
               )}
 
-              {selected.type === 'image' && (
+              {(selected.type === 'image' || selected.type === 'video') && (
                 <>
                   <div style={styles.row}>
                     <div style={styles.label}>{t.shape}</div>
@@ -1118,15 +1460,53 @@ export default function CustomCanvas({
                   <div style={styles.row}>
                     <div style={styles.label}>{t.fit}</div>
                     <select
-                      value={selected.fit || 'contain'}
+                      value={selected.fit || (selected.type === 'video' ? 'cover' : 'contain')}
                       onChange={(e) => updateItem(selected.id, { fit: e.target.value })}
                       style={styles.select}
                       disabled={selected.locked}
                     >
                       <option value="contain">{t.fitContain}</option>
                       <option value="cover">{t.fitCover}</option>
+                      <option value="fill">{t.fitFill}</option>
                     </select>
                   </div>
+
+                  {selected.type === 'video' && (
+                    <>
+                      <div style={styles.row}>
+                        <div style={styles.label}>{t.autoplay}</div>
+                        <button
+                          style={toggleBtn(selected.autoplay !== false)}
+                          onClick={() => updateItem(selected.id, { autoplay: !(selected.autoplay !== false) })}
+                          disabled={selected.locked}
+                        >
+                          {selected.autoplay !== false ? t.on : t.off}
+                        </button>
+                      </div>
+
+                      <div style={styles.row}>
+                        <div style={styles.label}>{t.loop}</div>
+                        <button
+                          style={toggleBtn(selected.loop !== false)}
+                          onClick={() => updateItem(selected.id, { loop: !(selected.loop !== false) })}
+                          disabled={selected.locked}
+                        >
+                          {selected.loop !== false ? t.on : t.off}
+                        </button>
+                      </div>
+
+                      <div style={styles.row}>
+                        <div style={styles.label}>{t.muted}</div>
+                        <button
+                          style={toggleBtn(selected.muted !== false)}
+                          onClick={() => updateItem(selected.id, { muted: !(selected.muted !== false) })}
+                          disabled={selected.locked}
+                        >
+                          {selected.muted !== false ? t.on : t.off}
+                        </button>
+                      </div>
+                    </>
+                  )}
                 </>
               )}
 
@@ -1147,12 +1527,9 @@ export default function CustomCanvas({
           ) : null}
         </div>
       )}
-    </>
+    </div>
   );
 
-  // -----------------------------
-  // Preset storage
-  // -----------------------------
   function loadPresets() {
     try {
       const raw = localStorage.getItem(PRESET_KEY);
@@ -1162,6 +1539,7 @@ export default function CustomCanvas({
       return [];
     }
   }
+
   function persistPresets(arr) {
     localStorage.setItem(PRESET_KEY, JSON.stringify(arr));
   }
@@ -1178,6 +1556,55 @@ function normalizeColorInputValue(color) {
   if (!match) return '#ffffff';
   const toHex = (value) => Number(value).toString(16).padStart(2, '0');
   return `#${toHex(match[1])}${toHex(match[2])}${toHex(match[3])}`;
+}
+
+function GuideOverlay({ guide }) {
+  if (guide.orientation === 'vertical') {
+    return (
+      <div
+        style={{
+          ...styles.guideLineV,
+          left: guide.x,
+          top: guide.y1,
+          height: Math.max(0, guide.y2 - guide.y1),
+        }}
+      />
+    );
+  }
+
+  if (guide.orientation === 'horizontal') {
+    return (
+      <div
+        style={{
+          ...styles.guideLineH,
+          top: guide.y,
+          left: guide.x1,
+          width: Math.max(0, guide.x2 - guide.x1),
+        }}
+      />
+    );
+  }
+
+  if (guide.orientation === 'vertical-segment') {
+    const top = Math.min(guide.y1, guide.y2);
+    const height = Math.abs(guide.y2 - guide.y1);
+    const midY = top + height / 2;
+
+    return (
+      <>
+        <div style={{ ...styles.guideSpacing, left: guide.x, top, height }} />
+        <div style={{ ...styles.guideCap, left: guide.x - 4, top: guide.y1, width: 8 }} />
+        <div style={{ ...styles.guideCap, left: guide.x - 4, top: guide.y2, width: 8 }} />
+        {guide.label ? (
+          <div style={{ ...styles.guideLabel, left: guide.x + 6, top: midY - 8 }}>
+            {guide.label}
+          </div>
+        ) : null}
+      </>
+    );
+  }
+
+  return null;
 }
 
 function ItemBox({ item, selected }) {
@@ -1212,6 +1639,32 @@ function ItemBox({ item, selected }) {
     );
   }
 
+  if (item.type === 'video') {
+    return (
+      <div style={base}>
+        <div style={imageFrameStyle(item)}>
+          <video
+            src={item.src}
+            muted={item.muted !== false}
+            autoPlay={item.autoplay !== false}
+            loop={item.loop !== false}
+            playsInline={item.playsInline !== false}
+            preload="auto"
+            draggable={false}
+            style={{
+              width: '100%',
+              height: '100%',
+              objectFit: item.fit || 'cover',
+              display: 'block',
+              pointerEvents: 'none',
+              background: '#000',
+            }}
+          />
+        </div>
+      </div>
+    );
+  }
+
   return (
     <div style={base}>
       <div
@@ -1237,7 +1690,10 @@ function ItemBox({ item, selected }) {
             fontWeight: item.bold ? 900 : 600,
             fontStyle: item.italic ? 'italic' : 'normal',
             textAlign: item.align || 'left',
-            textShadow: '0 2px 8px rgba(0,0,0,0.55)',
+            textShadow: '0 2px 8px rgba(0,0,0,0.78), 0 0 2px rgba(0,0,0,0.95)',
+            WebkitTextStroke: '1px rgba(0,0,0,0.72)',
+            paintOrder: 'stroke fill',
+            filter: 'drop-shadow(0 1px 1px rgba(0,0,0,0.35))',
             userSelect: 'none',
             whiteSpace: 'pre-wrap',
             wordBreak: 'break-word',
@@ -1261,9 +1717,15 @@ function imageFrameStyle(item) {
     borderRadius: shape === 'rounded' ? radius : (shape === 'circle' ? 9999 : 0),
   };
 
-  if (shape === 'triangle') return { ...common, borderRadius: 0, clipPath: 'polygon(50% 0%, 0% 100%, 100% 100%)' };
-  if (shape === 'diamond') return { ...common, borderRadius: 0, clipPath: 'polygon(50% 0%, 100% 50%, 50% 100%, 0% 50%)' };
-  if (shape === 'rect') return { ...common, borderRadius: 0 };
+  if (shape === 'triangle') {
+    return { ...common, borderRadius: 0, clipPath: 'polygon(50% 0%, 0% 100%, 100% 100%)' };
+  }
+  if (shape === 'diamond') {
+    return { ...common, borderRadius: 0, clipPath: 'polygon(50% 0%, 100% 50%, 50% 100%, 0% 50%)' };
+  }
+  if (shape === 'rect') {
+    return { ...common, borderRadius: 0 };
+  }
   return common;
 }
 
@@ -1271,12 +1733,25 @@ function toggleBtn(active) {
   return {
     padding: '8px 10px',
     borderRadius: 10,
-    border: '1px solid ' + (active ? '#111' : '#ddd'),
+    border: `1px solid ${active ? '#111' : '#ddd'}`,
     background: active ? '#111' : '#fff',
     color: active ? '#fff' : '#111',
     cursor: 'pointer',
     fontWeight: 800,
   };
+}
+
+function clamp(value, min, max) {
+  return Math.max(min, Math.min(max, value));
+}
+
+function rectsIntersect(a, b) {
+  return !(
+    a.left + a.width < b.left ||
+    b.left + b.width < a.left ||
+    a.top + a.height < b.top ||
+    b.top + b.height < a.top
+  );
 }
 
 function maxZ(items) {
@@ -1299,6 +1774,7 @@ function getTexts(lang) {
     addName: '+ 음식이름',
     addPrice: '+ 가격',
     addPhoto: '+ 사진',
+    addVideo: '+ 영상',
     snap: 'Snap',
     grid: 'Grid',
     savePreset: '프리셋 저장',
@@ -1308,6 +1784,8 @@ function getTexts(lang) {
     saved: 'Saved',
     save: '저장',
     cancel: '취소',
+    undo: '되돌리기',
+    redo: '다시실행',
 
     openTools: '도구 열기',
     hideTools: '도구 숨기기',
@@ -1325,6 +1803,7 @@ function getTexts(lang) {
     textName: '텍스트(메뉴명)',
     textPrice: '텍스트(가격)',
     photo: '사진',
+    video: '영상',
 
     locked: '잠금',
     lockedOn: '잠금',
@@ -1351,6 +1830,12 @@ function getTexts(lang) {
     fit: '맞춤',
     fitContain: 'Contain (전체 보이게)',
     fitCover: 'Cover (꽉 채우기)',
+    fitFill: 'Fill (늘려 맞추기)',
+    autoplay: '자동재생',
+    loop: '무한반복',
+    muted: '음소거',
+    on: '켜짐',
+    off: '꺼짐',
 
     left: '왼쪽',
     center: '가운데',
@@ -1376,6 +1861,7 @@ function getTexts(lang) {
     addName: '+ Name',
     addPrice: '+ Price',
     addPhoto: '+ Photo',
+    addVideo: '+ Video',
     snap: 'Snap',
     grid: 'Grid',
     savePreset: 'Save Preset',
@@ -1402,6 +1888,7 @@ function getTexts(lang) {
     textName: 'Text (Name)',
     textPrice: 'Text (Price)',
     photo: 'Photo',
+    video: 'Video',
 
     locked: 'Locked',
     lockedOn: 'Locked',
@@ -1428,6 +1915,12 @@ function getTexts(lang) {
     fit: 'Fit',
     fitContain: 'Contain',
     fitCover: 'Cover',
+    fitFill: 'Fill',
+    autoplay: 'Autoplay',
+    loop: 'Loop',
+    muted: 'Muted',
+    on: 'On',
+    off: 'Off',
 
     left: 'Left',
     center: 'Center',
@@ -1453,7 +1946,6 @@ function getTexts(lang) {
 }
 
 const styles = {
-  // ✅ 툴바: 좌상단 고정
   toolbarFixed: {
     position: 'fixed',
     left: 16,
@@ -1516,14 +2008,12 @@ const styles = {
     fontWeight: 900,
   },
 
-  chk: { display: 'inline-flex', gap: 6, alignItems: 'center', fontSize: 12, fontWeight: 800 },
-  gridNum: { width: 70, padding: '8px 8px', borderRadius: 10, border: 'none', fontWeight: 900 },
   presetSelect: { padding: '8px 10px', borderRadius: 10, border: 'none', fontWeight: 900 },
   sep: { width: 1, height: 20, background: 'rgba(255,255,255,0.25)', margin: '0 4px' },
 
   saveBar: {
     position: 'fixed',
-    right: 16,
+    left: 16,
     bottom: 16,
     zIndex: 9999,
     pointerEvents: 'auto',
@@ -1548,10 +2038,59 @@ const styles = {
     cursor: 'pointer',
   },
 
+  root: {
+    position: 'relative',
+    width: '100%',
+    height: '100%',
+  },
+
   layer: {
     position: 'absolute',
     inset: 0,
     zIndex: 40,
+  },
+  guideLineV: {
+    position: 'absolute',
+    width: 1,
+    borderLeft: `1px dashed ${GUIDE_COLOR}`,
+    pointerEvents: 'none',
+    zIndex: 80,
+  },
+  guideLineH: {
+    position: 'absolute',
+    height: 1,
+    borderTop: `1px dashed ${GUIDE_COLOR}`,
+    pointerEvents: 'none',
+    zIndex: 80,
+  },
+  guideSpacing: {
+    position: 'absolute',
+    width: 1,
+    borderLeft: `1px dashed ${GUIDE_ACCENT}`,
+    pointerEvents: 'none',
+    zIndex: 81,
+  },
+  guideCap: {
+    position: 'absolute',
+    height: 1,
+    borderTop: `1px solid ${GUIDE_ACCENT}`,
+    pointerEvents: 'none',
+    zIndex: 81,
+  },
+  guideLabel: {
+    position: 'absolute',
+    padding: '1px 4px',
+    borderRadius: 4,
+    background: 'rgba(255,255,255,0.96)',
+    color: 'rgba(37,99,235,0.96)',
+    border: '1px solid rgba(59,130,246,0.18)',
+    fontSize: 10,
+    fontWeight: 700,
+    lineHeight: 1.2,
+    letterSpacing: '-0.01em',
+    boxShadow: '0 1px 2px rgba(15,23,42,0.08)',
+    pointerEvents: 'none',
+    zIndex: 82,
   },
 
   itemBox: {
@@ -1577,12 +2116,12 @@ const styles = {
     right: 16,
     zIndex: 9998,
     pointerEvents: 'auto',
-    width: 320,
-    maxHeight: 'calc(100vh - 90px)',
+    width: 280,
+    maxHeight: 'calc(100vh - 170px)',
     overflow: 'auto',
     background: 'rgba(255,255,255,0.95)',
     borderRadius: 16,
-    padding: 12,
+    padding: 10,
     boxShadow: '0 10px 30px rgba(0,0,0,0.25)',
   },
   inspectorTitle: {
@@ -1600,7 +2139,7 @@ const styles = {
   },
   multiGrid: {
     display: 'grid',
-    gridTemplateColumns: '1fr 1fr 1fr',
+    gridTemplateColumns: '1fr 1fr',
     gap: 8,
     marginBottom: 8,
   },
@@ -1664,8 +2203,8 @@ const styles = {
     marginTop: 12,
   },
   actionBtn: {
-    padding: '10px 10px',
-    borderRadius: 12,
+    padding: '8px 8px',
+    borderRadius: 10,
     border: '1px solid #ddd',
     cursor: 'pointer',
     fontWeight: 900,

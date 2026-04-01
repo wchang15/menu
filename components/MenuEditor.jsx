@@ -746,6 +746,19 @@ export default function MenuEditor() {
     }
 
     setBgBlob(file);
+
+    // ✅ "배경(전체) 선택"은 페이지별 override보다 우선해서 전체 페이지에 바로 반영
+    setBgOverrides({});
+    try {
+      await saveJson(bgOverridesKey(lang), {});
+    } catch (e) {
+      console.error(e);
+    }
+
+    if (fileInputRef.current) {
+      fileInputRef.current.value = '';
+    }
+
     // ✅ 업로드 즉시 맨위로
     setTimeout(() => hardResetScrollTop('auto'), 0);
   };
@@ -1124,11 +1137,8 @@ export default function MenuEditor() {
     const pages = Math.max(1, Number(totalPages || 1));
     const base = pages * PAGE_HEIGHT + (pages - 1) * PAGE_GAP;
 
-    // ✅ Custom 편집 중엔 1페이지 여유(드래그로 2페이지 생성 가능)
-    const extra = edit && !preview && layout?.mode === 'custom' ? PAGE_HEIGHT : 0;
-
-    return Math.max(MIN_CONTENT_HEIGHT, base + extra);
-  }, [totalPages, edit, preview, layout?.mode]);
+    return Math.max(MIN_CONTENT_HEIGHT, base);
+  }, [totalPages]);
 
   const fullScrollHeight = useMemo(() => contentHeight, [contentHeight]);
 
@@ -1235,7 +1245,7 @@ export default function MenuEditor() {
           style={{
             position: 'absolute',
             left: 0,
-            right: 0,
+            width: PAGE_WIDTH,
             top,
             height: PAGE_HEIGHT,
             backgroundImage: `url(${useUrl})`,
@@ -1319,14 +1329,14 @@ export default function MenuEditor() {
     else goPrevPage();
   };
 
-  const renderCanvasLayer = (width = '100%') => {
+  const renderCanvasLayer = (width = `${PAGE_WIDTH}px`, height = PAGE_HEIGHT) => {
     if (layout.mode === 'template') {
       return (
-        <div style={{ width }}>
+        <div style={{ position: 'relative', width, height, overflow: 'hidden' }}>
           <TemplateCanvas
             lang={lang}
             editing={edit}
-            uiMode={preview ? 'preview' : 'edit'}
+            uiMode={preview ? 'preview' : edit ? 'edit' : 'view'}
             panelOpen={tplPanelOpen}
             onTogglePanel={(open) => setTplPanelOpen(open)}
             pageHeight={PAGE_HEIGHT}
@@ -1353,14 +1363,16 @@ export default function MenuEditor() {
 
     if (layout.mode === 'custom') {
       return (
-        <div style={{ width }}>
+        <div style={{ position: 'relative', width, height, overflow: 'hidden' }}>
           <CustomCanvas
             lang={lang}
             inspectorTop={118}
             items={layout.items}
             editing={edit}
-            uiMode={preview ? 'preview' : 'edit'}
+            uiMode={preview ? 'preview' : edit ? 'edit' : 'view'}
             scrollRef={stageScrollRef}
+            pageWidth={PAGE_WIDTH}
+            pageHeight={PAGE_HEIGHT}
             onChangeItems={(items) => {
               const next = { ...layout, mode: 'custom', items };
               setLayout(next);
@@ -1850,7 +1862,6 @@ export default function MenuEditor() {
               style={{
                 ...styles.page,
                 height: fullScrollHeight,
-                width: '100%',
               }}
             >
               {renderBgPages()}
@@ -1964,49 +1975,6 @@ export default function MenuEditor() {
                 </div>
               )}
 
-              {/* ✅ 편집 페이지 컨트롤(편집에서만) */}
-              {edit && !preview && (
-                <div style={styles.pageCtrl} onMouseDown={(e) => e.stopPropagation()}>
-                  <button style={styles.pageCtrlBtn} onClick={() => setPageView((v) => !v)}>
-                    {pageView ? T.continuous : T.pageView}
-                  </button>
-
-                  <div style={{ width: 10 }} />
-
-                  <button
-                    style={styles.pageCtrlBtn}
-                    onClick={() => {
-                      const next = Math.max(1, pageIndex - 1);
-                      setPageIndex(next);
-                      if (!pageView) scrollToPage(next);
-                    }}
-                    disabled={pageIndex <= 1}
-                  >
-                    {T.prev}
-                  </button>
-
-                  <div style={styles.pageCtrlText}>
-                    {T.page} {pageIndex} / {totalPages}
-                  </div>
-
-                  <button
-                    style={styles.pageCtrlBtn}
-                    onClick={() => {
-                      const next = Math.min(totalPages, pageIndex + 1);
-                      setPageIndex(next);
-                      if (!pageView) scrollToPage(next);
-                    }}
-                    disabled={pageIndex >= totalPages}
-                  >
-                    {T.next}
-                  </button>
-
-                  <button style={styles.pageCtrlBtn} onClick={() => scrollToPage(pageIndex)}>
-                    {T.jump}
-                  </button>
-                </div>
-              )}
-
               {/* ✅ 보기모드 페이지 인디케이터(옵션: 조용하게) */}
               {!layout.mode && !preview && <div style={styles.helpHint}>{T.help}</div>}
 
@@ -2025,10 +1993,11 @@ export default function MenuEditor() {
 
               {/* ✅ Template */}
               {layout.mode === 'template' && (
+                <div style={{ position: 'relative', width: PAGE_WIDTH, height: '100%', overflow: 'hidden' }}>
                 <TemplateCanvas
                   lang={lang}
                   editing={edit}
-                  uiMode={preview ? 'preview' : 'edit'}
+                  uiMode={preview ? 'preview' : edit ? 'edit' : 'view'}
                   panelOpen={tplPanelOpen}
                   onTogglePanel={(open) => setTplPanelOpen(open)}
                   pageHeight={PAGE_HEIGHT}
@@ -2049,17 +2018,21 @@ export default function MenuEditor() {
                     setTimeout(() => hardResetScrollTop('auto'), 0);
                   }}
                 />
+                </div>
               )}
 
               {/* ✅ Custom */}
               {layout.mode === 'custom' && (
+                <div style={{ position: 'relative', width: PAGE_WIDTH, height: '100%', overflow: 'hidden' }}>
                 <CustomCanvas
                   lang={lang}
                   inspectorTop={118}
                   items={layout.items}
                   editing={edit}
-                  uiMode={preview ? 'preview' : 'edit'}
+                  uiMode={preview ? 'preview' : edit ? 'edit' : 'view'}
                   scrollRef={stageScrollRef}
+            pageWidth={PAGE_WIDTH}
+            pageHeight={PAGE_HEIGHT}
                   onChangeItems={(items) => {
                     const next = { ...layout, mode: 'custom', items };
                     setLayout(next);
@@ -2083,6 +2056,7 @@ export default function MenuEditor() {
                     setTimeout(() => hardResetScrollTop('auto'), 0);
                   }}
                 />
+                </div>
               )}
 
               {/* ✅ 최초 편집 모드 선택 모달 */}
@@ -2367,6 +2341,8 @@ const styles = {
   viewportMover: {
     position: 'relative',
     width: '100%',
+    display: 'flex',
+    justifyContent: 'center',
   },
 
   viewTrackWrap: {
@@ -2426,8 +2402,10 @@ const styles = {
 
   page: {
     position: 'relative',
-    width: '100%',
+    width: 1080,
+    maxWidth: '100%',
     overflow: 'hidden',
+    flex: '0 0 auto',
   },
 
   secretHotspot: {
