@@ -2,6 +2,7 @@
 
 import { useEffect, useMemo, useRef, useState } from 'react';
 import { Rnd } from 'react-rnd';
+import { uploadMenuMediaFile } from '@/lib/layoutMedia';
 
 const FONTS = [
   { label: 'Pretendard', value: 'Pretendard, system-ui, -apple-system, Segoe UI, Roboto, sans-serif' },
@@ -31,6 +32,82 @@ const AUTO_SCROLL_SPEED = 18;
 const GUIDE_COLOR = 'rgba(59,130,246,0.68)';
 const GUIDE_ACCENT = 'rgba(59,130,246,0.88)';
 
+
+function getTextMeasureContext() {
+  if (typeof document === 'undefined') return null;
+  const canvas = getTextMeasureContext._canvas || (getTextMeasureContext._canvas = document.createElement('canvas'));
+  return canvas.getContext('2d');
+}
+
+function clampNumber(value, min, max) {
+  return Math.min(max, Math.max(min, value));
+}
+
+function autoSizeTextItem(item, options = {}) {
+  if (!item || item.type !== 'text') return item;
+
+  const pageWidth = options.pageWidth ?? 1080;
+  const pageHeight = options.pageHeight ?? 2200;
+  const boundHeight = Math.max(pageHeight, Number(options.boundHeight) || 0);
+  const horizontalPadding = options.horizontalPadding ?? 20;
+  const verticalPadding = options.verticalPadding ?? 20;
+  const minWidth = options.minWidth ?? 40;
+  const minHeight = options.minHeight ?? 24;
+  const maxWidth = Math.max(minWidth, Math.round(options.maxWidth ?? (pageWidth - (item.x || 0))));
+  const text = String(item.text ?? '');
+  const fontSize = Number(item.size || 36);
+  const fontWeight = item.bold ? 900 : 600;
+  const fontStyle = item.italic ? 'italic' : 'normal';
+  const fontFamily = item.fontFamily || FONTS[0].value;
+  const lineHeight = Math.max(fontSize * 1.2, fontSize + 6);
+  const ctx = getTextMeasureContext();
+
+  if (!ctx) return item;
+  ctx.font = `${fontStyle} ${fontWeight} ${fontSize}px ${fontFamily}`;
+
+  const rawLines = text.split('\n');
+  const naturalLineWidth = rawLines.reduce((max, line) => {
+    const width = Math.ceil(ctx.measureText(line || ' ').width);
+    return Math.max(max, width);
+  }, 0);
+
+  let boxWidth = clampNumber(naturalLineWidth + horizontalPadding, minWidth, maxWidth);
+  const contentWidth = Math.max(1, boxWidth - horizontalPadding);
+  const wrappedLines = [];
+
+  rawLines.forEach((rawLine) => {
+    const line = rawLine || ' ';
+    let current = '';
+    for (const ch of Array.from(line)) {
+      const next = current + ch;
+      if (!current || ctx.measureText(next).width <= contentWidth) {
+        current = next;
+      } else {
+        wrappedLines.push(current);
+        current = ch;
+      }
+    }
+    wrappedLines.push(current || ' ');
+  });
+
+  const boxHeight = clampNumber(
+    Math.ceil(wrappedLines.length * lineHeight + verticalPadding),
+    minHeight,
+    Math.max(minHeight, boundHeight - (item.y || 0))
+  );
+
+  const boundedX = clampNumber(item.x || 0, 0, Math.max(0, pageWidth - boxWidth));
+  const boundedY = clampNumber(item.y || 0, 0, Math.max(0, boundHeight - boxHeight));
+
+  return {
+    ...item,
+    x: boundedX,
+    y: boundedY,
+    w: boxWidth,
+    h: boxHeight,
+  };
+}
+
 export default function CustomCanvas({
   items = [],
   onChangeItems,
@@ -45,9 +122,22 @@ export default function CustomCanvas({
   pageHeight = 2200,
   pageGap = 40,
   currentPage = 1,
+  fullScrollHeight,
 }) {
   const t = useMemo(() => getTexts(lang), [lang]);
   const incomingItems = useMemo(() => (Array.isArray(items) ? items : []), [items]);
+  const inferredScrollHeight = useMemo(() => {
+    const maxBottom = incomingItems.reduce((max, item) => {
+      const bottom = (Number(item?.y) || 0) + Math.max(0, Number(item?.h) || 0);
+      return Math.max(max, bottom);
+    }, pageHeight);
+
+    const pageUnit = pageHeight + pageGap;
+    const inferredPages = Math.max(1, Math.ceil((maxBottom + pageGap) / pageUnit));
+    return Math.max(pageHeight, inferredPages * pageHeight + (inferredPages - 1) * pageGap);
+  }, [incomingItems, pageHeight, pageGap]);
+
+  const canvasHeight = Math.max(pageHeight, Number(fullScrollHeight) || 0, inferredScrollHeight);
 
   const [draft, setDraft] = useState(incomingItems);
   const [origin, setOrigin] = useState(incomingItems);
@@ -57,6 +147,8 @@ export default function CustomCanvas({
   const [selectedIds, setSelectedIds] = useState([]);
   const selectedId = selectedIds[0] || null;
   const [isDragging, setIsDragging] = useState(false);
+  const [mediaWidthInput, setMediaWidthInput] = useState('');
+  const [mediaHeightInput, setMediaHeightInput] = useState('');
 
   const [snapOn] = useState(true);
 
@@ -73,6 +165,8 @@ export default function CustomCanvas({
 
   const undoStackRef = useRef([]);
   const redoStackRef = useRef([]);
+  const clipboardRef = useRef([]);
+  const pasteCountRef = useRef(0);
 
   const dragAnchorRef = useRef(null);
   const dragSessionRef = useRef(null);
@@ -105,6 +199,41 @@ export default function CustomCanvas({
   const isBorderTransparent = resolvedBorderColor === 'transparent';
   const isEdit = !!editing;
   const isPreview = uiMode === 'preview';
+
+  useEffect(() => {
+    if (selected && (selected.type === 'image' || selected.type === 'video')) {
+      setMediaWidthInput(String(Math.round(selected.w || 0)));
+      setMediaHeightInput(String(Math.round(selected.h || 0)));
+    } else {
+      setMediaWidthInput('');
+      setMediaHeightInput('');
+    }
+  }, [selected?.id, selected?.type, selected?.w, selected?.h]);
+
+  const commitMediaSizeInput = (dimension, rawValue) => {
+    if (!selected || (selected.type !== 'image' && selected.type !== 'video') || selected.locked) return;
+
+    const fallback = Math.round(dimension === 'w' ? (selected.w || 0) : (selected.h || 0));
+    const trimmed = String(rawValue ?? '').trim();
+
+    if (!trimmed) {
+      if (dimension === 'w') setMediaWidthInput(String(fallback));
+      else setMediaHeightInput(String(fallback));
+      return;
+    }
+
+    const parsed = Number(trimmed);
+    const max = dimension === 'w' ? Math.max(20, pageWidth) : Math.max(20, canvasHeight);
+    const nextValue = clamp(Number.isFinite(parsed) ? parsed : fallback, 20, max);
+
+    if (dimension === 'w') {
+      setMediaWidthInput(String(nextValue));
+      updateItem(selected.id, { w: nextValue });
+    } else {
+      setMediaHeightInput(String(nextValue));
+      updateItem(selected.id, { h: nextValue });
+    }
+  };
 
   useEffect(() => {
     setPresets(loadPresets());
@@ -146,14 +275,19 @@ export default function CustomCanvas({
 
   useEffect(() => {
     if (dirty) return;
-    setDraft(incomingItems);
-    setOrigin(incomingItems);
+    const normalizedItems = incomingItems.map((item) => (
+      item?.type === 'text'
+        ? autoSizeTextItem(item, { pageWidth, pageHeight, boundHeight: canvasHeight })
+        : item
+    ));
+    setDraft(normalizedItems);
+    setOrigin(normalizedItems);
     setSelectedIds([]);
     setDirty(false);
     undoStackRef.current = [];
     redoStackRef.current = [];
     setHistoryVersion((v) => v + 1);
-  }, [incomingItems, dirty]);
+  }, [incomingItems, dirty, pageWidth, pageHeight]);
 
   const commit = (next, options = {}) => {
     const { skipHistory = false, previousState = safeItems } = options;
@@ -193,6 +327,26 @@ export default function CustomCanvas({
   const canUndo = undoStackRef.current.length > 0;
   const canRedo = redoStackRef.current.length > 0;
 
+  const getActivePageNumber = () => {
+    const unit = pageHeight + pageGap;
+
+    if (selectedIds.length) {
+      const selectedItem = safeItems.find((it) => it.id === selectedIds[0]);
+      if (selectedItem) {
+        const centerY = (Number(selectedItem.y) || 0) + (Number(selectedItem.h) || 0) / 2;
+        return Math.max(1, Math.floor(centerY / unit) + 1);
+      }
+    }
+
+    const sc = scrollRef?.current;
+    if (sc) {
+      const refY = (Number(sc.scrollTop) || 0) + Math.min(Number(sc.clientHeight) || 0, pageHeight) * 0.35;
+      return Math.max(1, Math.floor(refY / unit) + 1);
+    }
+
+    return Math.max(1, Number(currentPage) || 1);
+  };
+
 
   const applyDraftPreview = (next) => {
     setDraft(next);
@@ -207,7 +361,13 @@ export default function CustomCanvas({
   };
 
   const updateItem = (id, patch) => {
-    const next = safeItems.map((it) => (it.id === id ? { ...it, ...patch } : it));
+    const next = safeItems.map((it) => {
+      if (it.id !== id) return it;
+      const updated = { ...it, ...patch };
+      return updated.type === 'text'
+        ? autoSizeTextItem(updated, { pageWidth, pageHeight, boundHeight: canvasHeight })
+        : updated;
+    });
     commit(next);
   };
 
@@ -216,6 +376,153 @@ export default function CustomCanvas({
     const next = safeItems.filter((it) => !set.has(it.id));
     commit(next);
     setSelectedIds((prev) => prev.filter((id) => !set.has(id)));
+  };
+
+  const cloneClipboardItems = (items = []) => {
+    try {
+      return JSON.parse(JSON.stringify(items));
+    } catch {
+      return [];
+    }
+  };
+
+  const normalizeClipboardItems = (items = []) => {
+    if (!Array.isArray(items)) return [];
+    return cloneClipboardItems(items).filter((it) => it && typeof it === 'object' && it.id);
+  };
+
+  const writeClipboardText = async (items) => {
+    try {
+      if (typeof navigator === 'undefined' || !navigator.clipboard?.writeText) return;
+      await navigator.clipboard.writeText(JSON.stringify({ type: 'menu-items', items }));
+    } catch {}
+  };
+
+  const copySelected = async () => {
+    if (!selectedIds.length) return;
+    const selectedItems = safeItems
+      .filter((it) => selectedIds.includes(it.id))
+      .sort((a, b) => (a.z || 0) - (b.z || 0));
+
+    const normalized = normalizeClipboardItems(selectedItems);
+    if (!normalized.length) return;
+
+    clipboardRef.current = normalized;
+    pasteCountRef.current = 0;
+    await writeClipboardText(normalized);
+  };
+
+  const pasteItems = (itemsToPaste = []) => {
+    const items = normalizeClipboardItems(itemsToPaste.length ? itemsToPaste : clipboardRef.current);
+    if (!items.length) return false;
+
+    pasteCountRef.current += 1;
+    const offset = 28 * pasteCountRef.current;
+    let z = maxZ(safeItems) + 1;
+    const groupMap = new Map();
+
+    const copies = items.map((it) => {
+      const oldGroupId = it.groupId || null;
+      let nextGroupId = null;
+      if (oldGroupId) {
+        if (!groupMap.has(oldGroupId)) groupMap.set(oldGroupId, 'g_' + newId());
+        nextGroupId = groupMap.get(oldGroupId);
+      }
+
+      return {
+        ...it,
+        id: newId(),
+        x: Math.round((Number(it.x) || 0) + offset),
+        y: Math.round((Number(it.y) || 0) + offset),
+        z: ++z,
+        locked: false,
+        groupId: nextGroupId,
+      };
+    });
+
+    commit([...safeItems, ...copies]);
+    setSelectedIds(copies.map((it) => it.id));
+    showInspectorByAdd();
+    return true;
+  };
+
+  const distributeHorizontally = () => {
+    if (selectedIds.length < 2) return;
+    const sel = safeItems
+      .filter((it) => selectedIds.includes(it.id) && !it.locked)
+      .slice();
+    if (sel.length < 2) return;
+
+    const spanX = Math.max(...sel.map((it) => it.x)) - Math.min(...sel.map((it) => it.x));
+    const spanY = Math.max(...sel.map((it) => it.y)) - Math.min(...sel.map((it) => it.y));
+
+    if (spanY > spanX) {
+      const anchor = sel
+        .slice()
+        .sort((a, b) => {
+          if (a.y !== b.y) return a.y - b.y;
+          return a.x - b.x;
+        })[0];
+      const set = new Set(sel.map((it) => it.id));
+      const next = safeItems.map((it) => (
+        set.has(it.id)
+          ? {
+              ...it,
+              x: Math.round(anchor.x),
+              ...(it.type === 'text' ? { align: 'left' } : null),
+            }
+          : it
+      ));
+      commit(next);
+      return;
+    }
+
+    if (sel.length < 3) return;
+    const ordered = sel.slice().sort((a, b) => a.x - b.x);
+    const first = ordered[0];
+    const last = ordered[ordered.length - 1];
+    const totalWidth = ordered.reduce((sum, it) => sum + it.w, 0);
+    const available = (last.x + last.w) - first.x - totalWidth;
+    const gap = available / (ordered.length - 1);
+    if (!Number.isFinite(gap)) return;
+
+    const positions = new Map();
+    let cursor = first.x;
+    ordered.forEach((it, index) => {
+      positions.set(it.id, Math.round(cursor));
+      cursor += it.w + (index < ordered.length - 1 ? gap : 0);
+    });
+
+    const set = new Set(ordered.map((it) => it.id));
+    const next = safeItems.map((it) => (set.has(it.id) ? { ...it, x: positions.get(it.id) ?? it.x } : it));
+    commit(next);
+  };
+
+  const distributeVertically = () => {
+    if (selectedIds.length < 3) return;
+    const sel = safeItems
+      .filter((it) => selectedIds.includes(it.id) && !it.locked)
+      .slice()
+      .sort((a, b) => a.y - b.y);
+    if (sel.length < 3) return;
+
+    const first = sel[0];
+    const last = sel[sel.length - 1];
+    const totalHeight = sel.reduce((sum, it) => sum + it.h, 0);
+    const available = (last.y + last.h) - first.y - totalHeight;
+    const gap = available / (sel.length - 1);
+    if (!Number.isFinite(gap)) return;
+
+    const positions = new Map();
+    let cursor = first.y;
+    sel.forEach((it, index) => {
+      positions.set(it.id, Math.round(cursor));
+      cursor += it.h + (index < sel.length - 1 ? gap : 0);
+    });
+
+    const set = new Set(sel.map((it) => it.id));
+    const next = safeItems.map((it) => (set.has(it.id) ? { ...it, y: positions.get(it.id) ?? it.y } : it));
+    commit(next);
   };
 
   const newId = () => (crypto.randomUUID?.() || String(Date.now() + Math.random()));
@@ -273,7 +580,7 @@ export default function CustomCanvas({
     const id = newId();
     const next = [
       ...safeItems,
-      {
+      autoSizeTextItem({
         id,
         type: 'text',
         role: 'name',
@@ -292,7 +599,7 @@ export default function CustomCanvas({
         z: maxZ(safeItems) + 1,
         locked: false,
         groupId: null,
-      },
+      }, { pageWidth, pageHeight, boundHeight: canvasHeight }),
     ];
     commit(next);
     setSelectedIds([id]);
@@ -304,7 +611,7 @@ export default function CustomCanvas({
     const id = newId();
     const next = [
       ...safeItems,
-      {
+      autoSizeTextItem({
         id,
         type: 'text',
         role: 'price',
@@ -323,38 +630,44 @@ export default function CustomCanvas({
         z: maxZ(safeItems) + 1,
         locked: false,
         groupId: null,
-      },
+      }, { pageWidth, pageHeight, boundHeight: canvasHeight }),
     ];
     commit(next);
     setSelectedIds([id]);
     showInspectorByAdd();
   };
 
-  const addMediaFileAt = async (file, position = {}) => {
-    if (isPreview || !file) return;
+  const buildMediaItemFromFile = async (file, position = {}, baseItems = safeItems, zOffset = 0) => {
+    if (isPreview || !file) return null;
 
     const mime = String(file.type || '').toLowerCase();
     const isImage = mime.startsWith('image/');
     const isVideo = mime.startsWith('video/');
-    if (!isImage && !isVideo) return;
+    if (!isImage && !isVideo) return null;
 
-    const src = await fileToDataUrl(file);
+    const uploaded = await uploadMenuMediaFile(file, { kind: isVideo ? 'video' : 'image' }).catch((error) => {
+      console.error('uploadMenuMediaFile failed', error);
+      return null;
+    });
+    const src = uploaded?.signedUrl || await fileToDataUrl(file);
     const id = newId();
-    const defaultW = isVideo ? 360 : 320;
-    const defaultH = 240;
-    const nextItem = {
+    const defaultW = 218;
+    const defaultH = 145;
+
+    return {
       id,
       type: isVideo ? 'video' : 'image',
       x: clamp(Math.round(position.x ?? 80), 0, Math.max(0, pageWidth - defaultW)),
-      y: clamp(Math.round(position.y ?? 120), 0, Math.max(0, pageHeight - defaultH)),
+      y: clamp(Math.round(position.y ?? 120), 0, Math.max(0, canvasHeight - defaultH)),
       w: defaultW,
       h: defaultH,
       src,
+      assetPath: uploaded?.assetPath || null,
       shape: 'rounded',
       radius: 18,
       fit: isVideo ? 'cover' : 'contain',
       opacity: 1,
-      z: maxZ(safeItems) + 1,
+      z: maxZ(baseItems) + 1 + zOffset,
       locked: false,
       groupId: null,
       ...(isVideo
@@ -366,19 +679,73 @@ export default function CustomCanvas({
           }
         : {}),
     };
+  };
 
-    const next = [...safeItems, nextItem];
+  const addMediaFilesAt = async (files, origin = {}) => {
+    const mediaFiles = (Array.isArray(files) ? files : [files])
+      .filter(Boolean)
+      .filter((file) => /^image\/|^video\//.test(file.type || ''));
+
+    if (isPreview || !mediaFiles.length) return;
+
+    const baseItems = safeItems;
+    const createdItems = [];
+
+    for (let index = 0; index < mediaFiles.length; index += 1) {
+      const nextItem = await buildMediaItemFromFile(
+        mediaFiles[index],
+        {
+          x: (origin.x ?? 80) + index * 18,
+          y: (origin.y ?? 120) + index * 28,
+        },
+        [...baseItems, ...createdItems],
+        index,
+      );
+      if (nextItem) createdItems.push(nextItem);
+    }
+
+    if (!createdItems.length) return;
+
+    const next = [...baseItems, ...createdItems];
     commit(next);
-    setSelectedIds([id]);
+    setSelectedIds(createdItems.map((item) => item.id));
     showInspectorByAdd();
   };
 
-  const addPhoto = async (file) => {
-    await addMediaFileAt(file, { x: 80, y: 120 });
+  const addPhoto = async (files) => {
+    await addMediaFilesAt(files, { x: 80, y: 120 });
   };
 
-  const addVideo = async (file) => {
-    await addMediaFileAt(file, { x: 80, y: 120 });
+  const addVideo = async (files) => {
+    await addMediaFilesAt(files, { x: 80, y: 120 });
+  };
+
+  useEffect(() => {
+    if (!isEdit || isPreview) return undefined;
+
+    const preventBrowserFileDrop = (e) => {
+      const types = Array.from(e.dataTransfer?.types || []);
+      if (types.includes('Files')) {
+        e.preventDefault();
+      }
+    };
+
+    window.addEventListener('dragover', preventBrowserFileDrop);
+    window.addEventListener('drop', preventBrowserFileDrop);
+    return () => {
+      window.removeEventListener('dragover', preventBrowserFileDrop);
+      window.removeEventListener('drop', preventBrowserFileDrop);
+    };
+  }, [isEdit, isPreview]);
+
+  const handleLayerDragEnter = (e) => {
+    if (!isEdit || isPreview) return;
+    const items = Array.from(e.dataTransfer?.items || []);
+    const files = Array.from(e.dataTransfer?.files || []);
+    const hasMedia = items.some((item) => /^image\/|^video\//.test(item.type || '')) || files.some((file) => /^image\/|^video\//.test(file.type || ''));
+    if (!hasMedia) return;
+    e.preventDefault();
+    setDragOverActive(true);
   };
 
   const handleLayerDragOver = (e) => {
@@ -405,11 +772,7 @@ export default function CustomCanvas({
     e.preventDefault();
 
     const point = pointToLayer(e.clientX, e.clientY) || { x: 80, y: 120 };
-    let offsetY = 0;
-    for (const file of files) {
-      await addMediaFileAt(file, { x: point.x + 12 * offsetY, y: point.y + 24 * offsetY });
-      offsetY += 1;
-    }
+    await addMediaFilesAt(files, point);
   };
 
   const clearSelect = () => {
@@ -455,11 +818,12 @@ export default function CustomCanvas({
     const point = pointToLayer(e.clientX, e.clientY);
     if (!point) return;
 
-    marqueeBaseSelectionRef.current = e.shiftKey ? selectedIds : [];
+    const additive = e.shiftKey || e.metaKey || e.ctrlKey;
+    marqueeBaseSelectionRef.current = additive ? selectedIds : [];
     marqueeStartRef.current = point;
     setMarquee({ ...getMarqueeRect(point, point), active: true });
 
-    if (!e.shiftKey) {
+    if (!(e.shiftKey || e.metaKey || e.ctrlKey)) {
       setSelectedIds([]);
       setInspectorVisible(false);
       clearInspectorHideTimer();
@@ -504,7 +868,8 @@ export default function CustomCanvas({
 
     e.stopPropagation();
     setSelectedIds((prev) => {
-      if (!e.shiftKey) return [itemId];
+      const additive = e.shiftKey || e.metaKey || e.ctrlKey;
+      if (!additive) return [itemId];
       if (prev.includes(itemId)) return prev.filter((x) => x !== itemId);
       return [...prev, itemId];
     });
@@ -561,6 +926,18 @@ export default function CustomCanvas({
         return;
       }
 
+      if (modKey && e.key.toLowerCase() === 'c' && selectedIds.length) {
+        e.preventDefault();
+        copySelected();
+        return;
+      }
+
+      if (modKey && e.key.toLowerCase() === 'v') {
+        e.preventDefault();
+        pasteItems();
+        return;
+      }
+
       if ((e.key === 'Delete' || e.key === 'Backspace') && selectedIds.length) {
         e.preventDefault();
         removeMany(selectedIds);
@@ -588,6 +965,36 @@ export default function CustomCanvas({
     return () => window.removeEventListener('keydown', onKey);
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [editing, selectedIds, safeItems, origin, isPreview, historyVersion]);
+
+  useEffect(() => {
+    if (!editing || isPreview) return;
+
+    const onPaste = (e) => {
+      const target = e.target;
+      const isTypingTarget =
+        target instanceof HTMLElement &&
+        (target.tagName === 'INPUT' ||
+          target.tagName === 'TEXTAREA' ||
+          target.tagName === 'SELECT' ||
+          target.isContentEditable);
+
+      if (isTypingTarget) return;
+
+      const raw = e.clipboardData?.getData('text/plain');
+      if (!raw) return;
+
+      try {
+        const parsed = JSON.parse(raw);
+        if (parsed?.type !== 'menu-items' || !Array.isArray(parsed.items)) return;
+        e.preventDefault();
+        clipboardRef.current = normalizeClipboardItems(parsed.items);
+        pasteItems(parsed.items);
+      } catch {}
+    };
+
+    window.addEventListener('paste', onPaste);
+    return () => window.removeEventListener('paste', onPaste);
+  }, [editing, isPreview, safeItems]);
 
   useEffect(() => {
     if (!isEdit || isPreview) return;
@@ -807,8 +1214,29 @@ export default function CustomCanvas({
     showInspectorByAdd();
   };
 
+  const duplicateSelectedToNextPage = () => {
+    if (!selectedIds.length) return;
+    const unit = pageHeight + pageGap;
+    const selectedItems = safeItems.filter((it) => selectedIds.includes(it.id));
+    if (!selectedItems.length) return;
+
+    let z = maxZ(safeItems) + 1;
+    const copies = selectedItems.map((it) => ({
+      ...it,
+      id: newId(),
+      y: (Number(it.y) || 0) + unit,
+      z: ++z,
+      locked: false,
+      groupId: null,
+    }));
+
+    commit([...safeItems, ...copies]);
+    setSelectedIds(copies.map((c) => c.id));
+    showInspectorByAdd();
+  };
+
   const duplicateCurrentPageToNext = () => {
-    const pageNum = Math.max(1, Number(currentPage) || 1);
+    const pageNum = getActivePageNumber();
     const unit = pageHeight + pageGap;
     const pageStart = (pageNum - 1) * unit;
     const pageEnd = pageStart + pageHeight;
@@ -1041,7 +1469,7 @@ export default function CustomCanvas({
   };
 
   return (
-    <div style={{ ...styles.root, width: pageWidth, height: pageHeight, WebkitTextSizeAdjust: '100%', textSizeAdjust: '100%' }}>
+    <div style={{ ...styles.root, width: pageWidth, height: canvasHeight, WebkitTextSizeAdjust: '100%', textSizeAdjust: '100%' }}>
       {isEdit && !isPreview && (
         <>
           {!toolbarVisible && (
@@ -1064,9 +1492,10 @@ export default function CustomCanvas({
                   <input
                     type="file"
                     accept="image/*"
+                    multiple
                     style={{ display: 'none' }}
                     onChange={(e) => {
-                      addPhoto(e.target.files?.[0]);
+                      addPhoto(Array.from(e.target.files || []));
                       e.target.value = '';
                     }}
                   />
@@ -1077,9 +1506,10 @@ export default function CustomCanvas({
                   <input
                     type="file"
                     accept="video/mp4,video/webm,video/quicktime,video/*"
+                    multiple
                     style={{ display: 'none' }}
                     onChange={(e) => {
-                      addVideo(e.target.files?.[0]);
+                      addVideo(Array.from(e.target.files || []));
                       e.target.value = '';
                     }}
                   />
@@ -1093,6 +1523,9 @@ export default function CustomCanvas({
                 <span style={styles.sep} />
 
                 <button style={styles.toolBtnSm} onClick={duplicateCurrentPageToNext}>{t.copyPageToNext}</button>
+                <button style={styles.toolBtnSm} onClick={duplicateSelectedToNextPage} disabled={!selectedIds.length}>{t.copySelectionToNext}</button>
+                <button style={styles.toolBtnSm} onClick={copySelected} disabled={!selectedIds.length}>{t.copy}</button>
+                <button style={styles.toolBtnSm} onClick={() => pasteItems()} disabled={!clipboardRef.current.length}>{t.paste}</button>
 
                 <span style={styles.sep} />
 
@@ -1149,6 +1582,7 @@ export default function CustomCanvas({
           ...(dragOverActive ? styles.layerDragActive : null),
         }}
         onMouseDown={startMarqueeSelect}
+        onDragEnter={handleLayerDragEnter}
         onDragOver={handleLayerDragOver}
         onDragLeave={handleLayerDragLeave}
         onDrop={handleLayerDrop}
@@ -1178,7 +1612,7 @@ export default function CustomCanvas({
         )}
 
         {dragOverActive && (
-          <div style={styles.dropOverlay}>사진이나 영상을 여기로 드래그해서 놓으세요</div>
+          <div style={styles.dropOverlay}>사진/영상을 여러 장 한 번에 드래그해서 놓으세요</div>
         )}
 
         {safeItems
@@ -1206,7 +1640,15 @@ export default function CustomCanvas({
                 }}
                 onClick={(e) => handleItemClick(e, it.id)}
                 onDragStart={(e, d) => {
-                  if (!isEdit || isPreview) return;
+                  if (!isEdit || isPreview) return false;
+
+                  const additive = e.shiftKey || e.metaKey || e.ctrlKey;
+                  if (additive) {
+                    draggedItemRef.current = false;
+                    dragAnchorRef.current = null;
+                    return false;
+                  }
+
                   draggedItemRef.current = false;
                   dragStartPosRef.current = { x: d.x, y: d.y };
                   dragSessionRef.current = { type: 'single', itemId: it.id, startItems: safeItems };
@@ -1321,6 +1763,10 @@ export default function CustomCanvas({
                 <button style={styles.actionBtn} onClick={groupSelected}>{t.group}</button>
                 <button style={styles.actionBtn} onClick={ungroupSelected}>{t.ungroup}</button>
                 <button style={styles.actionBtn} onClick={duplicateSelected}>{t.duplicate}</button>
+                <button style={styles.actionBtn} onClick={copySelected}>{t.copy}</button>
+                <button style={styles.actionBtn} onClick={() => pasteItems()} disabled={!clipboardRef.current.length}>{t.paste}</button>
+                <button style={styles.actionBtn} onClick={distributeHorizontally} disabled={selectedIds.length < 3}>{t.distributeH}</button>
+                <button style={styles.actionBtn} onClick={distributeVertically} disabled={selectedIds.length < 3}>{t.distributeV}</button>
                 <button style={styles.actionBtn} onClick={bringForward}>{t.bring}</button>
                 <button style={styles.actionBtn} onClick={sendBackward}>{t.send}</button>
                 <button style={styles.actionBtn} onClick={lockSelected}>{t.lock}</button>
@@ -1499,6 +1945,44 @@ export default function CustomCanvas({
               {(selected.type === 'image' || selected.type === 'video') && (
                 <>
                   <div style={styles.row}>
+                    <div style={styles.label}>{t.width}</div>
+                    <input
+                      type="text"
+                      inputMode="numeric"
+                      value={mediaWidthInput}
+                      onChange={(e) => {
+                        const next = e.target.value.replace(/[^\d]/g, '');
+                        setMediaWidthInput(next);
+                      }}
+                      onBlur={() => commitMediaSizeInput('w', mediaWidthInput)}
+                      onKeyDown={(e) => {
+                        if (e.key === 'Enter') commitMediaSizeInput('w', mediaWidthInput);
+                      }}
+                      style={styles.num}
+                      disabled={selected.locked}
+                    />
+                  </div>
+
+                  <div style={styles.row}>
+                    <div style={styles.label}>{t.height}</div>
+                    <input
+                      type="text"
+                      inputMode="numeric"
+                      value={mediaHeightInput}
+                      onChange={(e) => {
+                        const next = e.target.value.replace(/[^\d]/g, '');
+                        setMediaHeightInput(next);
+                      }}
+                      onBlur={() => commitMediaSizeInput('h', mediaHeightInput)}
+                      onKeyDown={(e) => {
+                        if (e.key === 'Enter') commitMediaSizeInput('h', mediaHeightInput);
+                      }}
+                      style={styles.num}
+                      disabled={selected.locked}
+                    />
+                  </div>
+
+                  <div style={styles.row}>
                     <div style={styles.label}>{t.shape}</div>
                     <select
                       value={selected.shape || 'rounded'}
@@ -1582,6 +2066,10 @@ export default function CustomCanvas({
 
               <div style={styles.actions}>
                 <button style={styles.actionBtn} onClick={duplicateSelected}>{t.duplicate}</button>
+                <button style={styles.actionBtn} onClick={copySelected}>{t.copy}</button>
+                <button style={styles.actionBtn} onClick={() => pasteItems()} disabled={!clipboardRef.current.length}>{t.paste}</button>
+                <button style={styles.actionBtn} onClick={distributeHorizontally} disabled={selectedIds.length < 3}>{t.distributeH}</button>
+                <button style={styles.actionBtn} onClick={distributeVertically} disabled={selectedIds.length < 3}>{t.distributeV}</button>
                 <button style={styles.actionBtn} onClick={bringForward}>{t.bring}</button>
                 <button style={styles.actionBtn} onClick={sendBackward}>{t.send}</button>
                 <button style={styles.actionBtn} onClick={() => updateItem(selected.id, { locked: true })}>{t.lock}</button>
@@ -1914,6 +2402,8 @@ function getTexts(lang) {
     italic: '기울임',
     align: '정렬',
 
+    width: '가로',
+    height: '세로',
     shape: '모양',
     radius: '둥근 정도',
     fit: '맞춤',
@@ -1936,6 +2426,10 @@ function getTexts(lang) {
     group: '그룹',
     ungroup: '그룹 해제',
     duplicate: '복제',
+    copy: '복사',
+    paste: '붙여넣기',
+    distributeH: '가로 간격 맞춤',
+    distributeV: '세로 간격 맞춤',
     copyPageToNext: '현재 페이지 전체 복제',
     bring: '앞으로',
     send: '뒤로',
@@ -2000,6 +2494,8 @@ function getTexts(lang) {
     italic: 'Italic',
     align: 'Align',
 
+    width: 'Width',
+    height: 'Height',
     shape: 'Shape',
     radius: 'Radius',
     fit: 'Fit',
@@ -2022,6 +2518,10 @@ function getTexts(lang) {
     group: 'Group',
     ungroup: 'Ungroup',
     duplicate: 'Duplicate',
+    copy: 'Copy',
+    paste: 'Paste',
+    distributeH: 'Distribute H',
+    distributeV: 'Distribute V',
     copyPageToNext: 'Copy Page to Next',
     bring: 'Bring +',
     send: 'Send -',

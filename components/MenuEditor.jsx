@@ -11,13 +11,15 @@ import {
   saveJson,
   syncBlobFromCloud,
   syncJsonFromCloud,
+  removeKey,
 } from '@/lib/storage';
 import { clearCurrentUser, setCurrentUser } from '@/lib/session';
 import { supabase } from '@/lib/supabaseClient';
+import { hydrateLayoutMedia, migrateLegacyInlineMedia, sanitizeLayoutMedia } from '@/lib/layoutMedia';
 import CustomCanvas from './CustomCanvas';
 import TemplateCanvas from './TemplateCanvas';
 
-const DEFAULT_LAYOUT = { mode: null, templateId: null, items: [], templateData: null };
+const DEFAULT_LAYOUT = { mode: null, templateId: null, items: [], templateData: null, pageCount: 1 };
 const menuLayoutKey = (language) => `${KEYS.MENU_LAYOUT}_${language || 'en'}`;
 
 // ✅ 옵션들
@@ -254,6 +256,7 @@ export default function MenuEditor() {
   const fileInputRef = useRef(null);
   const introVideoInputRef = useRef(null);
   const pageBgInputRef = useRef(null);
+  const backupImportInputRef = useRef(null);
 
   const [dragOver, setDragOver] = useState(false);
   const [loading, setLoading] = useState(false);
@@ -261,6 +264,9 @@ export default function MenuEditor() {
   const [bgAssetsReady, setBgAssetsReady] = useState(false);
   const [assetUploading, setAssetUploading] = useState(false);
   const [assetUploadMessage, setAssetUploadMessage] = useState('');
+
+  const layoutSnapshotRef = useRef('');
+  const bgSnapshotRef = useRef('');
 
   // ✅ 보기모드에서만 잠깐 보이는 “수정 버튼” 상태
   const [showEditBtn, setShowEditBtn] = useState(false);
@@ -406,13 +412,48 @@ export default function MenuEditor() {
   // ✅ (핵심) 스크롤을 확실히 0으로 리셋하는 함수
   const hardResetScrollTop = (behavior = 'auto') => {
     const sc = stageScrollRef.current;
-    if (!sc) return;
-    sc.scrollTo({ top: 0, behavior });
+    if (sc) {
+      sc.scrollTo({ top: 0, left: 0, behavior });
+      sc.scrollTop = 0;
+      sc.scrollLeft = 0;
+    }
+
+    if (typeof window !== 'undefined') {
+      window.scrollTo({ top: 0, left: 0, behavior });
+    }
+
+    if (typeof document !== 'undefined') {
+      document.documentElement.scrollTop = 0;
+      document.body.scrollTop = 0;
+    }
   };
 
-  const loadBackgrounds = useCallback(async (isCancelled) => {
-    setBgLoading(true);
-    setBgAssetsReady(false);
+  useEffect(() => {
+    try {
+      layoutSnapshotRef.current = JSON.stringify(sanitizeLayoutMedia ? sanitizeLayoutMedia(layout) : layout);
+    } catch {
+      layoutSnapshotRef.current = '';
+    }
+  }, [layout]);
+
+  useEffect(() => {
+    try {
+      const bgMeta = {
+        hasDefault: !!bgBlob,
+        defaultSize: bgBlob?.size || 0,
+        defaultType: bgBlob?.type || '',
+        pages: Object.keys(bgOverrides || {})
+          .sort((a, b) => Number(a) - Number(b))
+          .map((key) => [Number(key), bgOverrides[key]?.size || 0, bgOverrides[key]?.type || '']),
+      };
+      bgSnapshotRef.current = JSON.stringify(bgMeta);
+    } catch {
+      bgSnapshotRef.current = '';
+    }
+  }, [bgBlob, bgOverrides]);
+
+  const loadBackgrounds = useCallback(async (isCancelled, { showLoading = false } = {}) => {
+    let hasLocalBg = false;
     try {
       const bgKey = menuBgKey(lang);
       const localBgLang = await loadLocalBlob(bgKey);
@@ -422,6 +463,7 @@ export default function MenuEditor() {
       if (!localBgLang && localBgLegacy) {
         try { await saveBlob(bgKey, localBgLegacy); } catch {}
       }
+      hasLocalBg = !!bg;
       if (!isCancelled?.() && isBlobLike(bg)) setBgBlob(bg);
 
       // ✅ 페이지별 배경 오버라이드 로드
@@ -446,18 +488,21 @@ export default function MenuEditor() {
           }
           if (isBlobLike(blob)) map[pn] = blob;
         }
+        hasLocalBg = hasLocalBg || Object.keys(map).length > 0;
         if (!isCancelled?.()) setBgOverrides(map);
       } catch {}
     } catch {}
 
-    if (!isCancelled?.()) setBgLoading(false);
+    if (!isCancelled?.() && showLoading && !hasLocalBg) {
+      setBgLoading(true);
+      setBgAssetsReady(false);
+    } else if (!isCancelled?.()) {
+      setBgLoading(false);
+    }
     if (isCancelled?.()) return;
 
     try {
       const syncResult = await syncBlobFromCloud(menuBgKey(lang), {
-        onRemoteDiff: () => {
-          if (!isCancelled?.()) setBgLoading(true);
-        },
       });
       if (!isCancelled?.() && isBlobLike(syncResult?.data)) setBgBlob(syncResult.data);
 
@@ -496,7 +541,7 @@ export default function MenuEditor() {
     if (!userReady) return;
     let cancelled = false;
     const isCancelled = () => cancelled;
-    loadBackgrounds(isCancelled);
+    loadBackgrounds(isCancelled, { showLoading: true });
     return () => {
       cancelled = true;
     };
@@ -525,47 +570,175 @@ export default function MenuEditor() {
     } catch {}
   }, []);
 
+
+  const normalizeLoadedLayout = useCallback((raw) => {
+    const base = raw && typeof raw === 'object' ? raw : DEFAULT_LAYOUT;
+
+    const safeItems = Array.isArray(base.items) ? base.items : [];
+    const safePageBackgrounds =
+      base.pageBackgrounds && typeof base.pageBackgrounds === 'object'
+        ? base.pageBackgrounds
+        : {};
+
+    const pageCountFromItems = safeItems.reduce((max, item) => {
+      const y = Number(item?.y || 0);
+      const h = Number(item?.h || 0);
+      const bottom = Math.max(0, y + h);
+      const page = Math.floor(Math.max(0, bottom - 1) / (PAGE_HEIGHT + PAGE_GAP)) + 1;
+      return Math.max(max, page);
+    }, 1);
+
+    const pageCountFromBackgrounds = Object.keys(safePageBackgrounds).reduce((max, key) => {
+      const n = Number(key);
+      return Number.isFinite(n) ? Math.max(max, n) : max;
+    }, 1);
+
+    const pageCount = Math.max(
+      1,
+      pageCountFromItems,
+      pageCountFromBackgrounds
+    );
+
+    return {
+      mode: base.mode ?? null,
+      templateId: base.templateId ?? null,
+      items: safeItems,
+      templateData: base.templateData ?? null,
+      pageBackgrounds: safePageBackgrounds,
+      pageCount,
+    };
+  }, []);
+
+  const persistLayout = useCallback(
+    async (nextLayout) => {
+      const normalized = normalizeLoadedLayout(nextLayout) || DEFAULT_LAYOUT;
+      const sanitized = sanitizeLayoutMedia
+        ? sanitizeLayoutMedia(normalized)
+        : normalized;
+
+      setLayout(normalized);
+      await saveJson(menuLayoutKey(lang), sanitized);
+      return sanitized;
+    },
+    [lang, normalizeLoadedLayout]
+  );
+
+
+  const refreshLayoutFromCloud = useCallback(
+    async ({ showLoading = false } = {}) => {
+      if (!userReady) return null;
+      if (showLoading) setLoading(true);
+      try {
+        const syncResult = await syncJsonFromCloud(menuLayoutKey(lang), {
+          onRemoteDiff: () => {
+            if (showLoading) setLoading(true);
+          },
+        });
+        if (!syncResult?.data) return null;
+
+        let safeLay = normalizeLoadedLayout(syncResult.data);
+        const migratedRemote = await migrateLegacyInlineMedia(safeLay);
+        safeLay = await hydrateLayoutMedia(migratedRemote.layout);
+
+        const nextSnapshot = JSON.stringify(sanitizeLayoutMedia ? sanitizeLayoutMedia(safeLay) : safeLay);
+        const changed = nextSnapshot !== layoutSnapshotRef.current;
+
+        if (changed) {
+          layoutSnapshotRef.current = nextSnapshot;
+          setLayout(safeLay);
+          if (migratedRemote.changed) {
+            await persistLayout(safeLay);
+          }
+          setTimeout(() => hardResetScrollTop('auto'), 0);
+        }
+
+        return safeLay;
+      } catch (error) {
+        console.error('refreshLayoutFromCloud failed', error);
+        return null;
+      } finally {
+        if (showLoading) setLoading(false);
+      }
+    },
+    [userReady, lang, normalizeLoadedLayout, persistLayout]
+  );
+
+  const refreshBackgroundsFromCloud = useCallback(
+    async ({ showLoading = false } = {}) => {
+      if (!userReady) return;
+      if (showLoading) {
+        await loadBackgrounds(() => false, { showLoading: true });
+        return;
+      }
+
+      try {
+        const nextBg = (await syncBlobFromCloud(menuBgKey(lang)))?.data || (await loadLocalBlob(menuBgKey(lang))) || null;
+        const overrides =
+          (await syncJsonFromCloud(bgOverridesKey(lang)))?.data ||
+          (await loadLocalJson(bgOverridesKey(lang))) ||
+          (await loadLocalJson(LEGACY_BG_OVERRIDES_KEY)) ||
+          {};
+
+        const nextOverrides = {};
+        for (const p of Object.keys(overrides || {})) {
+          const pn = Number(p);
+          if (!Number.isFinite(pn) || pn < 1) continue;
+          const blobSync = await syncBlobFromCloud(bgPageKey(pn, lang));
+          const blob = blobSync?.data || (await loadLocalBlob(bgPageKey(pn, lang))) || null;
+          if (isBlobLike(blob)) nextOverrides[pn] = blob;
+        }
+
+        const nextMeta = JSON.stringify({
+          hasDefault: !!nextBg,
+          defaultSize: nextBg?.size || 0,
+          defaultType: nextBg?.type || '',
+          pages: Object.keys(nextOverrides)
+            .sort((a, b) => Number(a) - Number(b))
+            .map((key) => [Number(key), nextOverrides[key]?.size || 0, nextOverrides[key]?.type || '']),
+        });
+
+        if (nextMeta !== bgSnapshotRef.current) {
+          bgSnapshotRef.current = nextMeta;
+          setBgBlob(nextBg);
+          setBgOverrides(nextOverrides);
+        }
+      } catch (error) {
+        console.error('refreshBackgroundsFromCloud failed', error);
+      }
+    },
+    [userReady, lang, loadBackgrounds]
+  );
+
   useEffect(() => {
     if (!userReady) return;
     let cancelled = false;
     (async () => {
+      let saved = null;
+      let legacy = null;
       try {
         const key = menuLayoutKey(lang);
-        const saved = await loadLocalJson(key);
-        const legacy = saved ? null : await loadLocalJson(KEYS.MENU_LAYOUT);
+        saved = await loadLocalJson(key);
+        legacy = saved ? null : await loadLocalJson(KEYS.MENU_LAYOUT);
         const lay = saved || legacy || DEFAULT_LAYOUT;
 
-        const safeLay = {
-          ...DEFAULT_LAYOUT,
-          ...(lay || {}),
-          templateData: lay?.templateData ?? null,
-        };
+        let safeLay = normalizeLoadedLayout(lay);
+        const migratedLocal = await migrateLegacyInlineMedia(safeLay);
+        safeLay = await hydrateLayoutMedia(migratedLocal.layout);
         if (!cancelled) setLayout(safeLay);
 
         if (!saved && legacy) {
-          await saveJson(key, safeLay);
+          await persistLayout(safeLay);
+        } else if (migratedLocal.changed) {
+          await persistLayout(safeLay);
         }
 
-        // ✅ 로드 직후 스크롤 잔상 방지
         if (!cancelled) setTimeout(() => hardResetScrollTop('auto'), 0);
       } finally {
         if (!cancelled) setLoading(false);
       }
 
-      const syncResult = await syncJsonFromCloud(menuLayoutKey(lang), {
-        onRemoteDiff: () => {
-          if (!cancelled) setLoading(true);
-        },
-      });
-      if (!cancelled && syncResult?.data) {
-        const remoteLay = syncResult.data;
-        const safeLay = {
-          ...DEFAULT_LAYOUT,
-          ...(remoteLay || {}),
-          templateData: remoteLay?.templateData ?? null,
-        };
-        setLayout(safeLay);
-        setTimeout(() => hardResetScrollTop('auto'), 0);
+      if (!cancelled) {
+        await refreshLayoutFromCloud({ showLoading: !saved && !legacy });
       }
 
       if (!cancelled) setLoading(false);
@@ -574,7 +747,50 @@ export default function MenuEditor() {
     return () => {
       cancelled = true;
     };
-  }, [userReady, lang]);
+  }, [userReady, lang, normalizeLoadedLayout, persistLayout, refreshLayoutFromCloud]);
+
+
+  useEffect(() => {
+    setPageIndex(1);
+    requestAnimationFrame(() => {
+      hardResetScrollTop('auto');
+      setTimeout(() => hardResetScrollTop('auto'), 0);
+    });
+  }, [lang]);
+
+
+  useEffect(() => {
+    if (!userReady) return;
+
+    const syncNow = async () => {
+      if (edit) return;
+      await refreshLayoutFromCloud();
+      await refreshBackgroundsFromCloud();
+    };
+
+    const onFocus = () => {
+      syncNow();
+    };
+
+    const onVisibilityChange = () => {
+      if (document.visibilityState === 'visible') {
+        syncNow();
+      }
+    };
+
+    const intervalId = window.setInterval(() => {
+      syncNow();
+    }, 5000);
+
+    window.addEventListener('focus', onFocus);
+    document.addEventListener('visibilitychange', onVisibilityChange);
+
+    return () => {
+      window.clearInterval(intervalId);
+      window.removeEventListener('focus', onFocus);
+      document.removeEventListener('visibilitychange', onVisibilityChange);
+    };
+  }, [userReady, edit, refreshLayoutFromCloud, refreshBackgroundsFromCloud]);
 
   // ✅ 보기 모드에서 텍스트 길게 눌러도 선택/터치 콜아웃이 뜨지 않도록 body 단위 차단
   useEffect(() => {
@@ -640,25 +856,233 @@ export default function MenuEditor() {
   }, [edit, preview]);
 
   const setLanguage = (next) => {
-  if (next === lang) return;
+    if (next === lang) return;
 
-  // ✅ 언어 전환 시 무조건 1페이지로
-  setPageIndex(1);
+    // ✅ 언어 전환 시 무조건 1페이지로
+    setPageIndex(1);
 
-  // ✅ 언어 전환 시, 이전 언어의 배경/페이지오버라이드가 잠깐 보이는 현상 방지
-  setBgBlob(null);
-  setBgOverrides({});
-  setBgAssetsReady(false);
-  setBgLoading(true);
+    // ✅ 언어 전환 시, 이전 언어의 배경/페이지오버라이드가 잠깐 보이는 현상 방지
+    setBgBlob(null);
+    setBgOverrides({});
+    setBgAssetsReady(false);
+    setBgLoading(true);
 
-  setLang(next);
-  try {
-    localStorage.setItem(LANG_KEY, next);
-  } catch {}
+    hardResetScrollTop('auto');
 
-  // ✅ 화면 스크롤 맨 위로
-  setTimeout(() => hardResetScrollTop('auto'), 0);
-};
+    setLang(next);
+    try {
+      localStorage.setItem(LANG_KEY, next);
+    } catch {}
+
+    // ✅ 언어 전환 직후/렌더 후에도 다시 한 번 상단 고정
+    requestAnimationFrame(() => {
+      hardResetScrollTop('auto');
+      setTimeout(() => hardResetScrollTop('auto'), 0);
+    });
+  };
+
+
+  const blobToDataUrl = (blob) => new Promise((resolve, reject) => {
+    if (!blob) {
+      resolve(null);
+      return;
+    }
+    const reader = new FileReader();
+    reader.onload = () => resolve(reader.result);
+    reader.onerror = reject;
+    reader.readAsDataURL(blob);
+  });
+
+  const dataUrlToBlob = async (dataUrl) => {
+    if (!dataUrl || typeof dataUrl !== 'string') return null;
+    const res = await fetch(dataUrl);
+    return await res.blob();
+  };
+
+  const sanitizeLayout = (value) => {
+    if (!value || typeof value !== 'object') return DEFAULT_LAYOUT;
+    return {
+      mode: value.mode ?? null,
+      templateId: value.templateId ?? null,
+      items: Array.isArray(value.items) ? value.items : [],
+      templateData: value.templateData ?? null,
+      pageCount: Math.max(1, Number(value.pageCount || 1)),
+    };
+  };
+
+  const openBackupImportPicker = () => backupImportInputRef.current?.click();
+
+  const exportBackupFile = async () => {
+    try {
+      const payload = {
+        version: 1,
+        exportedAt: new Date().toISOString(),
+        language: lang,
+        layout: sanitizeLayout(layout),
+        backgrounds: {
+          default: bgBlob ? await blobToDataUrl(bgBlob) : null,
+          pages: Object.fromEntries(
+            await Promise.all(
+              Object.entries(bgOverrides || {}).map(async ([page, blob]) => [page, await blobToDataUrl(blob)])
+            )
+          ),
+        },
+      };
+
+      const fileName = `menu-backup-${payload.language}-${payload.exportedAt.slice(0, 10)}.json`;
+      const blob = new Blob([JSON.stringify(payload, null, 2)], { type: 'application/json' });
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement('a');
+      a.href = url;
+      a.download = fileName;
+      document.body.appendChild(a);
+      a.click();
+      a.remove();
+      URL.revokeObjectURL(url);
+      window.alert(T.backupExportDone);
+    } catch (error) {
+      console.error(error);
+      window.alert(T.backupExportFail);
+    }
+  };
+
+  const importBackupFile = async (file) => {
+    if (!file) return;
+    try {
+      const raw = await file.text();
+      const parsed = JSON.parse(raw);
+      const targetLang = parsed?.language === 'ko' || parsed?.language === 'en' ? parsed.language : lang;
+      const nextLayout = sanitizeLayout(parsed?.layout);
+      const backgroundPages = parsed?.backgrounds?.pages && typeof parsed.backgrounds.pages === 'object'
+        ? parsed.backgrounds.pages
+        : {};
+      const highestImportedBgPage = Math.max(1, ...Object.keys(backgroundPages).map((key) => Number(key) || 1));
+      nextLayout.pageCount = Math.max(1, Number(nextLayout.pageCount || 1), highestImportedBgPage);
+      const nextBgBlob = await dataUrlToBlob(parsed?.backgrounds?.default || null);
+
+      const existingIndex = (await loadLocalJson(bgOverridesKey(targetLang))) || {};
+      for (const page of Object.keys(existingIndex)) {
+        if (!(page in backgroundPages)) {
+          await removeKey(bgPageKey(page, targetLang));
+        }
+      }
+
+      if (nextBgBlob) {
+        await saveBlob(menuBgKey(targetLang), nextBgBlob);
+      } else {
+        await removeKey(menuBgKey(targetLang));
+      }
+
+      const nextOverrideIndex = {};
+      const nextOverrideBlobs = {};
+      for (const [page, dataUrl] of Object.entries(backgroundPages)) {
+        const blob = await dataUrlToBlob(dataUrl);
+        if (!blob) continue;
+        nextOverrideBlobs[page] = blob;
+        nextOverrideIndex[page] = true;
+        await saveBlob(bgPageKey(page, targetLang), blob);
+      }
+      await saveJson(bgOverridesKey(targetLang), nextOverrideIndex);
+      await saveJson(menuLayoutKey(targetLang), nextLayout);
+
+      if (targetLang === lang) {
+        setLayout(nextLayout);
+        setBgBlob(nextBgBlob);
+        setBgOverrides(nextOverrideBlobs);
+        setBgAssetsReady(true);
+        setBgLoading(false);
+      } else {
+        setLang(targetLang);
+        try { localStorage.setItem(LANG_KEY, targetLang); } catch {}
+      }
+
+      setPageIndex(1);
+      setPreview(false);
+      setEdit(false);
+      setTimeout(() => hardResetScrollTop('auto'), 0);
+      window.alert(T.backupImportDone);
+    } catch (error) {
+      console.error(error);
+      window.alert(T.backupImportFail);
+    }
+  };
+
+  const cloneBlobSafe = (blob) => {
+    if (!blob) return null;
+    try {
+      return blob.slice(0, blob.size, blob.type);
+    } catch {
+      return blob;
+    }
+  };
+
+  const copyKoreanMenuToEnglish = async () => {
+    try {
+      const sourceLayoutRaw = lang === 'ko' ? layout : ((await loadLocalJson(menuLayoutKey('ko'))) || DEFAULT_LAYOUT);
+      const sourceLayout = sanitizeLayout(sourceLayoutRaw);
+
+      const sourceBgBlob = lang === 'ko'
+        ? bgBlob
+        : await loadLocalBlob(menuBgKey('ko'));
+
+      const sourceOverrideIndex = lang === 'ko'
+        ? Object.fromEntries(Object.keys(bgOverrides || {}).map((page) => [page, true]))
+        : ((await loadLocalJson(bgOverridesKey('ko'))) || {});
+
+      const sourceOverrideBlobs = {};
+      for (const page of Object.keys(sourceOverrideIndex || {})) {
+        sourceOverrideBlobs[page] = lang === 'ko'
+          ? (bgOverrides?.[page] || null)
+          : await loadLocalBlob(bgPageKey(page, 'ko'));
+      }
+
+      const nextLayout = sanitizeLayout(JSON.parse(JSON.stringify(sourceLayout)));
+
+      if (sourceBgBlob) {
+        await saveBlob(menuBgKey('en'), cloneBlobSafe(sourceBgBlob));
+      } else {
+        await removeKey(menuBgKey('en'));
+      }
+
+      const existingTargetIndex = (await loadLocalJson(bgOverridesKey('en'))) || {};
+      for (const page of Object.keys(existingTargetIndex)) {
+        if (!(page in (sourceOverrideIndex || {}))) {
+          await removeKey(bgPageKey(page, 'en'));
+        }
+      }
+
+      const nextOverrideIndex = {};
+      const nextOverrideBlobs = {};
+      for (const page of Object.keys(sourceOverrideIndex || {})) {
+        const blob = sourceOverrideBlobs?.[page];
+        if (!blob) continue;
+        const clonedBlob = cloneBlobSafe(blob);
+        nextOverrideBlobs[page] = clonedBlob;
+        nextOverrideIndex[page] = true;
+        await saveBlob(bgPageKey(page, 'en'), clonedBlob);
+      }
+
+      await saveJson(bgOverridesKey('en'), nextOverrideIndex);
+      await saveJson(menuLayoutKey('en'), nextLayout);
+
+      setLang('en');
+      try { localStorage.setItem(LANG_KEY, 'en'); } catch {}
+      setLayout(nextLayout);
+      setBgBlob(sourceBgBlob ? cloneBlobSafe(sourceBgBlob) : null);
+      setBgOverrides(nextOverrideBlobs);
+      setBgAssetsReady(true);
+      setBgLoading(false);
+      setPageIndex(1);
+      setPreview(false);
+      setEdit(false);
+      setTimeout(() => hardResetScrollTop('auto'), 0);
+
+      window.alert(T.copyKoToEnDone);
+    } catch (error) {
+      console.error(error);
+      window.alert(T.copyKoToEnFail);
+    }
+  };
 
   // ✅ 영상으로 돌아가기
   const goIntro = () => router.push('/intro');
@@ -1044,6 +1468,15 @@ export default function MenuEditor() {
       clearThis: '이 페이지 배경 해제(기본으로)',
       usingOverride: '이 페이지는 오버라이드 배경 사용 중',
       usingDefault: '이 페이지는 기본 배경 사용 중',
+      backupExport: '백업 파일 저장',
+      backupImport: '백업 파일 불러오기',
+      backupExportDone: '백업 파일을 저장했습니다.',
+      backupExportFail: '백업 파일 저장 중 문제가 발생했습니다.',
+      backupImportDone: '백업 파일을 불러왔습니다.',
+      backupImportFail: '백업 파일을 불러오지 못했습니다.',
+      copyKoToEn: '한글 메뉴판 전체를 영어로 복사',
+      copyKoToEnDone: '한글 메뉴판 전체를 영어 메뉴판으로 복사했습니다.',
+      copyKoToEnFail: '영어 메뉴판 복사 중 문제가 발생했습니다.',
     },
     en: {
       pickBgTitle: 'Select a menu background',
@@ -1099,6 +1532,15 @@ export default function MenuEditor() {
       clearThis: 'Clear this page override (use default)',
       usingOverride: 'This page is using an override background',
       usingDefault: 'This page is using the default background',
+      backupExport: 'Save Backup File',
+      backupImport: 'Load Backup File',
+      backupExportDone: 'Backup file saved.',
+      backupExportFail: 'Failed to save backup file.',
+      backupImportDone: 'Backup file restored.',
+      backupImportFail: 'Could not restore the backup file.',
+      copyKoToEn: 'Copy Full Korean Menu to English',
+      copyKoToEnDone: 'Copied the full Korean menu to the English menu.',
+      copyKoToEnFail: 'Failed to copy the menu to English.',
     },
   }[lang];
 
@@ -1135,17 +1577,23 @@ export default function MenuEditor() {
 
     let maxBottom = 0;
     for (const it of items) {
-      const b = (it?.y || 0) + (it?.h || 0);
+      const b = Number(it?.y || 0) + Number(it?.h || 0);
       if (b > maxBottom) maxBottom = b;
     }
 
-    const needed = Math.max(MIN_CONTENT_HEIGHT, Math.ceil(maxBottom + 240));
     const unit = PAGE_HEIGHT + PAGE_GAP;
-    const pages = Math.max(1, Math.ceil((needed + PAGE_GAP) / unit));
+    const occupiedBottom = Math.max(1, Math.ceil(maxBottom));
+    const pages = Math.max(1, Math.floor(Math.max(0, occupiedBottom - 1) / unit) + 1);
     return pages;
   }, [layout, lang]);
 
-  const totalPages = useMemo(() => Math.max(1, Number(computedPages || 1)), [computedPages]);
+  const highestBgOverridePage = useMemo(() => {
+    const keys = Object.keys(bgOverrides || {});
+    if (!keys.length) return 1;
+    return Math.max(1, ...keys.map((key) => Number(key) || 1));
+  }, [bgOverrides]);
+
+  const totalPages = useMemo(() => Math.max(1, Number(computedPages || 1), highestBgOverridePage), [computedPages, highestBgOverridePage]);
 
   // ✅ 컨텐츠 높이
   const contentHeight = useMemo(() => {
@@ -1216,6 +1664,49 @@ export default function MenuEditor() {
     sc.scrollTo({ top, behavior: 'smooth' });
   };
 
+  const getScrollBasedPageIndex = useCallback(() => {
+    const sc = stageScrollRef.current;
+    if (!sc) return Math.min(Math.max(1, Number(pageIndex) || 1), totalPages);
+
+    const unit = PAGE_HEIGHT + PAGE_GAP;
+    const scrollTop = Number(sc.scrollTop || 0);
+    const viewportCenter = scrollTop + Math.max(1, Number(sc.clientHeight || PAGE_HEIGHT)) / 2;
+    const derived = Math.floor(viewportCenter / unit) + 1;
+    return Math.min(Math.max(1, derived), totalPages);
+  }, [pageIndex, totalPages]);
+
+  useEffect(() => {
+    if (!edit || preview || !pageView) return;
+    const sc = stageScrollRef.current;
+    if (!sc) return;
+
+    const syncPageFromScroll = () => {
+      const nextPage = getScrollBasedPageIndex();
+      setPageIndex((prev) => (prev === nextPage ? prev : nextPage));
+    };
+
+    syncPageFromScroll();
+    sc.addEventListener('scroll', syncPageFromScroll, { passive: true });
+    window.addEventListener('resize', syncPageFromScroll);
+
+    return () => {
+      sc.removeEventListener('scroll', syncPageFromScroll);
+      window.removeEventListener('resize', syncPageFromScroll);
+    };
+  }, [edit, preview, pageView, getScrollBasedPageIndex]);
+
+  useEffect(() => {
+    if (!edit) return;
+    setLayout((prev) => {
+      const currentPageCount = Math.max(1, Number(prev?.pageCount || 1));
+      const nextPageCount = Math.max(1, Number(totalPages || 1));
+      if (currentPageCount === nextPageCount) return prev;
+      const next = { ...prev, pageCount: nextPageCount };
+      persistLayout(next);
+      return next;
+    });
+  }, [edit, totalPages, lang]);
+
   useEffect(() => {
     if (!edit) return;
     if (preview) return;
@@ -1227,7 +1718,7 @@ export default function MenuEditor() {
   const handleSaveAll = async () => {
     const next = { ...layout };
     setLayout(next);
-    await saveJson(menuLayoutKey(lang), next);
+    await persistLayout(next);
 
     setPreview(false);
     setEdit(false);
@@ -1361,7 +1852,7 @@ export default function MenuEditor() {
             onChange={(nextData) => {
               const next = { ...layout, mode: 'template', templateData: nextData };
               setLayout(next);
-              saveJson(menuLayoutKey(lang), next);
+              persistLayout(next);
             }}
             onCancel={() => {
               setPreview(false);
@@ -1396,7 +1887,7 @@ export default function MenuEditor() {
             onSave={(items) => {
               const next = { ...layout, mode: 'custom', items };
               setLayout(next);
-              saveJson(menuLayoutKey(lang), next);
+              persistLayout(next);
 
               setPreview(false);
               setEdit(false);
@@ -1519,7 +2010,7 @@ export default function MenuEditor() {
             <div style={{ fontWeight: 900, fontSize: 18, marginBottom: 10 }}>{T.pageBgTitle}</div>
 
             <div style={{ fontWeight: 900, marginBottom: 8 }}>
-              {T.currentPage}: {pageIndex} / {totalPages}
+              {T.currentPage}: {Math.min(Math.max(1, Number(pageIndex) || 1), totalPages)} / {totalPages}
             </div>
 
             <div style={{ fontSize: 13, opacity: 0.75, marginBottom: 10 }}>
@@ -1527,13 +2018,13 @@ export default function MenuEditor() {
             </div>
 
             <div style={{ display: 'flex', gap: 10, flexWrap: 'wrap' }}>
-              <button style={styles.primaryBtn} onClick={openPageBgPicker}>
+              <button style={styles.primaryBtn} onClick={() => { setPageIndex(getScrollBasedPageIndex()); openPageBgPicker(); }}>
                 {T.uploadThis}
               </button>
 
               <button
                 style={styles.secondaryBtn}
-                onClick={() => clearPageBgOverride(pageIndex)}
+                onClick={() => clearPageBgOverride(getScrollBasedPageIndex())}
                 disabled={!hasOverrideThisPage}
               >
                 {T.clearThis}
@@ -1549,7 +2040,7 @@ export default function MenuEditor() {
               type="file"
               accept="image/*"
               style={{ display: 'none' }}
-              onChange={(e) => uploadPageBg(e.target.files?.[0], pageIndex)}
+              onChange={(e) => uploadPageBg(e.target.files?.[0], getScrollBasedPageIndex())}
             />
 
             {assetUploadMessage && (
@@ -1583,7 +2074,7 @@ export default function MenuEditor() {
                   const next = { mode: 'template', templateId: fullId, templateData: data, items: [] };
 
                   setLayout(next);
-                  saveJson(menuLayoutKey(lang), next);
+                  persistLayout(next);
                   setEdit(true);
                   setPreview(false);
                   setPageIndex(1);
@@ -1598,7 +2089,7 @@ export default function MenuEditor() {
                 onClick={() => {
                   const next = { ...layout, mode: 'custom', templateId: null, templateData: null };
                   setLayout(next);
-                  saveJson(menuLayoutKey(lang), next);
+                  persistLayout(next);
                   setEditModeModalOpen(false);
                   setEdit(true);
                   setPreview(false);
@@ -1765,11 +2256,6 @@ export default function MenuEditor() {
           </div>
         )}
 
-        {!edit && !isOverlayOpen && totalPages > 1 && (
-          <div style={styles.viewPageHint}>
-            {pageIndex} / {totalPages}
-          </div>
-        )}
 
         {!showEditBtn && !edit && (
           <div
@@ -1978,6 +2464,18 @@ export default function MenuEditor() {
                     {T.changeBg}
                   </button>
 
+                  <button style={styles.menuBtn} onClick={exportBackupFile}>
+                    {T.backupExport}
+                  </button>
+
+                  <button style={styles.menuBtn} onClick={openBackupImportPicker}>
+                    {T.backupImport}
+                  </button>
+
+                  <button style={styles.menuBtn} onClick={copyKoreanMenuToEnglish}>
+                    {T.copyKoToEn}
+                  </button>
+
                   <button style={styles.menuBtnDark} onClick={() => setPreview(true)}>
                     {T.preview}
                   </button>
@@ -1997,6 +2495,18 @@ export default function MenuEditor() {
                     accept="video/*"
                     style={{ display: 'none' }}
                     onChange={(e) => uploadIntroVideo(e.target.files?.[0])}
+                  />
+
+                  <input
+                    ref={backupImportInputRef}
+                    type="file"
+                    accept="application/json,.json"
+                    style={{ display: 'none' }}
+                    onChange={async (e) => {
+                      const file = e.target.files?.[0];
+                      await importBackupFile(file);
+                      e.target.value = '';
+                    }}
                   />
                 </div>
               )}
@@ -2046,7 +2556,7 @@ export default function MenuEditor() {
                   onChange={(nextData) => {
                     const next = { ...layout, mode: 'template', templateData: nextData };
                     setLayout(next);
-                    saveJson(menuLayoutKey(lang), next);
+                    persistLayout(next);
                   }}
                   onCancel={() => {
                     setPreview(false);
@@ -2078,7 +2588,7 @@ export default function MenuEditor() {
                   onSave={(items) => {
                     const next = { ...layout, mode: 'custom', items };
                     setLayout(next);
-                    saveJson(menuLayoutKey(lang), next);
+                    persistLayout(next);
 
                     setPreview(false);
                     setEdit(false);
@@ -2125,7 +2635,7 @@ export default function MenuEditor() {
                           items: [],
                         };
                         setLayout(next);
-                        saveJson(menuLayoutKey(lang), next);
+                        persistLayout(next);
 
                         setEdit(true);
                         setPreview(false);
@@ -2142,7 +2652,7 @@ export default function MenuEditor() {
                       onClick={() => {
                         const next = { ...layout, mode: 'custom', templateId: null, templateData: null };
                         setLayout(next);
-                        saveJson(menuLayoutKey(lang), next);
+                        persistLayout(next);
                         setEdit(true);
                         setPreview(false);
                         setPageIndex(1);
@@ -2187,7 +2697,7 @@ export default function MenuEditor() {
                           items: [],
                         };
                         setLayout(next);
-                        saveJson(menuLayoutKey(lang), next);
+                        persistLayout(next);
                         setEditModeModalOpen(false);
                         setEdit(true);
                         setPreview(false);
@@ -2204,7 +2714,7 @@ export default function MenuEditor() {
                       onClick={() => {
                         const next = { ...layout, mode: 'custom', templateId: null, templateData: null };
                         setLayout(next);
-                        saveJson(menuLayoutKey(lang), next);
+                        persistLayout(next);
                         setEditModeModalOpen(false);
                         setEdit(true);
                         setPreview(false);
