@@ -359,31 +359,46 @@ export default function MenuEditor() {
   // ✅ 페이지 배경 설정 모달
   const [pageBgModalOpen, setPageBgModalOpen] = useState(false);
 
-  // ✅ viewport height (보기모드 scale용)
+  // ✅ viewport size (모바일/APK 보기모드 fit용)
+  const [vw, setVw] = useState(1280);
   const [vh, setVh] = useState(900);
 
   useEffect(() => {
     const update = () => {
       const vv = typeof window !== 'undefined' ? window.visualViewport : null;
 
+      const widthCandidates = [
+        vv?.width,
+        window.innerWidth,
+        document.documentElement?.clientWidth,
+        window.screen?.width,
+        window.screen?.availWidth,
+      ]
+        .map((v) => Number(v) || 0)
+        .filter(Boolean);
+
       const heightCandidates = [
         vv?.height,
         window.innerHeight,
+        document.documentElement?.clientHeight,
         window.screen?.height,
         window.screen?.availHeight,
       ]
         .map((v) => Number(v) || 0)
         .filter(Boolean);
 
-      setVh(heightCandidates.length ? Math.max(...heightCandidates) : 900);
+      setVw(widthCandidates.length ? Math.min(...widthCandidates) : 1280);
+      setVh(heightCandidates.length ? Math.min(...heightCandidates) : 900);
     };
 
     update();
     window.addEventListener('resize', update);
+    window.addEventListener('orientationchange', update);
     if (window.visualViewport) window.visualViewport.addEventListener('resize', update);
 
     return () => {
       window.removeEventListener('resize', update);
+      window.removeEventListener('orientationchange', update);
       if (window.visualViewport) window.visualViewport.removeEventListener('resize', update);
     };
   }, []);
@@ -1143,19 +1158,18 @@ export default function MenuEditor() {
   const fullScrollHeight = useMemo(() => contentHeight, [contentHeight]);
 
   // ✅ 보기모드에서만: 한 화면=한 페이지 + 스와이프/휠 전환
-  const pageTurnEnabled = useMemo(() => {
-    return !!bgUrl && !edit && !preview && !isOverlayOpen;
-  }, [bgUrl, edit, preview, isOverlayOpen]);
+  const pageTurnEnabled = false;
 
-  // ✅ 보기모드 스케일(화면 높이에 맞추기) / 편집&미리보기는 1:1(크게)
+  // ✅ 보기모드 스케일: 가로/세로 모두 기기 화면 안에 맞추기
   const viewScale = useMemo(() => {
-    const s = (vh || 900) / PAGE_HEIGHT;
-    return Math.max(0.25, Math.min(1, s));
-  }, [vh]);
+    const viewportWidth = Math.max(320, Number(vw) || PAGE_WIDTH);
+    return Math.min(1, viewportWidth / PAGE_WIDTH);
+  }, [vw]);
 
   const effectiveScale = useMemo(() => {
-    return pageTurnEnabled ? viewScale : 1;
-  }, [pageTurnEnabled, viewScale]);
+    if (edit || preview) return 1;
+    return pageTurnEnabled ? viewScale : viewScale;
+  }, [edit, preview, pageTurnEnabled, viewScale]);
 
   const viewTranslateY = useMemo(() => {
     return -((pageIndex - 1) * (PAGE_HEIGHT + PAGE_GAP) * effectiveScale);
@@ -1373,6 +1387,8 @@ export default function MenuEditor() {
             scrollRef={stageScrollRef}
             pageWidth={PAGE_WIDTH}
             pageHeight={PAGE_HEIGHT}
+            pageGap={PAGE_GAP}
+            currentPage={pageIndex}
             onChangeItems={(items) => {
               const next = { ...layout, mode: 'custom', items };
               setLayout(next);
@@ -1845,10 +1861,11 @@ export default function MenuEditor() {
           ref={stageScrollRef}
           style={{
             ...styles.stage,
-            ...styles.viewNoSelect,
+            ...((edit || preview) ? {} : styles.viewNoSelect),
+            overflowX: edit || preview ? 'auto' : 'hidden',
             overflowY: 'auto',
             WebkitOverflowScrolling: 'touch',
-            touchAction: 'pan-y',
+            touchAction: edit || preview ? 'auto' : 'pan-y',
           }}
           onWheel={onWheel}
           onTouchStart={onTouchStart}
@@ -1856,18 +1873,39 @@ export default function MenuEditor() {
           onTouchEnd={onTouchEnd}
         >
           {/* ✅ mover: 보기모드에서만 translate, 편집/미리보기는 none */}
-          <div style={styles.viewportMover}>
-            {/* ✅ content wrapper: 보기모드에서만 scale, 편집/미리보기는 1:1 크게 */}
+          <div
+            style={{
+              ...styles.viewportMover,
+              justifyContent: 'center',
+              paddingLeft: 0,
+              paddingRight: 0,
+              minWidth: edit || preview ? 'max(100%, 1080px)' : '100%',
+            }}
+          >
+            {/* ✅ content wrapper: 보기모드는 실제 박스 폭도 같이 줄여서 Android/WebView 잘림 방지 */}
             <div
               style={{
-                ...styles.page,
-                height: fullScrollHeight,
+                position: 'relative',
+                width: edit || preview ? PAGE_WIDTH : PAGE_WIDTH * effectiveScale,
+                height: edit || preview ? fullScrollHeight : fullScrollHeight * effectiveScale,
+                overflow: 'visible',
+                margin: '0 auto',
+                flex: '0 0 auto',
               }}
             >
-              {renderBgPages()}
+              <div
+                style={{
+                  ...styles.page,
+                  height: fullScrollHeight,
+                  transform: edit || preview ? 'none' : `scale(${effectiveScale})`,
+                  transformOrigin: 'top left',
+                  margin: 0,
+                }}
+              >
+                {renderBgPages()}
 
-              {/* ✅ 편집 중 페이지 구분선 */}
-              {edit && !preview && (
+                {/* ✅ 편집 중 페이지 구분선 */}
+                {edit && !preview && (
                 <>
                   {Array.from({ length: totalPages - 1 }).map((_, i) => {
                     const y = (i + 1) * PAGE_HEIGHT + i * PAGE_GAP;
@@ -2187,6 +2225,7 @@ export default function MenuEditor() {
             </div>
           </div>
         </div>
+      </div>
       )}
 
       {renderFloatingUi()}
@@ -2327,8 +2366,7 @@ const styles = {
     position: 'relative',
     width: '100%',
     height: '100%',
-    overflowX: 'hidden',
-    background: '#000',
+    background: 'transparent',
   },
 
   viewNoSelect: {
@@ -2402,8 +2440,7 @@ const styles = {
 
   page: {
     position: 'relative',
-    width: 1080,
-    maxWidth: '100%',
+    width: PAGE_WIDTH,
     overflow: 'hidden',
     flex: '0 0 auto',
   },

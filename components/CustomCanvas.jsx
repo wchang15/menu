@@ -43,6 +43,8 @@ export default function CustomCanvas({
   scrollRef,
   pageWidth = 1080,
   pageHeight = 2200,
+  pageGap = 40,
+  currentPage = 1,
 }) {
   const t = useMemo(() => getTexts(lang), [lang]);
   const incomingItems = useMemo(() => (Array.isArray(items) ? items : []), [items]);
@@ -83,6 +85,7 @@ export default function CustomCanvas({
   const marqueeHasMovedRef = useRef(false);
 
   const [marquee, setMarquee] = useState(null);
+  const [dragOverActive, setDragOverActive] = useState(false);
 
   const selected = useMemo(
     () => safeItems.find((it) => it.id === selectedId) || null,
@@ -327,65 +330,86 @@ export default function CustomCanvas({
     showInspectorByAdd();
   };
 
-  const addPhoto = async (file) => {
+  const addMediaFileAt = async (file, position = {}) => {
     if (isPreview || !file) return;
+
+    const mime = String(file.type || '').toLowerCase();
+    const isImage = mime.startsWith('image/');
+    const isVideo = mime.startsWith('video/');
+    if (!isImage && !isVideo) return;
+
     const src = await fileToDataUrl(file);
     const id = newId();
-    const next = [
-      ...safeItems,
-      {
-        id,
-        type: 'image',
-        x: 80,
-        y: 120,
-        w: 320,
-        h: 240,
-        src,
-        shape: 'rounded',
-        radius: 18,
-        fit: 'contain',
-        opacity: 1,
-        z: maxZ(safeItems) + 1,
-        locked: false,
-        groupId: null,
-      },
-    ];
+    const defaultW = isVideo ? 360 : 320;
+    const defaultH = 240;
+    const nextItem = {
+      id,
+      type: isVideo ? 'video' : 'image',
+      x: clamp(Math.round(position.x ?? 80), 0, Math.max(0, pageWidth - defaultW)),
+      y: clamp(Math.round(position.y ?? 120), 0, Math.max(0, pageHeight - defaultH)),
+      w: defaultW,
+      h: defaultH,
+      src,
+      shape: 'rounded',
+      radius: 18,
+      fit: isVideo ? 'cover' : 'contain',
+      opacity: 1,
+      z: maxZ(safeItems) + 1,
+      locked: false,
+      groupId: null,
+      ...(isVideo
+        ? {
+            autoplay: true,
+            loop: true,
+            muted: true,
+            playsInline: true,
+          }
+        : {}),
+    };
+
+    const next = [...safeItems, nextItem];
     commit(next);
     setSelectedIds([id]);
     showInspectorByAdd();
   };
 
+  const addPhoto = async (file) => {
+    await addMediaFileAt(file, { x: 80, y: 120 });
+  };
 
   const addVideo = async (file) => {
-    if (isPreview || !file) return;
-    const src = await fileToDataUrl(file);
-    const id = newId();
-    const next = [
-      ...safeItems,
-      {
-        id,
-        type: 'video',
-        x: 80,
-        y: 120,
-        w: 360,
-        h: 240,
-        src,
-        shape: 'rounded',
-        radius: 18,
-        fit: 'cover',
-        opacity: 1,
-        z: maxZ(safeItems) + 1,
-        locked: false,
-        groupId: null,
-        autoplay: true,
-        loop: true,
-        muted: true,
-        playsInline: true,
-      },
-    ];
-    commit(next);
-    setSelectedIds([id]);
-    showInspectorByAdd();
+    await addMediaFileAt(file, { x: 80, y: 120 });
+  };
+
+  const handleLayerDragOver = (e) => {
+    if (!isEdit || isPreview) return;
+    const items = Array.from(e.dataTransfer?.items || []);
+    const files = Array.from(e.dataTransfer?.files || []);
+    const hasMedia = items.some((item) => /^image\/|^video\//.test(item.type || '')) || files.some((file) => /^image\/|^video\//.test(file.type || ''));
+    if (!hasMedia) return;
+    e.preventDefault();
+    e.dataTransfer.dropEffect = 'copy';
+    setDragOverActive(true);
+  };
+
+  const handleLayerDragLeave = (e) => {
+    if (e.target === e.currentTarget) setDragOverActive(false);
+  };
+
+  const handleLayerDrop = async (e) => {
+    if (!isEdit || isPreview) return;
+    const files = Array.from(e.dataTransfer?.files || []).filter((file) => /^image\/|^video\//.test(file.type || ''));
+    setDragOverActive(false);
+    if (!files.length) return;
+
+    e.preventDefault();
+
+    const point = pointToLayer(e.clientX, e.clientY) || { x: 80, y: 120 };
+    let offsetY = 0;
+    for (const file of files) {
+      await addMediaFileAt(file, { x: point.x + 12 * offsetY, y: point.y + 24 * offsetY });
+      offsetY += 1;
+    }
   };
 
   const clearSelect = () => {
@@ -783,6 +807,34 @@ export default function CustomCanvas({
     showInspectorByAdd();
   };
 
+  const duplicateCurrentPageToNext = () => {
+    const pageNum = Math.max(1, Number(currentPage) || 1);
+    const unit = pageHeight + pageGap;
+    const pageStart = (pageNum - 1) * unit;
+    const pageEnd = pageStart + pageHeight;
+
+    const pageItems = safeItems.filter((it) => {
+      const centerY = (Number(it.y) || 0) + (Number(it.h) || 0) / 2;
+      return centerY >= pageStart && centerY < pageEnd;
+    });
+
+    if (!pageItems.length) return;
+
+    let z = maxZ(safeItems) + 1;
+    const copies = pageItems.map((it) => ({
+      ...it,
+      id: newId(),
+      y: (Number(it.y) || 0) + unit,
+      z: ++z,
+      locked: false,
+      groupId: null,
+    }));
+
+    commit([...safeItems, ...copies]);
+    setSelectedIds(copies.map((c) => c.id));
+    showInspectorByAdd();
+  };
+
   const alignLeft = () => {
     if (selectedIds.length < 2) return;
     const sel = safeItems.filter((it) => selectedIds.includes(it.id));
@@ -989,7 +1041,7 @@ export default function CustomCanvas({
   };
 
   return (
-    <div style={{ ...styles.root, width: pageWidth, height: pageHeight }}>
+    <div style={{ ...styles.root, width: pageWidth, height: pageHeight, WebkitTextSizeAdjust: '100%', textSizeAdjust: '100%' }}>
       {isEdit && !isPreview && (
         <>
           {!toolbarVisible && (
@@ -1037,6 +1089,10 @@ export default function CustomCanvas({
 
                 <button style={styles.toolBtnSm} onClick={undo} disabled={!canUndo}>{t.undo}</button>
                 <button style={styles.toolBtnSm} onClick={redo} disabled={!canRedo}>{t.redo}</button>
+
+                <span style={styles.sep} />
+
+                <button style={styles.toolBtnSm} onClick={duplicateCurrentPageToNext}>{t.copyPageToNext}</button>
 
                 <span style={styles.sep} />
 
@@ -1088,8 +1144,14 @@ export default function CustomCanvas({
 
       <div
         ref={layerRef}
-        style={styles.layer}
+        style={{
+          ...styles.layer,
+          ...(dragOverActive ? styles.layerDragActive : null),
+        }}
         onMouseDown={startMarqueeSelect}
+        onDragOver={handleLayerDragOver}
+        onDragLeave={handleLayerDragLeave}
+        onDrop={handleLayerDrop}
         onClick={(e) => {
           if (!isEdit || isPreview) return;
           if (suppressNextLayerClickRef.current) {
@@ -1115,12 +1177,20 @@ export default function CustomCanvas({
           />
         )}
 
+        {dragOverActive && (
+          <div style={styles.dropOverlay}>사진이나 영상을 여기로 드래그해서 놓으세요</div>
+        )}
+
         {safeItems
           .slice()
           .sort((a, b) => (a.z || 0) - (b.z || 0))
           .map((it) => {
             const isSelected = selectedIds.includes(it.id);
             const isLocked = !!it.locked;
+
+            if (!isEdit || isPreview) {
+              return <ViewItem key={it.id} item={it} />;
+            }
 
             return (
               <Rnd
@@ -1607,6 +1677,25 @@ function GuideOverlay({ guide }) {
   return null;
 }
 
+function ViewItem({ item }) {
+  return (
+    <div
+      style={{
+        position: 'absolute',
+        left: item.x || 0,
+        top: item.y || 0,
+        width: item.w || 0,
+        height: item.h || 0,
+        zIndex: item.z || 0,
+        opacity: item.opacity ?? 1,
+        pointerEvents: 'none',
+      }}
+    >
+      <ItemBox item={item} selected={false} />
+    </div>
+  );
+}
+
 function ItemBox({ item, selected }) {
   const resolvedBorderColor = resolveBorderColor(item);
   const border = selected ? styles.itemBoxSelected.border : `2px solid ${resolvedBorderColor}`;
@@ -1847,6 +1936,7 @@ function getTexts(lang) {
     group: '그룹',
     ungroup: '그룹 해제',
     duplicate: '복제',
+    copyPageToNext: '현재 페이지 전체 복제',
     bring: '앞으로',
     send: '뒤로',
     lock: '잠금',
@@ -1932,6 +2022,7 @@ function getTexts(lang) {
     group: 'Group',
     ungroup: 'Ungroup',
     duplicate: 'Duplicate',
+    copyPageToNext: 'Copy Page to Next',
     bring: 'Bring +',
     send: 'Send -',
     lock: 'Lock',
