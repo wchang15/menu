@@ -25,17 +25,24 @@ export default function TemplateCanvas({
   fullScrollHeight,
   panelOpen = true,
   onTogglePanel,
+  viewPageNumber = null,
 }) {
   const isPreview = uiMode === 'preview';
   const isEdit = !!editing && !isPreview;
 
   const wrapRef = useRef(null);
   const [scale, setScale] = useState(1);
+  const resolvedViewPageNumber = Number(viewPageNumber) > 0 ? Math.floor(Number(viewPageNumber)) : null;
 
   const t = useMemo(() => getTexts(lang), [lang]);
 
   // scale 계산
   useEffect(() => {
+    if (resolvedViewPageNumber) {
+      setScale(1);
+      return;
+    }
+
     const el = wrapRef.current;
     if (!el) return;
 
@@ -53,7 +60,7 @@ export default function TemplateCanvas({
       ro.disconnect();
       window.removeEventListener('resize', calc);
     };
-  }, []);
+  }, [resolvedViewPageNumber]);
 
   const safe = useMemo(() => normalizeData(templateId, data, lang), [templateId, data, lang]);
   if (!safe) return null;
@@ -141,7 +148,7 @@ export default function TemplateCanvas({
         <div
           style={{
             width: BASE_W,
-            height: Math.ceil((fullScrollHeight || pageHeight) / scale),
+            height: resolvedViewPageNumber ? pageHeight : Math.ceil((fullScrollHeight || pageHeight) / scale),
             transform: `scale(${scale})`,
             transformOrigin: 'top left',
             position: 'relative',
@@ -159,6 +166,7 @@ export default function TemplateCanvas({
               style={style}
               pageHeight={pageHeight}
               pageGap={pageGap}
+              renderPageNumber={resolvedViewPageNumber}
             />
           )}
 
@@ -175,6 +183,7 @@ export default function TemplateCanvas({
               style={style}
               pageHeight={pageHeight}
               pageGap={pageGap}
+              renderPageNumber={resolvedViewPageNumber}
             />
           )}
 
@@ -190,6 +199,7 @@ export default function TemplateCanvas({
               style={style}
               pageHeight={pageHeight}
               pageGap={pageGap}
+              renderPageNumber={resolvedViewPageNumber}
             />
           )}
         </div>
@@ -489,7 +499,7 @@ export default function TemplateCanvas({
 
 /* -------------------- RENDER: PAGES -------------------- */
 
-function PagedList({ title, restaurantName, logoSrc, rows, currency, style, pageHeight, pageGap, variant }) {
+function PagedList({ title, restaurantName, logoSrc, rows, currency, style, pageHeight, pageGap, variant, renderPageNumber = null }) {
   const rowH = estimateRowH(style);
   const headerH = estimateHeaderH(style);
 
@@ -499,11 +509,13 @@ function PagedList({ title, restaurantName, logoSrc, rows, currency, style, page
   const usableH = pageHeight - paddingTop - 80;
   const perPage = Math.max(1, Math.floor((usableH - headerH) / (rowH + (style.rowGap || 14))));
   const pages = chunk(rows, perPage);
+  const requestedPageIndex = Number(renderPageNumber) > 0 ? Math.floor(Number(renderPageNumber)) - 1 : null;
 
   return (
     <>
       {pages.map((pageRows, pi) => {
-        const top = pi * (pageHeight + pageGap);
+        if (requestedPageIndex !== null && pi !== requestedPageIndex) return null;
+        const top = requestedPageIndex !== null ? 0 : pi * (pageHeight + pageGap);
         return (
           <div
             key={pi}
@@ -547,7 +559,7 @@ function PagedList({ title, restaurantName, logoSrc, rows, currency, style, page
  * - 블록당 메뉴 3~4개
  * - A/B/C 레이아웃 확실히 다르게
  */
-function PagedPhotoList({ title, restaurantName, logoSrc, rows, currency, photos, caption, style, pageHeight, pageGap, variant }) {
+function PagedPhotoList({ title, restaurantName, logoSrc, rows, currency, photos, caption, style, pageHeight, pageGap, variant, renderPageNumber = null }) {
   const paddingTop = 70;
   const paddingX = 70;
 
@@ -566,6 +578,7 @@ function PagedPhotoList({ title, restaurantName, logoSrc, rows, currency, photos
 
   const blocks = chunk(rows, ITEMS_PER_BLOCK);
   const pages = chunk(blocks, blocksPerPage);
+  const requestedPageIndex = Number(renderPageNumber) > 0 ? Math.floor(Number(renderPageNumber)) - 1 : null;
 
   const ph = Array.isArray(photos) ? photos.filter(Boolean) : [];
   const getPhotoForBlock = (bi) => {
@@ -576,7 +589,8 @@ function PagedPhotoList({ title, restaurantName, logoSrc, rows, currency, photos
   return (
     <>
       {pages.map((pageBlocks, pi) => {
-        const top = pi * (pageHeight + pageGap);
+        if (requestedPageIndex !== null && pi !== requestedPageIndex) return null;
+        const top = requestedPageIndex !== null ? 0 : pi * (pageHeight + pageGap);
 
         return (
           <div
@@ -627,7 +641,7 @@ function PagedPhotoList({ title, restaurantName, logoSrc, rows, currency, photos
   );
 }
 
-function PagedGrid({ title, restaurantName, logoSrc, cells, currency, columns = 2, style, pageHeight, pageGap, variant }) {
+function PagedGrid({ title, restaurantName, logoSrc, cells, currency, columns = 2, style, pageHeight, pageGap, variant, renderPageNumber = null }) {
   const col = Math.max(2, Math.min(3, Number(columns) || 2));
   const paddingTop = 70;
   const paddingX = 70;
@@ -642,11 +656,13 @@ function PagedGrid({ title, restaurantName, logoSrc, cells, currency, columns = 
   const perPage = rowsPerPage * col;
 
   const pages = chunk(cells, perPage);
+  const requestedPageIndex = Number(renderPageNumber) > 0 ? Math.floor(Number(renderPageNumber)) - 1 : null;
 
   return (
     <>
       {pages.map((pageCells, pi) => {
-        const top = pi * (pageHeight + pageGap);
+        if (requestedPageIndex !== null && pi !== requestedPageIndex) return null;
+        const top = requestedPageIndex !== null ? 0 : pi * (pageHeight + pageGap);
         return (
           <div
             key={pi}

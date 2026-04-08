@@ -123,6 +123,7 @@ export default function CustomCanvas({
   pageGap = 40,
   currentPage = 1,
   fullScrollHeight,
+  viewPageNumber = null,
 }) {
   const t = useMemo(() => getTexts(lang), [lang]);
   const incomingItems = useMemo(() => (Array.isArray(items) ? items : []), [items]);
@@ -138,6 +139,7 @@ export default function CustomCanvas({
   }, [incomingItems, pageHeight, pageGap]);
 
   const canvasHeight = Math.max(pageHeight, Number(fullScrollHeight) || 0, inferredScrollHeight);
+  const resolvedViewPageNumber = Number(viewPageNumber) > 0 ? Math.floor(Number(viewPageNumber)) : null;
 
   const [draft, setDraft] = useState(incomingItems);
   const [origin, setOrigin] = useState(incomingItems);
@@ -199,6 +201,29 @@ export default function CustomCanvas({
   const isBorderTransparent = resolvedBorderColor === 'transparent';
   const isEdit = !!editing;
   const isPreview = uiMode === 'preview';
+
+  const visibleItems = useMemo(() => {
+    const sorted = safeItems
+      .slice()
+      .sort((a, b) => (a.z || 0) - (b.z || 0));
+
+    if (!resolvedViewPageNumber || isEdit || isPreview) return sorted;
+
+    const pageTop = (resolvedViewPageNumber - 1) * (pageHeight + pageGap);
+    const pageBottom = pageTop + pageHeight;
+
+    return sorted
+      .filter((item) => {
+        const top = Number(item?.y) || 0;
+        const height = Math.max(1, Number(item?.h) || 0);
+        const bottom = top + height;
+        return bottom > pageTop && top < pageBottom;
+      })
+      .map((item) => ({
+        ...item,
+        y: (Number(item?.y) || 0) - pageTop,
+      }));
+  }, [safeItems, resolvedViewPageNumber, pageHeight, pageGap, isEdit, isPreview]);
 
   useEffect(() => {
     if (selected && (selected.type === 'image' || selected.type === 'video')) {
@@ -1469,7 +1494,7 @@ export default function CustomCanvas({
   };
 
   return (
-    <div style={{ ...styles.root, width: pageWidth, height: canvasHeight, WebkitTextSizeAdjust: '100%', textSizeAdjust: '100%' }}>
+    <div style={{ ...styles.root, width: pageWidth, height: resolvedViewPageNumber && !isEdit && !isPreview ? pageHeight : canvasHeight, WebkitTextSizeAdjust: '100%', textSizeAdjust: '100%' }}>
       {isEdit && !isPreview && (
         <>
           {!toolbarVisible && (
@@ -1615,10 +1640,7 @@ export default function CustomCanvas({
           <div style={styles.dropOverlay}>사진/영상을 여러 장 한 번에 드래그해서 놓으세요</div>
         )}
 
-        {safeItems
-          .slice()
-          .sort((a, b) => (a.z || 0) - (b.z || 0))
-          .map((it) => {
+        {visibleItems.map((it) => {
             const isSelected = selectedIds.includes(it.id);
             const isLocked = !!it.locked;
 

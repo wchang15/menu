@@ -9,9 +9,6 @@ import { supabase } from '@/lib/supabaseClient';
 
 const LANG_KEY = 'APP_LANG_V1';
 const INTRO_ASSET_KEY = 'intro-video';
-const BLACK_POSTER = `data:image/svg+xml;charset=UTF-8,${encodeURIComponent(
-  '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 2 2"><rect width="100%" height="100%" fill="black"/></svg>'
-)}`;
 
 export default function IntroPlayer() {
   const router = useRouter();
@@ -22,6 +19,8 @@ export default function IntroPlayer() {
   const [videoVisible, setVideoVisible] = useState(false);
   const [muted, setMuted] = useState(true);
   const [loading, setLoading] = useState(true);
+  // ✅ 로컬/클라우드에서 인트로가 "있는지" 확인되기 전까지는
+  //    업로드 박스가 잠깐 뜨는 플래시를 막기 위한 상태
   const [introResolved, setIntroResolved] = useState(false);
   const [userReady, setUserReady] = useState(false);
   const [lang, setLang] = useState('en');
@@ -48,12 +47,15 @@ export default function IntroPlayer() {
     };
 
     (async () => {
+      // 1) Fast path: already in memory/storage
       const { data } = await supabase.auth.getSession();
       if (data?.session?.user?.id) {
         finalize(data.session);
         return;
       }
 
+      // 2) Mobile WebView: session restoration can lag behind mount.
+      // Wait for INITIAL_SESSION (definitive) or SIGNED_IN.
       const { data: sub } = supabase.auth.onAuthStateChange((event, session) => {
         if (!alive) return;
         if (event === 'INITIAL_SESSION' || event === 'SIGNED_IN' || event === 'TOKEN_REFRESHED') {
@@ -63,11 +65,13 @@ export default function IntroPlayer() {
 
       unsubscribe = () => sub?.subscription?.unsubscribe?.();
 
+      // Safety: if nothing happens, re-check once.
       setTimeout(async () => {
         if (!alive) return;
         const { data: again } = await supabase.auth.getSession();
         if (again?.session?.user?.id) finalize(again.session);
       }, 1200);
+
     })();
 
     return () => {
@@ -93,15 +97,18 @@ export default function IntroPlayer() {
     const cacheBust = (url) => `${url}${url.includes('?') ? '&' : '?'}v=${Date.now()}`;
 
     (async () => {
+      // ✅ 로그인 직후: 아직 인트로가 있는지 없는지 확정 전
       setIntroResolved(false);
       let localBlob = null;
 
+      // 1) 로컬 먼저: 여기서 바로 화면이 떠야 함
       try {
         localBlob = await loadLocalBlob(KEYS.INTRO_VIDEO);
         if (!cancelled && localBlob) setVideoBlob(localBlob);
       } catch {
         // ignore
       } finally {
+        // 로컬이 있으면 여기서 바로 끝(바로 재생)
         if (!cancelled && localBlob) {
           setIntroResolved(true);
           setLoading(false);
@@ -110,6 +117,7 @@ export default function IntroPlayer() {
 
       const hasLocal = !!localBlob;
 
+      // 2) 원격 변경 체크 + 필요할 때만 다운로드 (버전 다를 때만)
       let syncedBlob = null;
       try {
         const syncResult = await syncBlobFromCloud(KEYS.INTRO_VIDEO, {
@@ -121,20 +129,22 @@ export default function IntroPlayer() {
 
         if (!cancelled && syncedBlob) {
           setVideoBlob(syncedBlob);
-          setVideoUrl(null);
+          setVideoUrl(null); // blob URL 재생성 유도
           setIntroResolved(true);
         }
       } catch {
         // ignore
       } finally {
         if (!cancelled) {
+          // 로컬/원격 모두 확인 끝
           setIntroResolved(true);
           setLoading(false);
         }
       }
 
-      const needStream = !hasLocal && !syncedBlob;
-      const needDownloadToCache = !hasLocal && !syncedBlob;
+      // ✅ 여기부터 signed URL은 "필요할 때만" 1번만 받자
+      const needStream = !hasLocal && !syncedBlob; // 로컬도 없고, sync로도 못 받았을 때만 스트리밍 허용
+      const needDownloadToCache = !hasLocal && !syncedBlob; // 로컬 캐시가 아예 없을 때만 dl=1로 캐시 만들기 시도
 
       if (!needStream && !needDownloadToCache) return;
 
@@ -146,10 +156,12 @@ export default function IntroPlayer() {
       }
       if (cancelled || !signedUrl) return;
 
+      // 3) 스트리밍 URL 세팅 (로컬이 없을 때만)
       if (needStream && !cancelled) {
         setVideoUrl(cacheBust(signedUrl));
       }
 
+      // 4) 로컬이 없을 때만: dl=1로 내려받아 로컬 캐시 생성 (중복 다운로드 방지)
       if (needDownloadToCache) {
         fetch(`${signedUrl}${signedUrl.includes('?') ? '&' : '?'}dl=1`, { cache: 'no-store' })
           .then((r) => (r.ok ? r.blob() : null))
@@ -165,6 +177,7 @@ export default function IntroPlayer() {
     };
   }, [userReady]);
 
+
   useEffect(() => {
     if (!userReady) return;
     try {
@@ -174,6 +187,7 @@ export default function IntroPlayer() {
     }
   }, [router, userReady]);
 
+  // blob -> objectURL (로컬/동기화 blob 재생)
   useEffect(() => {
     if (!videoBlob) return;
 
@@ -185,6 +199,7 @@ export default function IntroPlayer() {
     };
   }, [videoBlob]);
 
+  // 자동재생
   useEffect(() => {
     if (!videoUrl) return;
 
@@ -255,7 +270,7 @@ export default function IntroPlayer() {
   const revealVideoFrame = () => {
     const v = videoRef.current;
     if (!v) return;
-    if (v.readyState >= 2 && (!v.paused || v.currentTime > 0)) {
+    if (!v.paused || v.currentTime > 0) {
       setVideoVisible(true);
     }
   };
@@ -283,6 +298,7 @@ export default function IntroPlayer() {
         </div>
       </div>
 
+      {/* ✅ 확인 전/Blob->URL 변환 중에는 업로드 박스를 보여주지 않음(플래시 방지) */}
       {loading || !introResolved || (videoBlob && !videoUrl) ? null : !videoUrl ? (
         <div style={styles.uploadBox}>
           <input type="file" accept="video/*" onChange={(e) => upload(e.target.files?.[0])} />
@@ -293,7 +309,6 @@ export default function IntroPlayer() {
             ref={videoRef}
             key={videoUrl}
             src={videoUrl}
-            poster={BLACK_POSTER}
             autoPlay
             muted={muted}
             playsInline
@@ -304,19 +319,20 @@ export default function IntroPlayer() {
             onPlay={revealVideoFrame}
             onPlaying={revealVideoFrame}
             onTimeUpdate={revealVideoFrame}
-            onLoadedMetadata={revealVideoFrame}
             onLoadedData={revealVideoFrame}
             onCanPlay={revealVideoFrame}
-            onCanPlayThrough={revealVideoFrame}
             onEnded={handleEnded}
             onError={() => {
               const v = videoRef.current;
               console.log('VIDEO_ERROR', v?.error?.code, v?.error?.message, videoUrl);
             }}
-            style={videoVisible ? styles.video : styles.videoPreload}
+            style={{
+              ...styles.video,
+              opacity: videoVisible ? 1 : 0,
+            }}
           />
 
-          <div style={{ ...styles.actionRow, opacity: videoVisible ? 1 : 0 }}>
+          <div style={styles.actionRow}>
             <button onClick={toggleSound} style={styles.soundBtn}>
               {muted ? T.soundOn : T.soundOff}
             </button>
@@ -376,25 +392,9 @@ const styles = {
     background: 'rgba(0,0,0,0.65)',
   },
   video: {
-    position: 'absolute',
-    inset: 0,
     width: '100%',
     height: '100%',
-    background: '#000',
-    objectFit: 'fill',
-    objectPosition: 'center center',
-    opacity: 1,
-    transform: 'translateZ(0)',
-    backfaceVisibility: 'hidden',
-  },
-  videoPreload: {
-    position: 'absolute',
-    top: -9999,
-    left: -9999,
-    width: 1,
-    height: 1,
-    opacity: 0,
-    pointerEvents: 'none',
+    objectFit: 'contain',
   },
   uploadBox: {
     color: '#fff',
@@ -406,7 +406,6 @@ const styles = {
     display: 'flex',
     gap: 10,
     alignItems: 'center',
-    transition: 'opacity 120ms ease-out',
   },
   soundBtn: {
     padding: '10px 14px',

@@ -86,7 +86,6 @@ const VIEW_GUTTER_Y = 24;
 const MIN_VIEW_SCALE = 0.22;
 const VIEW_FILL_SCREEN_X = true;
 const VIEW_PAGE_RENDER_RADIUS = 2;
-const LIVE_MENU_REFRESH_ENABLED = false;
 
 function clampNum(v, min, max) {
   const n = Number(v);
@@ -370,13 +369,8 @@ export default function MenuEditor() {
   const [settingsError, setSettingsError] = useState('');
   const [settingsMsg, setSettingsMsg] = useState('');
 
-  // ✅ 언어 상태 (hydration 이후에만 로컬 저장값을 반영해 초기 이중 로딩 방지)
+  // ✅ 언어 상태
   const [lang, setLang] = useState('en');
-  const [langReady, setLangReady] = useState(false);
-  const [hasInitialView, setHasInitialView] = useState(false);
-  const initialLangRef = useRef(null);
-  const layoutSyncedLangsRef = useRef(new Set());
-  const backgroundSyncedLangsRef = useRef(new Set());
 
   // ✅ 편집창 페이지 단위 보기
   const [pageView, setPageView] = useState(true);
@@ -477,167 +471,99 @@ export default function MenuEditor() {
   }, [bgBlob, bgOverrides]);
 
   const loadBackgrounds = useCallback(async (isCancelled, { showLoading = false } = {}) => {
-    let localBg = null;
-    let localOverrides = {};
     let hasLocalBg = false;
-
     try {
       const bgKey = menuBgKey(lang);
       const localBgLang = await loadLocalBlob(bgKey);
       const localBgLegacy = localBgLang ? null : await loadLocalBlob(KEYS.MENU_BG);
-      const bg = localBgLang || localBgLegacy || null;
-
+      const bg = localBgLang || localBgLegacy;
+      // ✅ legacy -> language key migrate (1회)
       if (!localBgLang && localBgLegacy) {
-        try {
-          await saveBlob(bgKey, localBgLegacy);
-        } catch {}
+        try { await saveBlob(bgKey, localBgLegacy); } catch {}
       }
+      hasLocalBg = !!bg;
+      if (!isCancelled?.() && isBlobLike(bg)) setBgBlob(bg);
 
-      localBg = isBlobLike(bg) ? bg : null;
-
+      // ✅ 페이지별 배경 오버라이드 로드
       try {
         const idxKey = bgOverridesKey(lang);
         const overridesLang = await loadLocalJson(idxKey);
         const overridesLegacy = overridesLang ? null : await loadLocalJson(LEGACY_BG_OVERRIDES_KEY);
         const overrides = overridesLang || overridesLegacy || {};
-
         if (!overridesLang && overridesLegacy) {
-          try {
-            await saveJson(idxKey, overridesLegacy);
-          } catch {}
+          try { await saveJson(idxKey, overridesLegacy); } catch {}
         }
-
         const pages = Object.keys(overrides || {});
         const map = {};
         for (const p of pages) {
           const pn = Number(p);
           if (!Number.isFinite(pn) || pn < 1) continue;
-
           const blobLang = await loadLocalBlob(bgPageKey(pn, lang));
           const blobLegacy = blobLang ? null : await loadLocalBlob(legacyBgPageKey(pn));
-          const blob = blobLang || blobLegacy || null;
-
+          const blob = blobLang || blobLegacy;
           if (!blobLang && blobLegacy) {
-            try {
-              await saveBlob(bgPageKey(pn, lang), blobLegacy);
-            } catch {}
+            try { await saveBlob(bgPageKey(pn, lang), blobLegacy); } catch {}
           }
-
           if (isBlobLike(blob)) map[pn] = blob;
         }
-        localOverrides = map;
+        hasLocalBg = hasLocalBg || Object.keys(map).length > 0;
+        if (!isCancelled?.()) setBgOverrides(map);
       } catch {}
-
-      hasLocalBg = !!localBg || Object.keys(localOverrides).length > 0;
-
-      if (!isCancelled?.() && hasLocalBg) {
-        setBgBlob(localBg);
-        setBgOverrides(localOverrides);
-      }
     } catch {}
 
-    const shouldBlock = showLoading && !hasLocalBg;
-    if (!isCancelled?.()) {
-      if (shouldBlock) {
-        setBgLoading(true);
-        setBgAssetsReady(false);
-      } else {
-        setBgLoading(false);
-      }
+    if (!isCancelled?.() && showLoading && !hasLocalBg) {
+      setBgLoading(true);
+      setBgAssetsReady(false);
+    } else if (!isCancelled?.()) {
+      setBgLoading(false);
     }
-
-    if (isCancelled?.()) return { hasLocalBg };
-
-    const shouldRemoteSync =
-      !backgroundSyncedLangsRef.current.has(lang) &&
-      (lang === initialLangRef.current || !hasLocalBg);
-
-    if (!shouldRemoteSync) {
-      if (!hasLocalBg && !isCancelled?.()) {
-        setBgBlob(null);
-        setBgOverrides({});
-      }
-      return { hasLocalBg };
-    }
-
-    backgroundSyncedLangsRef.current.add(lang);
-
-    let finalBg = localBg;
-    let finalOverrides = localOverrides;
-    let hasAnyBg = hasLocalBg;
+    if (isCancelled?.()) return;
 
     try {
-      const syncResult = await syncBlobFromCloud(menuBgKey(lang));
-      if (isBlobLike(syncResult?.data)) {
-        finalBg = syncResult.data;
-        hasAnyBg = true;
-      }
+      const syncResult = await syncBlobFromCloud(menuBgKey(lang), {
+      });
+      if (!isCancelled?.() && isBlobLike(syncResult?.data)) setBgBlob(syncResult.data);
 
       try {
-        const overridesSync = await syncJsonFromCloud(bgOverridesKey(lang));
-        const overrides =
-          overridesSync?.data ||
-          (await loadLocalJson(bgOverridesKey(lang))) ||
-          (await loadLocalJson(LEGACY_BG_OVERRIDES_KEY)) ||
-          {};
-
+        const overridesSync = await syncJsonFromCloud(bgOverridesKey(lang), {
+          onRemoteDiff: () => {
+            if (!isCancelled?.()) setBgLoading(true);
+          },
+        });
+        const overrides = overridesSync?.data || (await loadLocalJson(bgOverridesKey(lang))) || (await loadLocalJson(LEGACY_BG_OVERRIDES_KEY)) || {};
+        const pages = Object.keys(overrides || {});
         const map = {};
-        for (const p of Object.keys(overrides || {})) {
+        for (const p of pages) {
           const pn = Number(p);
           if (!Number.isFinite(pn) || pn < 1) continue;
-
-          const blobSync = await syncBlobFromCloud(bgPageKey(pn, lang));
+          const blobSync = await syncBlobFromCloud(bgPageKey(pn, lang), {
+            onRemoteDiff: () => {
+              if (!isCancelled?.()) setBgLoading(true);
+            },
+          });
           if (isBlobLike(blobSync?.data)) {
             map[pn] = blobSync.data;
-            continue;
+          } else {
+            const localBlob = await loadLocalBlob(bgPageKey(pn, lang));
+            if (isBlobLike(localBlob)) map[pn] = localBlob;
           }
-
-          const localBlob = await loadLocalBlob(bgPageKey(pn, lang));
-          if (isBlobLike(localBlob)) map[pn] = localBlob;
         }
-
-        finalOverrides = map;
-        hasAnyBg = hasAnyBg || Object.keys(map).length > 0;
+        if (!isCancelled?.()) setBgOverrides(map);
       } catch {}
     } catch {} finally {
-      if (!isCancelled?.()) {
-        if (hasAnyBg) {
-          setBgBlob(finalBg || null);
-          setBgOverrides(finalOverrides || {});
-        } else {
-          setBgBlob(null);
-          setBgOverrides({});
-        }
-        setBgLoading(false);
-      }
+      if (!isCancelled?.()) setBgLoading(false);
     }
-
-    return { hasLocalBg, hasAnyBg };
   }, [lang]);
 
   useEffect(() => {
-    if (!userReady || !langReady) return;
+    if (!userReady) return;
     let cancelled = false;
     const isCancelled = () => cancelled;
     loadBackgrounds(isCancelled, { showLoading: true });
     return () => {
       cancelled = true;
     };
-  }, [userReady, langReady, loadBackgrounds]);
-
-  useEffect(() => {
-    try {
-      const saved = localStorage.getItem(LANG_KEY);
-      const nextLang = saved === 'ko' || saved === 'en' ? saved : 'en';
-      initialLangRef.current = nextLang;
-      setLang(nextLang);
-    } catch {
-      initialLangRef.current = 'en';
-      setLang('en');
-    } finally {
-      setLangReady(true);
-    }
-  }, []);
+  }, [userReady, loadBackgrounds]);
 
   useEffect(() => {
     if (!userReady) return;
@@ -654,6 +580,14 @@ export default function MenuEditor() {
       setPin(DEFAULT_PIN);
     }
   }, [userReady, pinStorageKey]);
+
+  useEffect(() => {
+    try {
+      const saved = localStorage.getItem(LANG_KEY);
+      if (saved === 'ko' || saved === 'en') setLang(saved);
+    } catch {}
+  }, []);
+
 
   const normalizeLoadedLayout = useCallback((raw) => {
     const base = raw && typeof raw === 'object' ? raw : DEFAULT_LAYOUT;
@@ -792,53 +726,35 @@ export default function MenuEditor() {
   );
 
   useEffect(() => {
-    if (!userReady || !langReady) return;
+    if (!userReady) return;
     let cancelled = false;
-
     (async () => {
       let saved = null;
       let legacy = null;
-      let hasLocalLayout = false;
-
       try {
         const key = menuLayoutKey(lang);
         saved = await loadLocalJson(key);
         legacy = saved ? null : await loadLocalJson(KEYS.MENU_LAYOUT);
-        hasLocalLayout = !!saved || !!legacy;
+        const lay = saved || legacy || DEFAULT_LAYOUT;
 
-        if (hasLocalLayout) {
-          const lay = saved || legacy || DEFAULT_LAYOUT;
+        let safeLay = normalizeLoadedLayout(lay);
+        const migratedLocal = await migrateLegacyInlineMediaSafe(safeLay);
+        safeLay = await hydrateLayoutMediaSafe(migratedLocal.layout);
+        if (!cancelled) setLayout(safeLay);
 
-          let safeLay = normalizeLoadedLayout(lay);
-          const migratedLocal = await migrateLegacyInlineMediaSafe(safeLay);
-          safeLay = await hydrateLayoutMediaSafe(migratedLocal.layout);
-
-          if (!cancelled) setLayout(safeLay);
-
-          if (!saved && legacy) {
-            await persistLayout(safeLay);
-          } else if (migratedLocal.changed) {
-            await persistLayout(safeLay);
-          }
-
-          if (!cancelled) setTimeout(() => hardResetScrollTop('auto'), 0);
+        if (!saved && legacy) {
+          await persistLayout(safeLay);
+        } else if (migratedLocal.changed) {
+          await persistLayout(safeLay);
         }
+
+        if (!cancelled) setTimeout(() => hardResetScrollTop('auto'), 0);
       } finally {
         if (!cancelled) setLoading(false);
       }
 
-      const shouldRemoteSync =
-        !layoutSyncedLangsRef.current.has(lang) &&
-        (lang === initialLangRef.current || !hasLocalLayout);
-
-      if (shouldRemoteSync && !cancelled) {
-        layoutSyncedLangsRef.current.add(lang);
-        const remoteLayout = await refreshLayoutFromCloud({ showLoading: !hasLocalLayout });
-        if (!remoteLayout && !hasLocalLayout && !cancelled) {
-          setLayout(DEFAULT_LAYOUT);
-        }
-      } else if (!hasLocalLayout && !cancelled) {
-        setLayout(DEFAULT_LAYOUT);
+      if (!cancelled) {
+        await refreshLayoutFromCloud({ showLoading: !saved && !legacy });
       }
 
       if (!cancelled) setLoading(false);
@@ -847,7 +763,7 @@ export default function MenuEditor() {
     return () => {
       cancelled = true;
     };
-  }, [userReady, langReady, lang, normalizeLoadedLayout, persistLayout, refreshLayoutFromCloud]);
+  }, [userReady, lang, normalizeLoadedLayout, persistLayout, refreshLayoutFromCloud]);
 
 
   useEffect(() => {
@@ -860,8 +776,7 @@ export default function MenuEditor() {
 
 
   useEffect(() => {
-    if (!LIVE_MENU_REFRESH_ENABLED) return;
-    if (!userReady || !langReady) return;
+    if (!userReady) return;
 
     const syncNow = async () => {
       if (edit) return;
@@ -891,7 +806,7 @@ export default function MenuEditor() {
       window.removeEventListener('focus', onFocus);
       document.removeEventListener('visibilitychange', onVisibilityChange);
     };
-  }, [userReady, langReady, edit, refreshLayoutFromCloud, refreshBackgroundsFromCloud]);
+  }, [userReady, edit, refreshLayoutFromCloud, refreshBackgroundsFromCloud]);
 
   // ✅ 보기 모드에서 텍스트 길게 눌러도 선택/터치 콜아웃이 뜨지 않도록 body 단위 차단
   useEffect(() => {
@@ -961,6 +876,13 @@ export default function MenuEditor() {
 
     // ✅ 언어 전환 시 무조건 1페이지로
     setPageIndex(1);
+
+    // ✅ 언어 전환 시, 이전 언어의 배경/페이지오버라이드가 잠깐 보이는 현상 방지
+    setBgBlob(null);
+    setBgOverrides({});
+    setBgAssetsReady(false);
+    setBgLoading(true);
+
     hardResetScrollTop('auto');
 
     setLang(next);
@@ -968,7 +890,7 @@ export default function MenuEditor() {
       localStorage.setItem(LANG_KEY, next);
     } catch {}
 
-    // ✅ 기존 화면을 유지한 채 새 언어 자산을 교체해서 깜빡임 최소화
+    // ✅ 언어 전환 직후/렌더 후에도 다시 한 번 상단 고정
     requestAnimationFrame(() => {
       hardResetScrollTop('auto');
       setTimeout(() => hardResetScrollTop('auto'), 0);
@@ -1225,7 +1147,7 @@ export default function MenuEditor() {
     };
   }, [bgUrl, bgOverrideUrls]);
 
-  // ✅ 배경 이미지 로드 완료까지 대기(초기 표시용 현재 페이지만 선로딩)
+  // ✅ 배경 이미지 로드 완료까지 대기(플래시 방지)
   useEffect(() => {
     if (!bgUrl) {
       setBgAssetsReady(false);
@@ -1233,11 +1155,7 @@ export default function MenuEditor() {
     }
 
     let cancelled = false;
-    const currentPageBgUrl =
-      bgOverrideUrls?.[String(pageIndex)] ||
-      bgOverrideUrls?.[pageIndex] ||
-      bgUrl;
-    const urls = [currentPageBgUrl].filter(Boolean);
+    const urls = [bgUrl, ...Object.values(bgOverrideUrls || {})].filter(Boolean);
 
     setBgAssetsReady(false);
     Promise.all(
@@ -1257,14 +1175,7 @@ export default function MenuEditor() {
     return () => {
       cancelled = true;
     };
-  }, [bgUrl, bgOverrideUrls, pageIndex]);
-
-  useEffect(() => {
-    if (hasInitialView) return;
-    if (!loading && !bgLoading && (!bgUrl || bgAssetsReady)) {
-      setHasInitialView(true);
-    }
-  }, [hasInitialView, loading, bgLoading, bgUrl, bgAssetsReady]);
+  }, [bgUrl, bgOverrideUrls]);
 
   // ✅ 배경이 세팅되면 무조건 맨위로 (2페이지 잔상 방지)
   useEffect(() => {
@@ -2440,7 +2351,7 @@ export default function MenuEditor() {
 
   return (
     <div style={styles.container}>
-      {!hasInitialView && (loading || bgLoading || (bgUrl && !bgAssetsReady)) ? (
+      {loading || bgLoading || (bgUrl && !bgAssetsReady) ? (
         <div style={styles.loadingScreen} aria-label="loading-screen" />
       ) : !bgUrl ? (
         <div style={styles.setupWrap}>
