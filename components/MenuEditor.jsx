@@ -2695,7 +2695,7 @@ export default function MenuEditor() {
 
               {/* ✅ Template */}
               {layout.mode === 'template' && (
-                <div style={{ position: 'relative', width: PAGE_WIDTH, height: '100%', overflow: 'hidden' }}>
+                <div style={{ position: 'relative', width: '100%', height: '100%', overflow: 'hidden' }}>
                 <TemplateCanvas
                   lang={lang}
                   editing={edit}
@@ -2725,7 +2725,7 @@ export default function MenuEditor() {
 
               {/* ✅ Custom */}
               {layout.mode === 'custom' && (
-                <div style={{ position: 'relative', width: PAGE_WIDTH, height: '100%', overflow: 'hidden' }}>
+                <div style={{ position: 'relative', width: '100%', height: '100%', overflow: 'hidden' }}>
                 <CustomCanvas
                   lang={lang}
                   inspectorTop={118}
