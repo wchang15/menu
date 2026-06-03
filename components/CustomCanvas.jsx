@@ -43,6 +43,28 @@ function clampNumber(value, min, max) {
   return Math.min(max, Math.max(min, value));
 }
 
+function parseBulkMenuText(raw) {
+  return String(raw || '')
+    .split(/\r?\n/)
+    .map((line) => line.trim())
+    .filter(Boolean)
+    .slice(0, 60)
+    .map((line) => {
+      const separated = line.split(/\s*(?:\||\t)\s*/).filter(Boolean);
+      if (separated.length >= 2) {
+        return {
+          name: separated.slice(0, -1).join(' ').trim(),
+          price: separated[separated.length - 1].trim(),
+        };
+      }
+
+      const match = line.match(/^(.*?)(\s+[$₩￦€£]?\d[\d,.]*(?:\.\d{1,2})?)$/);
+      if (match) return { name: match[1].trim(), price: match[2].trim() };
+      return { name: line, price: '' };
+    })
+    .filter((entry) => entry.name);
+}
+
 function autoSizeTextItem(item, options = {}) {
   if (!item || item.type !== 'text') return item;
 
@@ -124,6 +146,14 @@ export default function CustomCanvas({
   currentPage = 1,
   fullScrollHeight,
   viewPageNumber = null,
+  interactionScale = 1,
+  interactionScaleX = interactionScale,
+  interactionScaleY = interactionScale,
+  controlsHidden = false,
+  toolsVisible,
+  onToolsVisibleChange,
+  toolsLauncherHidden = false,
+  suppressToolsAutoOpen = false,
 }) {
   const t = useMemo(() => getTexts(lang), [lang]);
   const incomingItems = useMemo(() => (Array.isArray(items) ? items : []), [items]);
@@ -146,6 +176,7 @@ export default function CustomCanvas({
   const safeItems = useMemo(() => (Array.isArray(draft) ? draft : []), [draft]);
 
   const [dirty, setDirty] = useState(false);
+  const dirtyRef = useRef(false);
   const [selectedIds, setSelectedIds] = useState([]);
   const selectedId = selectedIds[0] || null;
   const [isDragging, setIsDragging] = useState(false);
@@ -156,6 +187,8 @@ export default function CustomCanvas({
 
   const [presets, setPresets] = useState([]);
   const [presetSelectedId, setPresetSelectedId] = useState('');
+  const [bulkModalOpen, setBulkModalOpen] = useState(false);
+  const [bulkText, setBulkText] = useState('');
 
   const [inspectorVisible, setInspectorVisible] = useState(false);
   const hideTimerRef = useRef(null);
@@ -201,6 +234,79 @@ export default function CustomCanvas({
   const isBorderTransparent = resolvedBorderColor === 'transparent';
   const isEdit = !!editing;
   const isPreview = uiMode === 'preview';
+  const showEditControls = isEdit && !isPreview && !controlsHidden;
+  const toolbarIsControlled = typeof toolsVisible === 'boolean';
+  const resolvedToolbarVisible = toolbarIsControlled ? toolsVisible : toolbarVisible;
+  const setResolvedToolbarVisible = (next) => {
+    const value = typeof next === 'function' ? next(resolvedToolbarVisible) : next;
+    if (toolbarIsControlled) onToolsVisibleChange?.(!!value);
+    else setToolbarVisible(!!value);
+  };
+  const safeInteractionScaleX = Number.isFinite(Number(interactionScaleX))
+    ? Math.max(0.01, Number(interactionScaleX))
+    : 1;
+  const safeInteractionScaleY = Number.isFinite(Number(interactionScaleY))
+    ? Math.max(0.01, Number(interactionScaleY))
+    : safeInteractionScaleX;
+  const safeInteractionScale = safeInteractionScaleX;
+  const rndInteractionScale = 1;
+
+  const correctDragPoint = (point) => {
+    if (isEdit && !isPreview) {
+      return {
+        ...point,
+        x: (Number(point?.x) || 0) / safeInteractionScaleX,
+        y: (Number(point?.y) || 0) / safeInteractionScaleY,
+      };
+    }
+
+    const start = dragStartPosRef.current;
+    if (!start) return point;
+    return {
+      ...point,
+      x: start.x + (point.x - start.x) * (rndInteractionScale / safeInteractionScaleX),
+      y: start.y + (point.y - start.y) * (rndInteractionScale / safeInteractionScaleY),
+    };
+  };
+
+  const correctResizeBox = (item, ref, pos) => {
+    const dragSession = dragSessionRef.current;
+    const startItem = dragSession?.startItems?.find((candidate) => candidate.id === item.id) || item;
+    const rawWidth = Number(ref?.offsetWidth || item.w || 0);
+    const rawHeight = Number(ref?.offsetHeight || item.h || 0);
+
+    if (isEdit && !isPreview) {
+      return {
+        x: (Number(pos?.x) || 0) / safeInteractionScaleX,
+        y: (Number(pos?.y) || 0) / safeInteractionScaleY,
+        w: Math.max(1, rawWidth / safeInteractionScaleX),
+        h: Math.max(1, rawHeight / safeInteractionScaleY),
+      };
+    }
+
+    return {
+      x: startItem.x + (pos.x - startItem.x) * (rndInteractionScale / safeInteractionScaleX),
+      y: startItem.y + (pos.y - startItem.y) * (rndInteractionScale / safeInteractionScaleY),
+      w: Math.max(1, startItem.w + (rawWidth - startItem.w) * (rndInteractionScale / safeInteractionScaleX)),
+      h: Math.max(1, startItem.h + (rawHeight - startItem.h) * (rndInteractionScale / safeInteractionScaleY)),
+    };
+  };
+
+  const selectedTypeLabel = useMemo(() => {
+    if (!selected) return '';
+    if (selected.type === 'text') return selected.role === 'price' ? t.textPrice : t.textName;
+    if (selected.type === 'video') return t.video;
+    return t.photo;
+  }, [selected, t]);
+
+  const inspectorTitle = useMemo(() => {
+    if (!selected) return t.inspectorTitle;
+    if (selected.type === 'text') return selected.role === 'price' ? t.priceInspectorTitle : t.textInspectorTitle;
+    if (selected.type === 'video') return t.videoInspectorTitle;
+    return t.photoInspectorTitle;
+  }, [selected, t]);
+
+  const bulkEntries = useMemo(() => parseBulkMenuText(bulkText), [bulkText]);
 
   const visibleItems = useMemo(() => {
     const sorted = safeItems
@@ -270,36 +376,38 @@ export default function CustomCanvas({
       setIsDragging(false);
       setSelectedIds([]);
       setInspectorVisible(false);
+      setBulkModalOpen(false);
       clearInspectorHideTimer();
       hideReasonRef.current = null;
-      setToolbarVisible(false);
+      setResolvedToolbarVisible(false);
       setDragGuides([]);
     } else {
       setInspectorVisible(false);
-      setToolbarVisible(false);
+      setResolvedToolbarVisible(false);
       setDragGuides([]);
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [editing]);
+  }, [editing, suppressToolsAutoOpen]);
 
   useEffect(() => {
     if (isPreview) {
       setSelectedIds([]);
       setInspectorVisible(false);
+      setBulkModalOpen(false);
       clearInspectorHideTimer();
       hideReasonRef.current = null;
-      setToolbarVisible(false);
+      setResolvedToolbarVisible(false);
       setDragGuides([]);
     } else if (editing) {
       setInspectorVisible(false);
-      setToolbarVisible(false);
+      setResolvedToolbarVisible(false);
       setDragGuides([]);
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [isPreview, editing]);
+  }, [isPreview, editing, suppressToolsAutoOpen]);
 
   useEffect(() => {
-    if (dirty) return;
+    if (dirtyRef.current || dirty) return;
     const normalizedItems = incomingItems.map((item) => (
       item?.type === 'text'
         ? autoSizeTextItem(item, { pageWidth, pageHeight, boundHeight: canvasHeight })
@@ -308,6 +416,7 @@ export default function CustomCanvas({
     setDraft(normalizedItems);
     setOrigin(normalizedItems);
     setSelectedIds([]);
+    dirtyRef.current = false;
     setDirty(false);
     undoStackRef.current = [];
     redoStackRef.current = [];
@@ -323,6 +432,7 @@ export default function CustomCanvas({
       setHistoryVersion((v) => v + 1);
     }
     setDraft(next);
+    dirtyRef.current = true;
     setDirty(true);
     onChangeItems?.(next);
   };
@@ -333,6 +443,7 @@ export default function CustomCanvas({
     redoStackRef.current.push(safeItems);
     setHistoryVersion((v) => v + 1);
     setDraft(previous);
+    dirtyRef.current = true;
     setDirty(true);
     onChangeItems?.(previous);
     setSelectedIds((prev) => prev.filter((id) => previous.some((item) => item.id === id)));
@@ -344,6 +455,7 @@ export default function CustomCanvas({
     undoStackRef.current.push(safeItems);
     setHistoryVersion((v) => v + 1);
     setDraft(nextState);
+    dirtyRef.current = true;
     setDirty(true);
     onChangeItems?.(nextState);
     setSelectedIds((prev) => prev.filter((id) => nextState.some((item) => item.id === id)));
@@ -375,6 +487,7 @@ export default function CustomCanvas({
 
   const applyDraftPreview = (next) => {
     setDraft(next);
+    dirtyRef.current = true;
     setDirty(true);
     onChangeItems?.(next);
   };
@@ -434,6 +547,7 @@ export default function CustomCanvas({
 
     clipboardRef.current = normalized;
     pasteCountRef.current = 0;
+    setHistoryVersion((v) => v + 1);
     await writeClipboardText(normalized);
   };
 
@@ -588,6 +702,7 @@ export default function CustomCanvas({
 
   const showInspectorBySelect = () => {
     if (!INSPECTOR_ENABLED || isPreview) return;
+    setResolvedToolbarVisible(false);
     setInspectorVisible(true);
     hideReasonRef.current = 'select';
     clearInspectorHideTimer();
@@ -595,6 +710,7 @@ export default function CustomCanvas({
 
   const showInspectorByAdd = () => {
     if (!INSPECTOR_ENABLED || isPreview) return;
+    setResolvedToolbarVisible(false);
     setInspectorVisible(true);
     hideReasonRef.current = 'add';
     clearInspectorHideTimer();
@@ -662,6 +778,88 @@ export default function CustomCanvas({
     showInspectorByAdd();
   };
 
+  const openBulkAddMenu = () => {
+    if (isPreview) return;
+    setBulkText((prev) => prev || t.bulkPromptExample);
+    setBulkModalOpen(true);
+  };
+
+  const bulkAddMenuItems = () => {
+    if (isPreview) return;
+    const entries = bulkEntries;
+    if (!entries.length) {
+      return;
+    }
+
+    const pageStartY = (Math.max(1, Number(currentPage) || 1) - 1) * (pageHeight + pageGap);
+    const rowGap = 78;
+    const rowsPerPage = Math.max(1, Math.floor((pageHeight - 220) / rowGap));
+    let z = maxZ(safeItems) + 1;
+    const created = [];
+
+    entries.forEach((entry, index) => {
+      const pageOffset = Math.floor(index / rowsPerPage);
+      const row = index % rowsPerPage;
+      const y = pageStartY + pageOffset * (pageHeight + pageGap) + 120 + row * rowGap;
+      const boundHeight = Math.max(canvasHeight, y + 180);
+      const nameId = newId();
+
+      created.push(
+        autoSizeTextItem({
+          id: nameId,
+          type: 'text',
+          role: 'name',
+          x: 72,
+          y,
+          w: 560,
+          h: 58,
+          text: entry.name,
+          fontFamily: FONTS[0].value,
+          size: 38,
+          color: '#ffffff',
+          bold: true,
+          italic: false,
+          align: 'left',
+          opacity: 1,
+          z: z++,
+          locked: false,
+          groupId: null,
+        }, { pageWidth, pageHeight, boundHeight })
+      );
+
+      if (entry.price) {
+        const priceId = newId();
+        created.push(
+          autoSizeTextItem({
+            id: priceId,
+            type: 'text',
+            role: 'price',
+            x: 690,
+            y,
+            w: 260,
+            h: 58,
+            text: entry.price,
+            fontFamily: FONTS[0].value,
+            size: 38,
+            color: '#ffffff',
+            bold: true,
+            italic: false,
+            align: 'right',
+            opacity: 1,
+            z: z++,
+            locked: false,
+            groupId: null,
+          }, { pageWidth, pageHeight, boundHeight })
+        );
+      }
+    });
+
+    commit([...safeItems, ...created]);
+    setSelectedIds(created.slice(0, Math.min(2, created.length)).map((item) => item.id));
+    setBulkModalOpen(false);
+    showInspectorByAdd();
+  };
+
   const buildMediaItemFromFile = async (file, position = {}, baseItems = safeItems, zOffset = 0) => {
     if (isPreview || !file) return null;
 
@@ -690,7 +888,7 @@ export default function CustomCanvas({
       assetPath: uploaded?.assetPath || null,
       shape: 'rounded',
       radius: 18,
-      fit: isVideo ? 'cover' : 'contain',
+      fit: 'contain',
       opacity: 1,
       z: maxZ(baseItems) + 1 + zOffset,
       locked: false,
@@ -812,8 +1010,8 @@ export default function CustomCanvas({
     if (!layer) return null;
     const rect = layer.getBoundingClientRect();
     return {
-      x: clamp(clientX - rect.left, 0, rect.width),
-      y: clamp(clientY - rect.top, 0, rect.height),
+      x: clamp((clientX - rect.left) / safeInteractionScaleX, 0, pageWidth),
+      y: clamp((clientY - rect.top) / safeInteractionScaleY, 0, canvasHeight),
     };
   };
 
@@ -901,8 +1099,21 @@ export default function CustomCanvas({
     showInspectorBySelect();
   };
 
+  const selectItemForEditing = (event, itemId) => {
+    if (!isEdit || isPreview) return;
+    const additive = !!(event?.shiftKey || event?.metaKey || event?.ctrlKey);
+
+    setSelectedIds((prev) => {
+      if (!additive) return [itemId];
+      if (prev.includes(itemId)) return prev;
+      return [...prev, itemId];
+    });
+    showInspectorBySelect();
+  };
+
   const doSave = () => {
     setOrigin(safeItems);
+    dirtyRef.current = false;
     setDirty(false);
     undoStackRef.current = [];
     redoStackRef.current = [];
@@ -912,6 +1123,7 @@ export default function CustomCanvas({
 
   const doCancel = () => {
     setDraft(origin);
+    dirtyRef.current = false;
     setDirty(false);
     setSelectedIds([]);
     clearInspectorHideTimer();
@@ -1288,68 +1500,6 @@ export default function CustomCanvas({
     showInspectorByAdd();
   };
 
-  const alignLeft = () => {
-    if (selectedIds.length < 2) return;
-    const sel = safeItems.filter((it) => selectedIds.includes(it.id));
-    const minX = Math.min(...sel.map((it) => it.x));
-    updateMany(selectedIds, { x: minX });
-  };
-
-  const alignRight = () => {
-    if (selectedIds.length < 2) return;
-    const sel = safeItems.filter((it) => selectedIds.includes(it.id));
-    const maxR = Math.max(...sel.map((it) => it.x + it.w));
-    const set = new Set(selectedIds);
-    const next = safeItems.map((it) => {
-      if (!set.has(it.id) || it.locked) return it;
-      return { ...it, x: maxR - it.w };
-    });
-    commit(next);
-  };
-
-  const alignCenter = () => {
-    if (selectedIds.length < 2) return;
-    const sel = safeItems.filter((it) => selectedIds.includes(it.id));
-    const center = (Math.min(...sel.map((it) => it.x)) + Math.max(...sel.map((it) => it.x + it.w))) / 2;
-    const set = new Set(selectedIds);
-    const next = safeItems.map((it) => {
-      if (!set.has(it.id) || it.locked) return it;
-      return { ...it, x: Math.round(center - it.w / 2) };
-    });
-    commit(next);
-  };
-
-  const alignTop = () => {
-    if (selectedIds.length < 2) return;
-    const sel = safeItems.filter((it) => selectedIds.includes(it.id));
-    const minY = Math.min(...sel.map((it) => it.y));
-    updateMany(selectedIds, { y: minY });
-  };
-
-  const alignBottom = () => {
-    if (selectedIds.length < 2) return;
-    const sel = safeItems.filter((it) => selectedIds.includes(it.id));
-    const maxB = Math.max(...sel.map((it) => it.y + it.h));
-    const set = new Set(selectedIds);
-    const next = safeItems.map((it) => {
-      if (!set.has(it.id) || it.locked) return it;
-      return { ...it, y: maxB - it.h };
-    });
-    commit(next);
-  };
-
-  const alignMiddle = () => {
-    if (selectedIds.length < 2) return;
-    const sel = safeItems.filter((it) => selectedIds.includes(it.id));
-    const mid = (Math.min(...sel.map((it) => it.y)) + Math.max(...sel.map((it) => it.y + it.h))) / 2;
-    const set = new Set(selectedIds);
-    const next = safeItems.map((it) => {
-      if (!set.has(it.id) || it.locked) return it;
-      return { ...it, y: Math.round(mid - it.h / 2) };
-    });
-    commit(next);
-  };
-
   const savePreset = () => {
     if (isPreview) return;
     const name = prompt(t.presetNamePrompt, t.presetNameDefault);
@@ -1493,119 +1643,231 @@ export default function CustomCanvas({
     commit(state.next, { previousState });
   };
 
+  const baseCanvasHeight = resolvedViewPageNumber && !isEdit && !isPreview ? pageHeight : canvasHeight;
+  const canvasShellStyle = isEdit && !isPreview
+    ? {
+        width: pageWidth * safeInteractionScaleX,
+        height: baseCanvasHeight * safeInteractionScaleY,
+      }
+    : {
+        width: pageWidth,
+        height: baseCanvasHeight,
+      };
+  const layerStyle = isEdit && !isPreview
+    ? {
+        ...styles.layer,
+        ...(dragOverActive ? styles.layerDragActive : null),
+        width: pageWidth * safeInteractionScaleX,
+        height: baseCanvasHeight * safeInteractionScaleY,
+        transform: 'none',
+        transformOrigin: 'top left',
+      }
+    : {
+        ...styles.layer,
+        ...(dragOverActive ? styles.layerDragActive : null),
+      };
+
   return (
-    <div style={{ ...styles.root, width: pageWidth, height: resolvedViewPageNumber && !isEdit && !isPreview ? pageHeight : canvasHeight, WebkitTextSizeAdjust: '100%', textSizeAdjust: '100%' }}>
-      {isEdit && !isPreview && (
+    <div style={{ ...styles.root, ...canvasShellStyle, WebkitTextSizeAdjust: '100%', textSizeAdjust: '100%' }}>
+      {showEditControls && (
         <>
-          {!toolbarVisible && (
+          {!resolvedToolbarVisible && !toolsLauncherHidden && !inspectorVisible && !bulkModalOpen && (
             <button
               style={styles.toolsOpenBtn}
-              onClick={() => setToolbarVisible(true)}
+              onClick={() => setResolvedToolbarVisible(true)}
             >
               {t.openTools}
             </button>
           )}
 
-          {toolbarVisible && (
+          {resolvedToolbarVisible && (
             <div style={styles.toolbarFixed} onMouseDown={(e) => e.stopPropagation()}>
-              <div style={styles.toolbarRow}>
-                <button style={styles.toolBtn} onClick={addFoodName}>{t.addName}</button>
-                <button style={styles.toolBtn} onClick={addPrice}>{t.addPrice}</button>
-
-                <label style={{ ...styles.toolBtn, display: 'inline-flex', alignItems: 'center', gap: 8 }}>
-                  {t.addPhoto}
-                  <input
-                    type="file"
-                    accept="image/*"
-                    multiple
-                    style={{ display: 'none' }}
-                    onChange={(e) => {
-                      addPhoto(Array.from(e.target.files || []));
-                      e.target.value = '';
-                    }}
-                  />
-                </label>
-
-                <label style={{ ...styles.toolBtn, display: 'inline-flex', alignItems: 'center', gap: 8 }}>
-                  {t.addVideo}
-                  <input
-                    type="file"
-                    accept="video/mp4,video/webm,video/quicktime,video/*"
-                    multiple
-                    style={{ display: 'none' }}
-                    onChange={(e) => {
-                      addVideo(Array.from(e.target.files || []));
-                      e.target.value = '';
-                    }}
-                  />
-                </label>
-
-                <span style={styles.sep} />
-
-                <button style={styles.toolBtnSm} onClick={undo} disabled={!canUndo}>{t.undo}</button>
-                <button style={styles.toolBtnSm} onClick={redo} disabled={!canRedo}>{t.redo}</button>
-
-                <span style={styles.sep} />
-
-                <button style={styles.toolBtnSm} onClick={duplicateCurrentPageToNext}>{t.copyPageToNext}</button>
-                <button style={styles.toolBtnSm} onClick={duplicateSelectedToNextPage} disabled={!selectedIds.length}>{t.copySelectionToNext}</button>
-                <button style={styles.toolBtnSm} onClick={copySelected} disabled={!selectedIds.length}>{t.copy}</button>
-                <button style={styles.toolBtnSm} onClick={() => pasteItems()} disabled={!clipboardRef.current.length}>{t.paste}</button>
-
-                <span style={styles.sep} />
-
-                <button style={styles.toolBtnSm} onClick={savePreset}>{t.savePreset}</button>
-
-                <select
-                  value={presetSelectedId}
-                  onChange={(e) => {
-                    const v = e.target.value;
-                    setPresetSelectedId(v);
-                    if (v) loadPreset(v);
-                  }}
-                  style={styles.presetSelect}
-                >
-                  <option value="">{t.loadPreset}</option>
-                  {presets.map((p) => (
-                    <option key={p.id} value={p.id}>{p.name}</option>
-                  ))}
-                </select>
-
-                <button style={styles.toolBtnSm} onClick={deletePreset}>
-                  {t.deletePreset}
-                </button>
-
-                <span style={{ fontWeight: 900, fontSize: 12, opacity: 0.9 }}>
+              <div style={styles.toolbarHeader}>
+                <div>
+                  <div style={styles.toolbarKicker}>{t.toolsKicker}</div>
+                  <div style={styles.toolbarTitle}>{t.toolsTitle}</div>
+                </div>
+                <div style={dirty ? styles.statusPillDirty : styles.statusPill}>
                   {dirty ? t.editingNotSaved : t.saved}
-                </span>
-
+                </div>
                 <button
                   style={styles.toolbarCloseBtn}
-                  onClick={() => setToolbarVisible(false)}
+                  onClick={() => setResolvedToolbarVisible(false)}
                   aria-label="close-toolbar"
                   title={t.hideTools}
                 >
                   ×
                 </button>
               </div>
+
+              <div style={styles.toolbarBody}>
+                <section style={styles.toolbarSection}>
+                  <div style={styles.sectionTitle}>{t.addSection}</div>
+                  <div style={styles.addGrid}>
+                    <button style={styles.toolBtnAdd} onClick={addFoodName}>{t.addName}</button>
+                    <button style={styles.toolBtnAdd} onClick={addPrice}>{t.addPrice}</button>
+
+                    <label style={styles.toolBtnMedia}>
+                      {t.addPhoto}
+                      <input
+                        type="file"
+                        accept="image/*"
+                        multiple
+                        style={{ display: 'none' }}
+                        onChange={(e) => {
+                          addPhoto(Array.from(e.target.files || []));
+                          e.target.value = '';
+                        }}
+                      />
+                    </label>
+
+                    <label style={styles.toolBtnMedia}>
+                      {t.addVideo}
+                      <input
+                        type="file"
+                        accept="video/mp4,video/webm,video/quicktime,video/*"
+                        multiple
+                        style={{ display: 'none' }}
+                        onChange={(e) => {
+                          addVideo(Array.from(e.target.files || []));
+                          e.target.value = '';
+                        }}
+                      />
+                    </label>
+
+                    <button style={styles.toolBtnBulk} onClick={openBulkAddMenu}>
+                      {t.addBulk}
+                    </button>
+                  </div>
+                </section>
+
+                <section style={styles.toolbarSection}>
+                  <div style={styles.sectionTitle}>{t.editSection}</div>
+                  <div style={styles.quickGrid}>
+                    <button style={styles.toolBtnSm} onClick={undo} disabled={!canUndo}>{t.undo}</button>
+                    <button style={styles.toolBtnSm} onClick={redo} disabled={!canRedo}>{t.redo}</button>
+                  </div>
+                </section>
+
+                <section style={styles.toolbarSection}>
+                  <div style={styles.sectionTitle}>{t.pageSection}</div>
+                  <div style={styles.quickGrid}>
+                    <button style={styles.toolBtnSm} onClick={duplicateCurrentPageToNext}>{t.copyPageToNext}</button>
+                  </div>
+                </section>
+
+                <section style={styles.toolbarSection}>
+                  <div style={styles.sectionTitle}>{t.presetSection}</div>
+                  <div style={styles.presetGrid}>
+                    <button style={styles.toolBtnSm} onClick={savePreset}>{t.savePreset}</button>
+
+                    <select
+                      value={presetSelectedId}
+                      onChange={(e) => {
+                        const v = e.target.value;
+                        setPresetSelectedId(v);
+                        if (v) loadPreset(v);
+                      }}
+                      style={styles.presetSelect}
+                    >
+                      <option value="">{t.loadPreset}</option>
+                      {presets.map((p) => (
+                        <option key={p.id} value={p.id}>{p.name}</option>
+                      ))}
+                    </select>
+
+                    <button style={styles.toolBtnSm} onClick={deletePreset}>
+                      {t.deletePreset}
+                    </button>
+                  </div>
+                </section>
+              </div>
             </div>
           )}
 
           <div style={styles.saveBar} onMouseDown={(e) => e.stopPropagation()}>
-            <button style={{ ...styles.toolBtnSm, minWidth: 72 }} onClick={undo} disabled={!canUndo}>{t.undo}</button>
-            <button style={{ ...styles.toolBtnSm, minWidth: 72 }} onClick={redo} disabled={!canRedo}>{t.redo}</button>
             <button style={styles.saveBtn} onClick={doSave}>{t.save}</button>
             <button style={styles.cancelBtn} onClick={doCancel}>{t.cancel}</button>
           </div>
+
+          {bulkModalOpen && (
+            <div style={styles.bulkBackdrop} onMouseDown={() => setBulkModalOpen(false)}>
+              <div style={styles.bulkModal} onMouseDown={(e) => e.stopPropagation()}>
+                <div style={styles.bulkHeader}>
+                  <div>
+                    <div style={styles.bulkKicker}>{t.bulkKicker}</div>
+                    <div style={styles.bulkTitle}>{t.bulkTitle}</div>
+                    <div style={styles.bulkDesc}>{t.bulkDesc}</div>
+                  </div>
+                  <button
+                    type="button"
+                    style={styles.bulkCloseBtn}
+                    onClick={() => setBulkModalOpen(false)}
+                    aria-label={t.bulkClose}
+                    title={t.bulkClose}
+                  >
+                    ×
+                  </button>
+                </div>
+
+                <div style={styles.bulkBody}>
+                  <label style={styles.bulkEditor}>
+                    <span style={styles.bulkLabel}>{t.bulkInputLabel}</span>
+                    <textarea
+                      value={bulkText}
+                      onChange={(e) => setBulkText(e.target.value)}
+                      placeholder={t.bulkPromptExample}
+                      style={styles.bulkTextarea}
+                    />
+                  </label>
+
+                  <div style={styles.bulkPreview}>
+                    <div style={styles.bulkPreviewHeader}>
+                      <div style={styles.bulkLabel}>{t.bulkPreviewTitle}</div>
+                      <div style={bulkEntries.length ? styles.bulkCountReady : styles.bulkCountEmpty}>
+                        {bulkEntries.length ? `${bulkEntries.length}${t.bulkItemsReady}` : t.bulkPreviewEmpty}
+                      </div>
+                    </div>
+
+                    <div style={styles.bulkPreviewList}>
+                      {bulkEntries.slice(0, 8).map((entry, index) => (
+                        <div key={`${entry.name}-${index}`} style={styles.bulkPreviewRow}>
+                          <div style={styles.bulkPreviewName}>{entry.name}</div>
+                          <div style={styles.bulkPreviewPrice}>{entry.price || t.bulkNoPrice}</div>
+                        </div>
+                      ))}
+                      {bulkEntries.length > 8 && (
+                        <div style={styles.bulkMore}>{t.bulkMore.replace('{count}', String(bulkEntries.length - 8))}</div>
+                      )}
+                    </div>
+                  </div>
+                </div>
+
+                <div style={styles.bulkFooter}>
+                  <button type="button" style={styles.bulkSecondaryBtn} onClick={() => setBulkText('')}>
+                    {t.bulkClear}
+                  </button>
+                  <button type="button" style={styles.bulkSecondaryBtn} onClick={() => setBulkModalOpen(false)}>
+                    {t.cancel}
+                  </button>
+                  <button
+                    type="button"
+                    style={bulkEntries.length ? styles.bulkPrimaryBtn : styles.bulkPrimaryBtnDisabled}
+                    onClick={bulkAddMenuItems}
+                    disabled={!bulkEntries.length}
+                  >
+                    {t.bulkAddButton}
+                  </button>
+                </div>
+              </div>
+            </div>
+          )}
         </>
       )}
 
       <div
         ref={layerRef}
-        style={{
-          ...styles.layer,
-          ...(dragOverActive ? styles.layerDragActive : null),
-        }}
+        style={layerStyle}
         onMouseDown={startMarqueeSelect}
         onDragEnter={handleLayerDragEnter}
         onDragOver={handleLayerDragOver}
@@ -1628,10 +1890,10 @@ export default function CustomCanvas({
           <div
             style={{
               ...styles.marquee,
-              left: marquee.left,
-              top: marquee.top,
-              width: marquee.width,
-              height: marquee.height,
+              left: isEdit && !isPreview ? marquee.left * safeInteractionScaleX : marquee.left,
+              top: isEdit && !isPreview ? marquee.top * safeInteractionScaleY : marquee.top,
+              width: isEdit && !isPreview ? marquee.width * safeInteractionScaleX : marquee.width,
+              height: isEdit && !isPreview ? marquee.height * safeInteractionScaleY : marquee.height,
             }}
           />
         )}
@@ -1643,6 +1905,10 @@ export default function CustomCanvas({
         {visibleItems.map((it) => {
             const isSelected = selectedIds.includes(it.id);
             const isLocked = !!it.locked;
+            const displayX = (Number(it.x) || 0) * safeInteractionScaleX;
+            const displayY = (Number(it.y) || 0) * safeInteractionScaleY;
+            const displayW = Math.max(1, (Number(it.w) || 1) * safeInteractionScaleX);
+            const displayH = Math.max(1, (Number(it.h) || 1) * safeInteractionScaleY);
 
             if (!isEdit || isPreview) {
               return <ViewItem key={it.id} item={it} />;
@@ -1652,19 +1918,27 @@ export default function CustomCanvas({
               <Rnd
                 key={it.id}
                 bounds="parent"
-                size={{ width: it.w, height: it.h }}
-                position={{ x: it.x, y: it.y }}
+                scale={rndInteractionScale}
+                size={{ width: displayW, height: displayH }}
+                position={{ x: displayX, y: displayY }}
                 disableDragging={!isEdit || isLocked || isPreview}
                 enableResizing={!isEdit ? false : (isLocked || isPreview ? false : undefined)}
                 onMouseDown={(e) => {
                   if (!isEdit || isPreview) return;
                   e.stopPropagation();
+                  selectItemForEditing(e, it.id);
+                }}
+                onTouchStart={(e) => {
+                  if (!isEdit || isPreview) return;
+                  e.stopPropagation();
+                  selectItemForEditing(e, it.id);
                 }}
                 onClick={(e) => handleItemClick(e, it.id)}
                 onDragStart={(e, d) => {
                   if (!isEdit || isPreview) return false;
 
                   const additive = e.shiftKey || e.metaKey || e.ctrlKey;
+                  selectItemForEditing(e, it.id);
                   if (additive) {
                     draggedItemRef.current = false;
                     dragAnchorRef.current = null;
@@ -1672,7 +1946,7 @@ export default function CustomCanvas({
                   }
 
                   draggedItemRef.current = false;
-                  dragStartPosRef.current = { x: d.x, y: d.y };
+                  dragStartPosRef.current = correctDragPoint(d);
                   dragSessionRef.current = { type: 'single', itemId: it.id, startItems: safeItems };
                   setIsDragging(true);
                   clearDragGuides();
@@ -1693,16 +1967,19 @@ export default function CustomCanvas({
 
                   const dragStart = dragStartPosRef.current;
                   if (dragStart) {
-                    const moved = Math.abs(d.x - dragStart.x) > 5 || Math.abs(d.y - dragStart.y) > 5;
+                    const corrected = correctDragPoint(d);
+                    const moved = Math.abs(corrected.x - dragStart.x) > 5 || Math.abs(corrected.y - dragStart.y) > 5;
+                    if (!moved) return;
                     if (moved) draggedItemRef.current = true;
                   }
 
+                  const corrected = correctDragPoint(d);
                   if (selectedIds.length >= 2 && selectedIds.includes(it.id)) {
-                    applyMultiDragPreview(it.id, d.x, d.y);
+                    applyMultiDragPreview(it.id, corrected.x, corrected.y);
                     return;
                   }
 
-                  const assist = computeDragAssist(it.id, d.x, d.y, it.w, it.h);
+                  const assist = computeDragAssist(it.id, corrected.x, corrected.y, it.w, it.h);
                   setDragGuides(assist.guides || []);
                   applyDraftPreview(
                     safeItems.map((item) => (item.id === it.id ? { ...item, x: assist.x, y: assist.y } : item))
@@ -1725,19 +2002,20 @@ export default function CustomCanvas({
                   }
 
                   const dragStart = dragStartPosRef.current;
+                  const corrected = correctDragPoint(d);
                   dragStartPosRef.current = null;
-                  const movedEnough = !dragStart || Math.abs(d.x - dragStart.x) > 5 || Math.abs(d.y - dragStart.y) > 5;
+                  const movedEnough = !dragStart || Math.abs(corrected.x - dragStart.x) > 5 || Math.abs(corrected.y - dragStart.y) > 5;
                   if (!movedEnough) {
                     dragSessionRef.current = null;
                     return;
                   }
 
                   if (selectedIds.length >= 2 && selectedIds.includes(it.id)) {
-                    applyMultiDragStop(it.id, d.x, d.y);
+                    applyMultiDragStop(it.id, corrected.x, corrected.y);
                     return;
                   }
 
-                  const { x: sx, y: sy } = applySnap(it.id, d.x, d.y, it.w, it.h);
+                  const { x: sx, y: sy } = applySnap(it.id, corrected.x, corrected.y, it.w, it.h);
                   const dragSession = dragSessionRef.current;
                   dragSessionRef.current = null;
                   const next = safeItems.map((item) => (item.id === it.id ? { ...item, x: sx, y: sy } : item));
@@ -1754,30 +2032,71 @@ export default function CustomCanvas({
                     return;
                   }
 
-                  const w = ref.offsetWidth;
-                  const h = ref.offsetHeight;
-                  const { x: sx, y: sy } = applySnap(it.id, pos.x, pos.y, w, h);
+                  const box = correctResizeBox(it, ref, pos);
+                  const { x: sx, y: sy } = applySnap(it.id, box.x, box.y, box.w, box.h);
                   const dragSession = dragSessionRef.current;
                   dragSessionRef.current = null;
-                  const next = safeItems.map((item) => (item.id === it.id ? { ...item, w, h, x: sx, y: sy } : item));
+                  const next = safeItems.map((item) => (item.id === it.id ? { ...item, w: box.w, h: box.h, x: sx, y: sy } : item));
                   const previousState = dragSession?.startItems || safeItems;
                   if (JSON.stringify(previousState) === JSON.stringify(next)) return;
                   commit(next, { previousState });
                 }}
                 style={{ zIndex: it.z || 0 }}
               >
-                <ItemBox item={it} selected={isEdit && isSelected && !isPreview} />
+                <div
+                  onPointerDown={(e) => {
+                    if (!isEdit || isPreview) return;
+                    selectItemForEditing(e, it.id);
+                  }}
+                  onMouseDown={(e) => {
+                    if (!isEdit || isPreview) return;
+                    selectItemForEditing(e, it.id);
+                  }}
+                  onTouchStart={(e) => {
+                    if (!isEdit || isPreview) return;
+                    selectItemForEditing(e, it.id);
+                  }}
+                  style={{
+                    width: it.w,
+                    height: it.h,
+                    transform: `scaleX(${safeInteractionScaleX}) scaleY(${safeInteractionScaleY})`,
+                    transformOrigin: 'top left',
+                    position: 'relative',
+                  }}
+                >
+                  <ItemBox item={it} selected={isEdit && isSelected && !isPreview} />
+                  {!isSelected && (
+                    <button
+                      type="button"
+                      aria-label={`Select ${it.type || 'item'}`}
+                      tabIndex={-1}
+                      onPointerDown={(e) => {
+                        if (!isEdit || isPreview) return;
+                        selectItemForEditing(e, it.id);
+                      }}
+                      onClick={(e) => {
+                        if (!isEdit || isPreview) return;
+                        e.stopPropagation();
+                        selectItemForEditing(e, it.id);
+                      }}
+                      style={styles.itemSelectOverlay}
+                    />
+                  )}
+                </div>
               </Rnd>
             );
           })}
       </div>
 
-      {INSPECTOR_ENABLED && isEdit && !isPreview && inspectorVisible && (
+      {INSPECTOR_ENABLED && showEditControls && inspectorVisible && (
         <div
           style={{ ...styles.inspector, top: inspectorTop }}
           onMouseDown={(e) => e.stopPropagation()}
         >
-          <div style={styles.inspectorTitle}>{t.inspectorTitle}</div>
+          <div style={styles.inspectorTitleRow}>
+            <div style={styles.inspectorTitle}>{inspectorTitle}</div>
+            {selected ? <div style={styles.inspectorTypePill}>{selectedTypeLabel}</div> : null}
+          </div>
 
           {selectedIds.length >= 2 && (
             <div style={styles.multiBox}>
@@ -1785,6 +2104,7 @@ export default function CustomCanvas({
                 <button style={styles.actionBtn} onClick={groupSelected}>{t.group}</button>
                 <button style={styles.actionBtn} onClick={ungroupSelected}>{t.ungroup}</button>
                 <button style={styles.actionBtn} onClick={duplicateSelected}>{t.duplicate}</button>
+                <button style={styles.actionBtn} onClick={duplicateSelectedToNextPage}>{t.copySelectionToNext}</button>
                 <button style={styles.actionBtn} onClick={copySelected}>{t.copy}</button>
                 <button style={styles.actionBtn} onClick={() => pasteItems()} disabled={!clipboardRef.current.length}>{t.paste}</button>
                 <button style={styles.actionBtn} onClick={distributeHorizontally} disabled={selectedIds.length < 3}>{t.distributeH}</button>
@@ -1794,7 +2114,7 @@ export default function CustomCanvas({
                 <button style={styles.actionBtn} onClick={lockSelected}>{t.lock}</button>
                 <button style={styles.actionBtn} onClick={unlockSelected}>{t.unlock}</button>
                 <button
-                  style={{ ...styles.actionBtn, background: '#ffefef', borderColor: '#ffb7b7' }}
+                  style={{ ...styles.actionBtn, background: '#ffefef', border: '1px solid #ffb7b7' }}
                   onClick={() => removeMany(selectedIds)}
                 >
                   {t.delete}
@@ -1809,13 +2129,7 @@ export default function CustomCanvas({
             <>
               <div style={styles.row}>
                 <div style={styles.label}>{t.type}</div>
-                <div style={styles.value}>
-                  {selected.type === 'text'
-                    ? (selected.role === 'price' ? t.textPrice : t.textName)
-                    : selected.type === 'video'
-                      ? t.video
-                      : t.photo}
-                </div>
+                <div style={styles.value}>{selectedTypeLabel}</div>
               </div>
 
               <div style={styles.row}>
@@ -2036,7 +2350,7 @@ export default function CustomCanvas({
                   <div style={styles.row}>
                     <div style={styles.label}>{t.fit}</div>
                     <select
-                      value={selected.fit || (selected.type === 'video' ? 'cover' : 'contain')}
+                      value={selected.fit || 'contain'}
                       onChange={(e) => updateItem(selected.id, { fit: e.target.value })}
                       style={styles.select}
                       disabled={selected.locked}
@@ -2088,6 +2402,7 @@ export default function CustomCanvas({
 
               <div style={styles.actions}>
                 <button style={styles.actionBtn} onClick={duplicateSelected}>{t.duplicate}</button>
+                <button style={styles.actionBtn} onClick={duplicateSelectedToNextPage}>{t.copySelectionToNext}</button>
                 <button style={styles.actionBtn} onClick={copySelected}>{t.copy}</button>
                 <button style={styles.actionBtn} onClick={() => pasteItems()} disabled={!clipboardRef.current.length}>{t.paste}</button>
                 <button style={styles.actionBtn} onClick={distributeHorizontally} disabled={selectedIds.length < 3}>{t.distributeH}</button>
@@ -2097,7 +2412,7 @@ export default function CustomCanvas({
                 <button style={styles.actionBtn} onClick={() => updateItem(selected.id, { locked: true })}>{t.lock}</button>
                 <button style={styles.actionBtn} onClick={() => updateItem(selected.id, { locked: false })}>{t.unlock}</button>
                 <button
-                  style={{ ...styles.actionBtn, background: '#ffefef', borderColor: '#ffb7b7' }}
+                  style={{ ...styles.actionBtn, background: '#ffefef', border: '1px solid #ffb7b7' }}
                   onClick={() => removeMany([selected.id])}
                 >
                   {t.delete}
@@ -2207,6 +2522,11 @@ function ViewItem({ item }) {
 }
 
 function ItemBox({ item, selected }) {
+  const [mediaError, setMediaError] = useState(false);
+  useEffect(() => {
+    setMediaError(false);
+  }, [item.src]);
+
   const resolvedBorderColor = resolveBorderColor(item);
   const border = selected ? styles.itemBoxSelected.border : `2px solid ${resolvedBorderColor}`;
   const base = {
@@ -2222,17 +2542,25 @@ function ItemBox({ item, selected }) {
     return (
       <div style={base}>
         <div style={imageFrameStyle(item)}>
-          <img
-            src={item.src}
-            alt="photo"
-            draggable={false}
-            style={{
-              width: '100%',
-              height: '100%',
-              objectFit: item.fit || 'contain',
-              display: 'block',
-            }}
-          />
+          {item.src && !mediaError ? (
+            <img
+              src={item.src}
+              alt="photo"
+              draggable={false}
+              loading="eager"
+              decoding="sync"
+              fetchPriority="high"
+              onError={() => setMediaError(true)}
+              style={{
+                width: '100%',
+                height: '100%',
+                objectFit: item.fit || 'contain',
+                display: 'block',
+              }}
+            />
+          ) : (
+            <div style={styles.mediaPlaceholder} />
+          )}
         </div>
       </div>
     );
@@ -2242,23 +2570,28 @@ function ItemBox({ item, selected }) {
     return (
       <div style={base}>
         <div style={imageFrameStyle(item)}>
-          <video
-            src={item.src}
-            muted={item.muted !== false}
-            autoPlay={item.autoplay !== false}
-            loop={item.loop !== false}
-            playsInline={item.playsInline !== false}
-            preload="auto"
-            draggable={false}
-            style={{
-              width: '100%',
-              height: '100%',
-              objectFit: item.fit || 'cover',
-              display: 'block',
-              pointerEvents: 'none',
-              background: '#000',
-            }}
-          />
+          {item.src && !mediaError ? (
+            <video
+              src={item.src}
+              muted={item.muted !== false}
+              autoPlay={item.autoplay !== false}
+              loop={item.loop !== false}
+              playsInline={item.playsInline !== false}
+              preload="auto"
+              draggable={false}
+              onError={() => setMediaError(true)}
+              style={{
+                width: '100%',
+                height: '100%',
+                objectFit: item.fit || 'contain',
+                display: 'block',
+                pointerEvents: 'none',
+                background: '#000',
+              }}
+            />
+          ) : (
+            <div style={styles.mediaPlaceholder} />
+          )}
         </div>
       </div>
     );
@@ -2374,13 +2707,27 @@ function getTexts(lang) {
     addPrice: '+ 가격',
     addPhoto: '+ 사진',
     addVideo: '+ 영상',
-    snap: 'Snap',
-    grid: 'Grid',
+    addBulk: '메뉴 한 번에 추가',
+    bulkPrompt: '메뉴를 줄마다 입력하세요. 이름과 가격은 | 또는 탭으로 나누면 됩니다.',
+    bulkPromptExample: '김치찌개 | $14.99\n불고기 | $18.99\n해물파전 | $21.99',
+    bulkEmpty: '추가할 메뉴가 없습니다.',
+    bulkKicker: '빠른 입력',
+    bulkTitle: '메뉴 한 번에 추가',
+    bulkDesc: '엑셀/구글시트에서 메뉴명과 가격을 복사해 붙여넣으면 자동으로 텍스트를 배치합니다.',
+    bulkInputLabel: '붙여넣기',
+    bulkPreviewTitle: '미리보기',
+    bulkPreviewEmpty: '입력 대기',
+    bulkItemsReady: '개 준비됨',
+    bulkNoPrice: '가격 없음',
+    bulkMore: '+ {count}개 더',
+    bulkClear: '비우기',
+    bulkAddButton: '메뉴 추가',
+    bulkClose: '닫기',
     savePreset: '프리셋 저장',
     loadPreset: '프리셋 불러오기…',
     deletePreset: '프리셋 삭제',
-    editingNotSaved: '● Editing (Not Saved)',
-    saved: 'Saved',
+    editingNotSaved: '● 저장 안 됨',
+    saved: '저장됨',
     save: '저장',
     cancel: '취소',
     undo: '되돌리기',
@@ -2388,6 +2735,12 @@ function getTexts(lang) {
 
     openTools: '도구 열기',
     hideTools: '도구 숨기기',
+    toolsKicker: '관리자 편집',
+    toolsTitle: '메뉴 도구',
+    addSection: '추가',
+    editSection: '수정',
+    pageSection: '페이지',
+    presetSection: '프리셋',
 
     presetNamePrompt: '프리셋 이름을 입력하세요',
     presetNameDefault: '내 메뉴 프리셋',
@@ -2397,6 +2750,10 @@ function getTexts(lang) {
     deletePresetConfirm: '선택한 프리셋을 삭제할까요?',
 
     inspectorTitle: '속성',
+    textInspectorTitle: '텍스트 설정',
+    priceInspectorTitle: '가격 설정',
+    photoInspectorTitle: '사진 설정',
+    videoInspectorTitle: '영상 설정',
 
     type: '종류',
     textName: '텍스트(메뉴명)',
@@ -2408,9 +2765,6 @@ function getTexts(lang) {
     lockedOn: '잠금',
     lockedOff: '해제',
 
-    border: '테두리',
-    borderOn: '켜짐',
-    borderOff: '꺼짐',
     borderColor: '테두리 색',
     transparent: '투명',
 
@@ -2441,10 +2795,6 @@ function getTexts(lang) {
     left: '왼쪽',
     center: '가운데',
     right: '오른쪽',
-    top: '위',
-    middle: '중간',
-    bottom: '아래',
-
     group: '그룹',
     ungroup: '그룹 해제',
     duplicate: '복제',
@@ -2452,7 +2802,8 @@ function getTexts(lang) {
     paste: '붙여넣기',
     distributeH: '가로 간격 맞춤',
     distributeV: '세로 간격 맞춤',
-    copyPageToNext: '현재 페이지 전체 복제',
+    copyPageToNext: '페이지 다음으로',
+    copySelectionToNext: '선택 다음으로',
     bring: '앞으로',
     send: '뒤로',
     lock: '잠금',
@@ -2468,18 +2819,40 @@ function getTexts(lang) {
     addPrice: '+ Price',
     addPhoto: '+ Photo',
     addVideo: '+ Video',
-    snap: 'Snap',
-    grid: 'Grid',
+    addBulk: 'Bulk Add Menu',
+    bulkPrompt: 'Enter one menu item per line. Separate name and price with | or tab.',
+    bulkPromptExample: 'Kimchi Stew | $14.99\nBulgogi | $18.99\nSeafood Pancake | $21.99',
+    bulkEmpty: 'No menu items to add.',
+    bulkKicker: 'Fast entry',
+    bulkTitle: 'Bulk Add Menu',
+    bulkDesc: 'Paste menu names and prices from Excel or Google Sheets, then place them as editable text.',
+    bulkInputLabel: 'Paste menu list',
+    bulkPreviewTitle: 'Preview',
+    bulkPreviewEmpty: 'Waiting',
+    bulkItemsReady: ' items ready',
+    bulkNoPrice: 'No price',
+    bulkMore: '+ {count} more',
+    bulkClear: 'Clear',
+    bulkAddButton: 'Add Menu Items',
+    bulkClose: 'Close',
     savePreset: 'Save Preset',
     loadPreset: 'Load Preset…',
     deletePreset: 'Delete Preset',
-    editingNotSaved: '● Editing (Not Saved)',
+    editingNotSaved: '● Unsaved',
     saved: 'Saved',
     save: 'Save',
     cancel: 'Cancel',
+    undo: 'Undo',
+    redo: 'Redo',
 
     openTools: 'Show Tools',
     hideTools: 'Hide Tools',
+    toolsKicker: 'Manager edit',
+    toolsTitle: 'Menu Tools',
+    addSection: 'Add',
+    editSection: 'Edit',
+    pageSection: 'Page',
+    presetSection: 'Preset',
 
     presetNamePrompt: 'Enter preset name',
     presetNameDefault: 'My Menu Preset',
@@ -2489,6 +2862,10 @@ function getTexts(lang) {
     deletePresetConfirm: 'Delete selected preset?',
 
     inspectorTitle: 'Properties',
+    textInspectorTitle: 'Text Settings',
+    priceInspectorTitle: 'Price Settings',
+    photoInspectorTitle: 'Photo Settings',
+    videoInspectorTitle: 'Video Settings',
 
     type: 'Type',
     textName: 'Text (Name)',
@@ -2500,9 +2877,6 @@ function getTexts(lang) {
     lockedOn: 'Locked',
     lockedOff: 'Unlocked',
 
-    border: 'Border',
-    borderOn: 'On',
-    borderOff: 'Off',
     borderColor: 'Border color',
     transparent: 'Transparent',
 
@@ -2533,10 +2907,6 @@ function getTexts(lang) {
     left: 'Left',
     center: 'Center',
     right: 'Right',
-    top: 'Top',
-    middle: 'Middle',
-    bottom: 'Bottom',
-
     group: 'Group',
     ungroup: 'Ungroup',
     duplicate: 'Duplicate',
@@ -2544,7 +2914,8 @@ function getTexts(lang) {
     paste: 'Paste',
     distributeH: 'Distribute H',
     distributeV: 'Distribute V',
-    copyPageToNext: 'Copy Page to Next',
+    copyPageToNext: 'Page to Next',
+    copySelectionToNext: 'Selection to Next',
     bring: 'Bring +',
     send: 'Send -',
     lock: 'Lock',
@@ -2562,45 +2933,166 @@ const styles = {
   toolbarFixed: {
     position: 'fixed',
     left: 16,
-    top: 'calc(env(safe-area-inset-top, 0px) + 48px)',
+    top: 'calc(env(safe-area-inset-top, 0px) + 54px)',
     zIndex: 9999,
     pointerEvents: 'auto',
-    background: 'rgba(0,0,0,0.55)',
-    color: '#fff',
-    padding: '10px 12px',
-    borderRadius: 14,
-    backdropFilter: 'blur(6px)',
-    maxWidth: 'min(920px, calc(100vw - 160px))',
-  },
-  toolbarRow: {
-    display: 'flex',
-    gap: 8,
-    flexWrap: 'nowrap',
-    alignItems: 'center',
-    whiteSpace: 'nowrap',
-    overflowX: 'auto',
-  },
-  toolBtn: {
-    padding: '9px 11px',
+    width: 360,
+    maxWidth: 'calc(100vw - 32px)',
+    background: 'rgba(255,255,255,0.96)',
+    color: '#111827',
+    padding: 12,
     borderRadius: 12,
-    border: 'none',
-    cursor: 'pointer',
+    border: '1px solid rgba(17,24,39,0.10)',
+    backdropFilter: 'blur(10px)',
+    boxShadow: '0 18px 42px rgba(0,0,0,0.24)',
+    maxHeight: 'calc(100vh - 150px)',
+    overflowY: 'auto',
+  },
+  toolbarHeader: {
+    display: 'flex',
+    gap: 10,
+    alignItems: 'center',
+    marginBottom: 12,
+  },
+  toolbarKicker: {
+    fontSize: 10,
     fontWeight: 900,
+    letterSpacing: 0,
+    textTransform: 'uppercase',
+    color: '#0f766e',
+  },
+  toolbarTitle: {
+    fontSize: 18,
+    fontWeight: 950,
+    lineHeight: 1.1,
+  },
+  statusPill: {
+    marginLeft: 'auto',
+    padding: '7px 9px',
+    borderRadius: 999,
+    background: '#ecfdf5',
+    color: '#047857',
+    border: '1px solid #a7f3d0',
+    fontSize: 12,
+    fontWeight: 900,
+    whiteSpace: 'nowrap',
+  },
+  statusPillDirty: {
+    marginLeft: 'auto',
+    padding: '7px 9px',
+    borderRadius: 999,
+    background: '#fff7ed',
+    color: '#c2410c',
+    border: '1px solid #fed7aa',
+    fontSize: 12,
+    fontWeight: 900,
+    whiteSpace: 'nowrap',
+  },
+  toolbarBody: {
+    display: 'grid',
+    gap: 10,
+  },
+  toolbarSection: {
+    display: 'grid',
+    gap: 7,
+    padding: 10,
+    borderRadius: 10,
+    background: '#f8fafc',
+    border: '1px solid #e5e7eb',
+  },
+  sectionTitle: {
+    fontSize: 11,
+    fontWeight: 950,
+    color: '#374151',
+  },
+  addGrid: {
+    display: 'grid',
+    gridTemplateColumns: '1fr 1fr',
+    gap: 8,
+  },
+  quickGrid: {
+    display: 'grid',
+    gridTemplateColumns: '1fr 1fr',
+    gap: 8,
+  },
+  presetGrid: {
+    display: 'grid',
+    gridTemplateColumns: '1fr 1.15fr 1fr',
+    gap: 8,
+  },
+  toolBtnAdd: {
+    padding: '11px 10px',
+    borderRadius: 9,
+    border: '1px solid #c7d2fe',
+    cursor: 'pointer',
+    fontWeight: 950,
+    fontSize: 13,
+    lineHeight: 1,
+    minHeight: 40,
+    boxSizing: 'border-box',
+    background: '#eef2ff',
+    color: '#312e81',
+    display: 'inline-flex',
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
+  toolBtnMedia: {
+    padding: '11px 10px',
+    borderRadius: 9,
+    border: '1px solid #bae6fd',
+    cursor: 'pointer',
+    fontWeight: 950,
+    fontSize: 13,
+    lineHeight: 1,
+    minHeight: 40,
+    boxSizing: 'border-box',
+    background: '#ecfeff',
+    color: '#155e75',
+    display: 'inline-flex',
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
+  toolBtnBulk: {
+    gridColumn: '1 / -1',
+    padding: '12px 10px',
+    borderRadius: 9,
+    border: '1px solid #99f6e4',
+    cursor: 'pointer',
+    fontWeight: 950,
+    fontSize: 13,
+    lineHeight: 1,
+    minHeight: 40,
+    boxSizing: 'border-box',
+    background: '#ccfbf1',
+    color: '#134e4a',
+    display: 'inline-flex',
+    alignItems: 'center',
+    justifyContent: 'center',
   },
   toolBtnSm: {
-    padding: '7px 9px',
-    borderRadius: 10,
-    border: 'none',
+    padding: '9px 8px',
+    borderRadius: 9,
+    border: '1px solid #d1d5db',
     cursor: 'pointer',
     fontWeight: 900,
+    fontSize: 12,
+    lineHeight: 1,
+    minHeight: 36,
+    minWidth: 0,
+    boxSizing: 'border-box',
+    background: '#fff',
+    color: '#111827',
+    display: 'inline-flex',
+    alignItems: 'center',
+    justifyContent: 'center',
   },
   toolbarCloseBtn: {
     width: 34,
     height: 34,
-    borderRadius: 10,
-    border: '1px solid rgba(255,255,255,0.28)',
-    background: 'rgba(255,255,255,0.10)',
-    color: '#fff',
+    borderRadius: 9,
+    border: '1px solid #d1d5db',
+    background: '#fff',
+    color: '#111827',
     fontSize: 22,
     lineHeight: 1,
     cursor: 'pointer',
@@ -2615,40 +3107,277 @@ const styles = {
     top: 'calc(env(safe-area-inset-top, 0px) + 66px)',
     zIndex: 9999,
     padding: '10px 12px',
-    borderRadius: 12,
-    border: 'none',
+    borderRadius: 999,
+    border: '1px solid rgba(15,118,110,0.20)',
+    cursor: 'pointer',
+    fontWeight: 900,
+    background: '#ffffff',
+    color: '#0f766e',
+    boxShadow: '0 10px 26px rgba(0,0,0,0.22)',
+  },
+  bulkBackdrop: {
+    position: 'fixed',
+    inset: 0,
+    zIndex: 10020,
+    pointerEvents: 'auto',
+    background: 'rgba(15,23,42,0.44)',
+    display: 'flex',
+    alignItems: 'center',
+    justifyContent: 'center',
+    padding: 24,
+    boxSizing: 'border-box',
+  },
+  bulkModal: {
+    width: 'min(760px, calc(100vw - 48px))',
+    maxHeight: 'calc(100vh - 72px)',
+    overflow: 'hidden',
+    borderRadius: 14,
+    background: '#ffffff',
+    color: '#111827',
+    border: '1px solid rgba(17,24,39,0.12)',
+    boxShadow: '0 26px 70px rgba(0,0,0,0.34)',
+    display: 'grid',
+    gridTemplateRows: 'auto minmax(0, 1fr) auto',
+  },
+  bulkHeader: {
+    display: 'flex',
+    gap: 14,
+    alignItems: 'flex-start',
+    justifyContent: 'space-between',
+    padding: '18px 18px 14px',
+    borderBottom: '1px solid #e5e7eb',
+    background: '#f8fafc',
+  },
+  bulkKicker: {
+    fontSize: 11,
+    fontWeight: 950,
+    color: '#0f766e',
+    textTransform: 'uppercase',
+    letterSpacing: 0,
+    marginBottom: 4,
+  },
+  bulkTitle: {
+    fontSize: 22,
+    fontWeight: 950,
+    lineHeight: 1.1,
+    marginBottom: 6,
+  },
+  bulkDesc: {
+    maxWidth: 560,
+    fontSize: 13,
+    lineHeight: 1.45,
+    color: '#475569',
+    fontWeight: 700,
+  },
+  bulkCloseBtn: {
+    width: 36,
+    height: 36,
+    borderRadius: 10,
+    border: '1px solid #d1d5db',
+    background: '#ffffff',
+    color: '#111827',
+    fontSize: 22,
+    lineHeight: 1,
+    cursor: 'pointer',
+    fontWeight: 900,
+    display: 'grid',
+    placeItems: 'center',
+    flex: '0 0 auto',
+  },
+  bulkBody: {
+    minHeight: 0,
+    display: 'grid',
+    gridTemplateColumns: 'minmax(0, 1fr) minmax(230px, 0.72fr)',
+    gap: 14,
+    padding: 18,
+    overflow: 'auto',
+    background: '#ffffff',
+  },
+  bulkEditor: {
+    display: 'grid',
+    gap: 8,
+    minHeight: 0,
+  },
+  bulkLabel: {
+    fontSize: 12,
+    fontWeight: 950,
+    color: '#334155',
+  },
+  bulkTextarea: {
+    width: '100%',
+    minHeight: 260,
+    resize: 'vertical',
+    borderRadius: 11,
+    border: '1px solid #cbd5e1',
+    background: '#ffffff',
+    color: '#111827',
+    padding: 12,
+    boxSizing: 'border-box',
+    fontFamily: 'ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace',
+    fontSize: 13,
+    lineHeight: 1.55,
+    outline: 'none',
+  },
+  bulkPreview: {
+    minHeight: 0,
+    display: 'grid',
+    gridTemplateRows: 'auto minmax(0, 1fr)',
+    gap: 8,
+  },
+  bulkPreviewHeader: {
+    display: 'flex',
+    gap: 8,
+    alignItems: 'center',
+    justifyContent: 'space-between',
+  },
+  bulkCountReady: {
+    padding: '5px 8px',
+    borderRadius: 999,
+    background: '#ecfdf5',
+    color: '#047857',
+    border: '1px solid #a7f3d0',
+    fontSize: 11,
+    fontWeight: 950,
+    whiteSpace: 'nowrap',
+  },
+  bulkCountEmpty: {
+    padding: '5px 8px',
+    borderRadius: 999,
+    background: '#f1f5f9',
+    color: '#64748b',
+    border: '1px solid #e2e8f0',
+    fontSize: 11,
+    fontWeight: 950,
+    whiteSpace: 'nowrap',
+  },
+  bulkPreviewList: {
+    minHeight: 260,
+    borderRadius: 11,
+    border: '1px solid #e2e8f0',
+    background: '#f8fafc',
+    padding: 10,
+    overflow: 'auto',
+    display: 'grid',
+    alignContent: 'start',
+    gap: 8,
+  },
+  bulkPreviewRow: {
+    display: 'grid',
+    gridTemplateColumns: 'minmax(0, 1fr) auto',
+    gap: 10,
+    alignItems: 'center',
+    padding: '9px 10px',
+    borderRadius: 9,
+    background: '#ffffff',
+    border: '1px solid #e5e7eb',
+  },
+  bulkPreviewName: {
+    fontSize: 13,
+    fontWeight: 900,
+    color: '#111827',
+    overflow: 'hidden',
+    textOverflow: 'ellipsis',
+    whiteSpace: 'nowrap',
+  },
+  bulkPreviewPrice: {
+    fontSize: 13,
+    fontWeight: 950,
+    color: '#0f766e',
+    whiteSpace: 'nowrap',
+  },
+  bulkMore: {
+    padding: '9px 10px',
+    borderRadius: 9,
+    background: '#ecfeff',
+    color: '#155e75',
+    border: '1px solid #bae6fd',
+    fontSize: 12,
+    fontWeight: 950,
+    textAlign: 'center',
+  },
+  bulkFooter: {
+    display: 'flex',
+    gap: 10,
+    justifyContent: 'flex-end',
+    padding: '14px 18px 18px',
+    borderTop: '1px solid #e5e7eb',
+    background: '#ffffff',
+  },
+  bulkSecondaryBtn: {
+    minWidth: 96,
+    padding: '11px 14px',
+    borderRadius: 10,
+    border: '1px solid #d1d5db',
+    background: '#ffffff',
+    color: '#374151',
     cursor: 'pointer',
     fontWeight: 900,
   },
+  bulkPrimaryBtn: {
+    minWidth: 136,
+    padding: '11px 14px',
+    borderRadius: 10,
+    border: '1px solid rgba(15,118,110,0.18)',
+    background: '#0f766e',
+    color: '#ffffff',
+    cursor: 'pointer',
+    fontWeight: 950,
+    boxShadow: '0 10px 24px rgba(15,118,110,0.22)',
+  },
+  bulkPrimaryBtnDisabled: {
+    minWidth: 136,
+    padding: '11px 14px',
+    borderRadius: 10,
+    border: '1px solid #d1d5db',
+    background: '#f1f5f9',
+    color: '#94a3b8',
+    cursor: 'not-allowed',
+    fontWeight: 950,
+  },
 
-  presetSelect: { padding: '8px 10px', borderRadius: 10, border: 'none', fontWeight: 900 },
-  sep: { width: 1, height: 20, background: 'rgba(255,255,255,0.25)', margin: '0 4px' },
-
+  presetSelect: {
+    minWidth: 0,
+    padding: '9px 8px',
+    borderRadius: 9,
+    border: '1px solid #d1d5db',
+    fontWeight: 900,
+    background: '#fff',
+    color: '#111827',
+  },
   saveBar: {
     position: 'fixed',
-    left: 16,
-    bottom: 16,
+    left: '50%',
+    bottom: 'calc(env(safe-area-inset-bottom, 0px) + 14px)',
+    transform: 'translateX(-50%)',
     zIndex: 9999,
     pointerEvents: 'auto',
     display: 'flex',
-    gap: 10,
+    gap: 8,
+    padding: 8,
+    borderRadius: 14,
+    background: 'rgba(255,255,255,0.95)',
+    border: '1px solid rgba(17,24,39,0.10)',
+    boxShadow: '0 14px 32px rgba(0,0,0,0.26)',
   },
   saveBtn: {
-    padding: '12px 16px',
-    borderRadius: 12,
+    padding: '12px 22px',
+    borderRadius: 10,
     border: 'none',
     fontWeight: 900,
-    background: '#111',
+    background: '#0f766e',
     color: '#fff',
     cursor: 'pointer',
+    minWidth: 92,
   },
   cancelBtn: {
-    padding: '12px 16px',
-    borderRadius: 12,
-    border: '1px solid #ddd',
+    padding: '12px 18px',
+    borderRadius: 10,
+    border: '1px solid #d1d5db',
     fontWeight: 900,
-    background: 'rgba(255,255,255,0.95)',
+    background: '#f9fafb',
+    color: '#374151',
     cursor: 'pointer',
+    minWidth: 92,
   },
 
   root: {
@@ -2661,6 +3390,20 @@ const styles = {
     position: 'absolute',
     inset: 0,
     zIndex: 40,
+  },
+  itemSelectOverlay: {
+    position: 'absolute',
+    inset: 0,
+    width: '100%',
+    height: '100%',
+    padding: 0,
+    margin: 0,
+    border: 'none',
+    background: 'transparent',
+    cursor: 'move',
+    zIndex: 5,
+    appearance: 'none',
+    WebkitAppearance: 'none',
   },
   guideLineV: {
     position: 'absolute',
@@ -2719,6 +3462,11 @@ const styles = {
     background: 'transparent',
     boxShadow: 'none',
   },
+  mediaPlaceholder: {
+    width: '100%',
+    height: '100%',
+    background: 'rgba(0,0,0,0.16)',
+  },
   itemBoxSelected: {
     border: '2px solid rgba(255,255,255,0.85)',
     boxShadow: '0 12px 26px rgba(0,0,0,0.35)',
@@ -2729,18 +3477,38 @@ const styles = {
     right: 16,
     zIndex: 9998,
     pointerEvents: 'auto',
-    width: 280,
+    width: 286,
     maxHeight: 'calc(100vh - 170px)',
     overflow: 'auto',
-    background: 'rgba(255,255,255,0.95)',
-    borderRadius: 16,
-    padding: 10,
-    boxShadow: '0 10px 30px rgba(0,0,0,0.25)',
+    background: 'rgba(255,255,255,0.97)',
+    border: '1px solid rgba(17,24,39,0.10)',
+    borderRadius: 12,
+    padding: 12,
+    boxShadow: '0 18px 42px rgba(0,0,0,0.24)',
+  },
+  inspectorTitleRow: {
+    display: 'flex',
+    alignItems: 'center',
+    justifyContent: 'space-between',
+    gap: 10,
+    marginBottom: 12,
+    paddingBottom: 9,
+    borderBottom: '1px solid #e5e7eb',
   },
   inspectorTitle: {
     fontWeight: 900,
-    fontSize: 16,
-    marginBottom: 10,
+    fontSize: 17,
+    lineHeight: 1.1,
+  },
+  inspectorTypePill: {
+    padding: '5px 8px',
+    borderRadius: 999,
+    background: '#eef2ff',
+    color: '#312e81',
+    border: '1px solid #c7d2fe',
+    fontSize: 11,
+    fontWeight: 900,
+    whiteSpace: 'nowrap',
   },
 
   multiBox: {
@@ -2774,27 +3542,32 @@ const styles = {
 
   input: {
     width: '100%',
-    padding: '10px 10px',
-    borderRadius: 12,
-    border: '1px solid #ddd',
+    padding: '10px 11px',
+    borderRadius: 9,
+    border: '1px solid #cbd5e1',
     fontWeight: 700,
+    background: '#fff',
+    boxSizing: 'border-box',
   },
   select: {
     width: '100%',
-    padding: '10px 10px',
-    borderRadius: 12,
-    border: '1px solid #ddd',
+    padding: '10px 11px',
+    borderRadius: 9,
+    border: '1px solid #cbd5e1',
     fontWeight: 800,
     background: '#fff',
+    boxSizing: 'border-box',
   },
   num: {
     width: '100%',
-    padding: '10px 10px',
-    borderRadius: 12,
-    border: '1px solid #ddd',
+    padding: '10px 11px',
+    borderRadius: 9,
+    border: '1px solid #cbd5e1',
     fontWeight: 800,
+    background: '#fff',
+    boxSizing: 'border-box',
   },
-  color: { width: '100%', height: 38, border: '1px solid #ddd', borderRadius: 12 },
+  color: { width: '100%', height: 38, border: '1px solid #cbd5e1', borderRadius: 9 },
   transparentBtn: {
     padding: '8px 10px',
     borderRadius: 10,
@@ -2817,10 +3590,16 @@ const styles = {
   },
   actionBtn: {
     padding: '8px 8px',
-    borderRadius: 10,
-    border: '1px solid #ddd',
+    borderRadius: 9,
+    border: '1px solid #d1d5db',
     cursor: 'pointer',
     fontWeight: 900,
+    fontSize: 11,
+    lineHeight: 1.15,
+    minHeight: 34,
     background: '#fff',
+    color: '#111827',
+    textAlign: 'center',
+    wordBreak: 'keep-all',
   },
 };

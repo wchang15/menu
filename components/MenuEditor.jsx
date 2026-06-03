@@ -13,14 +13,24 @@ import {
   syncJsonFromCloud,
   removeKey,
 } from '@/lib/storage';
-import { clearCurrentUser, setCurrentUser } from '@/lib/session';
+import { clearCurrentUser, getCurrentUser, setCurrentUser } from '@/lib/session';
 import { supabase } from '@/lib/supabaseClient';
+import { getSignedAssetUrl } from '@/lib/cloudAssets';
 import * as layoutMedia from '@/lib/layoutMedia';
+import {
+  menuReadyBundleIdentity,
+  readMenuReadyBundle,
+  readMenuReadyBundleAsync,
+  writeMenuReadyBundleAsync,
+} from '@/lib/menuReadyBundle';
 import CustomCanvas from './CustomCanvas';
 import TemplateCanvas from './TemplateCanvas';
 
 const DEFAULT_LAYOUT = { mode: null, templateId: null, items: [], templateData: null, pageCount: 1 };
 const menuLayoutKey = (language) => `${KEYS.MENU_LAYOUT}_${language || 'en'}`;
+const PREMIUM_TEMPLATE_IDS = new Set(['T1A', 'T2A', 'T3A']);
+const isPremiumTemplateId = (templateId) => PREMIUM_TEMPLATE_IDS.has(String(templateId || ''));
+const PAIRED_TEMPLATE_SYNC_KEY = 'MENU_PAIRED_TEMPLATE_SYNC_V1';
 
 // ✅ 옵션들
 const SECRET_TAPS = 5;
@@ -49,6 +59,9 @@ const MIN_CONTENT_HEIGHT = PAGE_HEIGHT;
 const DEFAULT_ROW_H = 92;
 const DEFAULT_HEADER_H = 210;
 const DEFAULT_PAGE_PADDING_TOP = 70;
+const DEFAULT_FOOTER_SPACE = 176;
+const FEATURE_RIBBON_H = 168;
+const FEATURE_RIBBON_GAP = 18;
 const PAGE_WIDTH = 1080;
 
 // ✅ T2 사진 슬롯과 동일
@@ -57,6 +70,13 @@ const MAX_PHOTOS = 8;
 const hydrateLayoutMediaSafe = async (layout) => {
   const fn = layoutMedia?.hydrateLayoutMedia;
   return typeof fn === 'function' ? fn(layout) : layout;
+};
+
+const hydrateLayoutMediaForPagesSafe = async (layout, pages) => {
+  const fn = layoutMedia?.hydrateLayoutMediaForPages;
+  return typeof fn === 'function'
+    ? fn(layout, pages, { pageHeight: PAGE_HEIGHT, pageGap: PAGE_GAP })
+    : hydrateLayoutMediaSafe(layout);
 };
 
 const migrateLegacyInlineMediaSafe = async (layout) => {
@@ -69,6 +89,224 @@ const sanitizeLayoutMediaSafe = (layout) => {
   return typeof fn === 'function' ? fn(layout) : layout;
 };
 
+function isUsableMenuLayout(value) {
+  return value?.mode === 'custom' || value?.mode === 'template';
+}
+
+function layoutConflictsWithSyncedTemplate(value, syncedTemplateId) {
+  if (!syncedTemplateId || !isPremiumTemplateId(syncedTemplateId)) return false;
+  if (!isUsableMenuLayout(value)) return false;
+  if (value?.mode === 'custom') return true;
+  if (value?.mode === 'template') {
+    return getCanonicalTemplateId(value) !== syncedTemplateId;
+  }
+  return false;
+}
+
+function normalizeLanguageProbeText(value) {
+  const text = String(value || '').trim();
+  if (!text) return '';
+  if (/^\$?\s*\d+(?:[.,]\d+)?\s*$/.test(text)) return '';
+  if (/^(음식\s*이름|음식명|가격|item\s*name|price)$/i.test(text)) return '';
+  return text;
+}
+
+function getLayoutLanguageProfile(value) {
+  const templateData = value?.templateData && typeof value.templateData === 'object'
+    ? value.templateData
+    : {};
+  const templateRows = [
+    ...(Array.isArray(templateData.rows) ? templateData.rows : []),
+    ...(Array.isArray(templateData.cells) ? templateData.cells : []),
+  ];
+  const templateTexts = [
+    templateData.restaurantName,
+    templateData.title,
+    templateData.tagline,
+    templateData.footerText,
+    ...templateRows.flatMap((row) => [row?.section, row?.name]),
+  ];
+
+  const texts = [
+    ...(Array.isArray(value?.items) ? value.items : [])
+      .filter((item) => item?.type === 'text')
+      .map((item) => item.text),
+    ...templateTexts,
+  ]
+    .map((text) => normalizeLanguageProbeText(text))
+    .filter(Boolean);
+
+  return texts.reduce((profile, text) => {
+    const hangulChars = text.match(/[가-힣]/g)?.length || 0;
+    const latinChars = text.match(/[A-Za-z]/g)?.length || 0;
+    if (hangulChars > 0) {
+      profile.koItems += 1;
+      profile.koChars += hangulChars;
+    }
+    if (latinChars > 0) {
+      profile.enItems += 1;
+      profile.enChars += latinChars;
+    }
+    return profile;
+  }, { koItems: 0, enItems: 0, koChars: 0, enChars: 0 });
+}
+
+function inferLayoutLanguage(value) {
+  const profile = getLayoutLanguageProfile(value);
+  const { koItems, enItems, koChars, enChars } = profile;
+
+  if (!koItems && !enItems) return null;
+  if (koItems >= 3 && koItems >= enItems * 1.35) return 'ko';
+  if (enItems >= 3 && enItems >= koItems * 1.35) return 'en';
+  if (koChars >= 12 && koChars >= enChars * 0.7) return 'ko';
+  if (enChars >= 12 && enChars >= koChars * 1.15) return 'en';
+  if (koItems > enItems) return 'ko';
+  if (enItems > koItems) return 'en';
+  return null;
+}
+
+function normalizeLayoutTextForLanguage(value, language) {
+  if (!value || typeof value !== 'object') return value;
+  const safeLang = language === 'ko' ? 'ko' : 'en';
+  const inferredTemplateLang = value?.mode === 'template' && isPremiumTemplateId(value.templateId)
+    ? inferLayoutLanguage(value)
+    : null;
+  const canonicalTemplateId = value?.mode === 'template' ? getCanonicalTemplateId(value) : null;
+  const needsTemplateIdentityFix =
+    value?.mode === 'template' &&
+    isPremiumTemplateId(canonicalTemplateId) &&
+    (value.templateId !== canonicalTemplateId || value.templateData?.style?.templateKey !== canonicalTemplateId);
+  const baseValue = (inferredTemplateLang && inferredTemplateLang !== safeLang) || needsTemplateIdentityFix
+    ? normalizePremiumTemplateLayoutForLanguage(value, safeLang)
+    : value;
+  const placeholderMap = safeLang === 'ko'
+    ? { 'Item Name': '음식 이름', Price: '가격' }
+    : { '음식 이름': 'Item Name', 음식명: 'Item Name', 가격: 'Price' };
+
+  const items = Array.isArray(baseValue.items) ? baseValue.items : [];
+  let changed = false;
+  const nextItems = items.map((item) => {
+    if (item?.type !== 'text') return item;
+    const rawText = String(item.text || '');
+    const trimmed = rawText.trim();
+    const replacement = placeholderMap[trimmed];
+    if (!replacement) return item;
+    changed = true;
+    const leading = rawText.match(/^\s*/)?.[0] || '';
+    const trailing = rawText.match(/\s*$/)?.[0] || '';
+    return { ...item, text: `${leading}${replacement}${trailing}` };
+  });
+
+  return changed ? { ...baseValue, items: nextItems } : baseValue;
+}
+
+function layoutMatchesLanguage(value, language) {
+  if (!isUsableMenuLayout(value)) return false;
+  const inferred = inferLayoutLanguage(value);
+  return !inferred || inferred === (language === 'ko' ? 'ko' : 'en');
+}
+
+const WINDOW_READY_VIEW_STORE = '__MENU_READY_VIEW_STORE_V1__';
+
+function readyViewKey(language, userId) {
+  return `${userId || 'user'}:${language === 'ko' ? 'ko' : 'en'}`;
+}
+
+function getWindowReadyViewStore() {
+  if (typeof window === 'undefined') return null;
+  try {
+    if (!window[WINDOW_READY_VIEW_STORE]) {
+      window[WINDOW_READY_VIEW_STORE] = new Map();
+    }
+    return window[WINDOW_READY_VIEW_STORE];
+  } catch {
+    return null;
+  }
+}
+
+function readWindowReadyView(language, userId) {
+  const store = getWindowReadyViewStore();
+  if (!store) return null;
+  const exact = store.get?.(readyViewKey(language, userId));
+  if (exact?.userId && exact.userId !== userId) return null;
+  if (layoutMatchesLanguage(exact?.layout, language)) return exact;
+  return null;
+}
+
+function writeWindowReadyView({ language, userId, layout, bgSignedUrl = null, bgOverrideSignedUrls = {} }) {
+  if (!layoutMatchesLanguage(layout, language)) return;
+  const store = getWindowReadyViewStore();
+  if (!store) return;
+  const safeLang = language === 'ko' ? 'ko' : 'en';
+  const view = {
+    language: safeLang,
+    userId: userId || null,
+    layout,
+    bgSignedUrl: bgSignedUrl || null,
+    bgOverrideSignedUrls: bgOverrideSignedUrls || {},
+    ts: Date.now(),
+  };
+  store.set?.(readyViewKey(safeLang, userId), view);
+}
+
+function isBlobUrlSrc(value) {
+  return typeof value === 'string' && value.startsWith('blob:');
+}
+
+function isMediaItem(item) {
+  return item && (item.type === 'image' || item.type === 'video');
+}
+
+function mediaItemNeedsRepair(item) {
+  if (!isMediaItem(item)) return false;
+  return !item.src;
+}
+
+function repairMissingMediaItemsFromFallback(targetLayout, fallbackLayout) {
+  const targetItems = Array.isArray(targetLayout?.items) ? targetLayout.items : [];
+  const fallbackMediaItems = (Array.isArray(fallbackLayout?.items) ? fallbackLayout.items : [])
+    .filter((item) => isMediaItem(item) && (item.assetPath || (item.src && !isBlobUrlSrc(item.src))));
+
+  if (!targetItems.length || !fallbackMediaItems.length) {
+    return { layout: targetLayout, changed: false };
+  }
+
+  let mediaIndex = 0;
+  let changed = false;
+
+  const repairedItems = targetItems.map((item) => {
+    if (!isMediaItem(item)) return item;
+
+    const fallbackItem = fallbackMediaItems[mediaIndex];
+    mediaIndex += 1;
+
+    if (!mediaItemNeedsRepair(item) || !fallbackItem) return item;
+
+    const fallbackSrc = fallbackItem.src && !isBlobUrlSrc(fallbackItem.src) ? fallbackItem.src : null;
+    const nextAssetPath = item.assetPath || fallbackItem.assetPath || null;
+    const nextSrc = fallbackSrc || (item.src && !isBlobUrlSrc(item.src) ? item.src : null);
+
+    if (!nextAssetPath && !nextSrc) return item;
+
+    changed = true;
+    return {
+      ...item,
+      ...(nextAssetPath ? { assetPath: nextAssetPath } : {}),
+      src: nextSrc,
+    };
+  });
+
+  return {
+    layout: { ...targetLayout, items: repairedItems },
+    changed,
+  };
+}
+
+function layoutNeedsMediaHydration(targetLayout) {
+  const items = Array.isArray(targetLayout?.items) ? targetLayout.items : [];
+  return items.some((item) => isMediaItem(item) && !item.src);
+}
+
 // ✅✅ 페이지별 배경 오버라이드 저장 키 (언어별로 분리)
 const LEGACY_BG_OVERRIDES_KEY = 'MENU_BG_OVERRIDES_V1';
 const bgOverridesKey = (language) => `MENU_BG_OVERRIDES_V1_${language || 'en'}`;
@@ -79,14 +317,149 @@ const menuBgKey = (language) => `${KEYS.MENU_BG}_${language || 'en'}`;
 // 각 페이지 blob 키: `${menuBgKey(lang)}__P${page}`
 const bgPageKey = (page, language) => `${menuBgKey(language)}__P${page}`;
 const legacyBgPageKey = (page) => `${KEYS.MENU_BG}__P${page}`;
+const fallbackLanguageFor = (language) => (language === 'ko' ? 'en' : 'ko');
+
+function normalizePageList(pages) {
+  if (!Array.isArray(pages)) return null;
+  const out = pages
+    .map((page) => Number(page))
+    .filter((page) => Number.isFinite(page) && page >= 1)
+    .map((page) => Math.floor(page));
+  return out.length ? Array.from(new Set(out)) : null;
+}
+
+function getItemPageNumber(item) {
+  const y = Number(item?.y || 0);
+  const h = Number(item?.h || 0);
+  const centerY = Math.max(0, y + h / 2);
+  return Math.floor(centerY / (PAGE_HEIGHT + PAGE_GAP)) + 1;
+}
+
+function getLayoutImageUrlsForPage(targetLayout, page = 1) {
+  const items = Array.isArray(targetLayout?.items) ? targetLayout.items : [];
+  return items
+    .filter((item) => item?.type === 'image' && item?.src && getItemPageNumber(item) === page)
+    .map((item) => item.src)
+    .filter(Boolean)
+    .slice(0, 24);
+}
+
+function getAllLayoutImageUrls(targetLayout) {
+  const items = Array.isArray(targetLayout?.items) ? targetLayout.items : [];
+  const templateData = targetLayout?.templateData && typeof targetLayout.templateData === 'object'
+    ? targetLayout.templateData
+    : {};
+  const templateUrls = [
+    templateData.logoSrc,
+    templateData.qrSrc,
+    templateData.photoSrc,
+    ...(Array.isArray(templateData.photos) ? templateData.photos : []),
+  ];
+
+  return Array.from(new Set([
+    ...items
+      .filter((item) => item?.type === 'image' && item?.src)
+      .map((item) => item.src),
+    ...templateUrls,
+  ].filter(Boolean)));
+}
+
+function imagePreloadStatsComplete(targetLayout, stats) {
+  const imageCount = getAllLayoutImageUrls(targetLayout).length;
+  if (!imageCount) return true;
+
+  const total = Number(stats?.total || 0);
+  const loaded = Number(stats?.loaded || 0);
+  const failed = Number(stats?.failed || 0);
+  return total >= imageCount && loaded >= total && failed === 0;
+}
+
+function readyBundleImagesComplete(bundle) {
+  return !!bundle?.layout && imagePreloadStatsComplete(bundle.layout, bundle.imagePreloadStats);
+}
+
+function preloadImageUrl(url, timeoutMs = 1600) {
+  if (!url || typeof Image === 'undefined') return Promise.resolve({ url, loaded: false });
+
+  return new Promise((resolve) => {
+    let done = false;
+    const finish = (loaded) => {
+      if (done) return;
+      done = true;
+      resolve({ url, loaded: !!loaded });
+    };
+    const timer = window.setTimeout(() => finish(false), timeoutMs);
+    const img = new Image();
+    img.onload = () => {
+      window.clearTimeout(timer);
+      finish(true);
+    };
+    img.onerror = () => {
+      window.clearTimeout(timer);
+      finish(false);
+    };
+    img.src = url;
+  });
+}
+
+async function preloadImageUrls(urls, timeoutMs = 1800) {
+  const uniqueUrls = Array.from(new Set((urls || []).filter(Boolean)));
+  if (!uniqueUrls.length || typeof window === 'undefined') {
+    return { total: 0, loaded: 0, failed: 0, failedUrls: [] };
+  }
+
+  const results = [];
+  let nextIndex = 0;
+  const workerCount = Math.min(MENU_IMAGE_PRELOAD_CONCURRENCY, uniqueUrls.length);
+
+  await Promise.all(Array.from({ length: workerCount }, async () => {
+    while (nextIndex < uniqueUrls.length) {
+      const url = uniqueUrls[nextIndex];
+      nextIndex += 1;
+      results.push(await preloadImageUrl(url, timeoutMs));
+    }
+  }));
+
+  const failedUrls = results.filter((result) => !result.loaded).map((result) => result.url).filter(Boolean);
+  return {
+    total: uniqueUrls.length,
+    loaded: results.filter((result) => result.loaded).length,
+    failed: failedUrls.length,
+    failedUrls,
+  };
+}
+
+async function preloadImageUrlsUntilReady(urls, timeoutMs = 7000, attempts = 3) {
+  let remaining = Array.from(new Set((urls || []).filter(Boolean)));
+  const total = remaining.length;
+  let loaded = 0;
+
+  for (let attempt = 0; attempt < attempts && remaining.length; attempt += 1) {
+    const stats = await preloadImageUrls(remaining, timeoutMs);
+    loaded += Number(stats?.loaded || 0);
+    remaining = stats?.failedUrls || [];
+  }
+
+  return { total, loaded, failed: remaining.length, failedUrls: remaining };
+}
+
+function withTimeout(promise, timeoutMs, fallback = null) {
+  return Promise.race([
+    promise,
+    new Promise((resolve) => {
+      setTimeout(() => resolve(fallback), timeoutMs);
+    }),
+  ]);
+}
 
 // ✅ 보기모드 페이지 전환 튜닝
 const VIEW_GUTTER_X = 0;
 const VIEW_GUTTER_Y = 24;
+const EDIT_ACTION_BAR_SPACE = 36;
 const MIN_VIEW_SCALE = 0.22;
-const VIEW_FILL_SCREEN_X = true;
-const VIEW_PAGE_RENDER_RADIUS = 2;
+const VIEW_PAGE_RENDER_RADIUS = 1;
 const LIVE_MENU_REFRESH_ENABLED = false;
+const MENU_IMAGE_PRELOAD_CONCURRENCY = 16;
 
 function clampNum(v, min, max) {
   const n = Number(v);
@@ -108,6 +481,7 @@ function normalizeTemplateDataForMeasure(templateId, data, lang) {
   const baseStyle = {
     lineSpacing: 1.12,
     rowGap: 14,
+    minPages: 3,
   };
   const style = { ...baseStyle, ...(data.style || {}) };
 
@@ -142,6 +516,7 @@ function computeTemplatePages(templateId, templateData, lang) {
   const id = templateId || '';
   const group = id.slice(0, 2); // T1/T2/T3
   const variant = id.slice(2, 3) || 'A';
+  if (['T1A', 'T2A', 'T3A'].includes(id)) return 3;
 
   const td = normalizeTemplateDataForMeasure(id, templateData, lang);
   const style = td?.style || {};
@@ -152,20 +527,20 @@ function computeTemplatePages(templateId, templateData, lang) {
     const rowH = estimateRowH(style);
 
     const paddingTop = DEFAULT_PAGE_PADDING_TOP;
-    const usableH = PAGE_HEIGHT - paddingTop - 80;
+    const usableH = PAGE_HEIGHT - paddingTop - DEFAULT_FOOTER_SPACE;
 
     const perPage = Math.max(
       1,
-      Math.floor((usableH - headerH) / (rowH + (style.rowGap || 14)))
+      Math.floor((usableH - headerH - FEATURE_RIBBON_H - FEATURE_RIBBON_GAP) / (rowH + (style.rowGap || 14)))
     );
-    return Math.max(1, Math.ceil((rows.length || 0) / perPage) || 1);
+    return Math.max(getMinTemplatePages(style), Math.ceil((rows.length || 0) / perPage) || 1);
   }
 
   if (group === 'T2') {
     const rows = Array.isArray(td.rows) ? td.rows : [];
 
     const paddingTop = 70;
-    const usableH = PAGE_HEIGHT - paddingTop - 80;
+    const usableH = PAGE_HEIGHT - paddingTop - DEFAULT_FOOTER_SPACE;
 
     const ITEMS_PER_BLOCK = variant === 'B' ? 3 : 4;
 
@@ -174,7 +549,7 @@ function computeTemplatePages(templateId, templateData, lang) {
     const blockGap = variant === 'A' ? 18 : variant === 'B' ? 16 : 20;
 
     const blockH = Math.floor(
-      (available - blockGap * (Math.ceil(targetBlocksPerPage) - 1)) / targetBlocksPerPage
+      (available - FEATURE_RIBBON_H - FEATURE_RIBBON_GAP - blockGap * (Math.ceil(targetBlocksPerPage) - 1)) / targetBlocksPerPage
     );
     const blocksPerPage = clampNum(
       Math.floor((available + blockGap) / (blockH + blockGap)),
@@ -183,7 +558,7 @@ function computeTemplatePages(templateId, templateData, lang) {
     );
 
     const blocks = Math.max(1, Math.ceil((rows.length || 0) / ITEMS_PER_BLOCK));
-    return Math.max(1, Math.ceil(blocks / blocksPerPage));
+    return Math.max(getMinTemplatePages(style), Math.ceil(blocks / blocksPerPage));
   }
 
   // T3
@@ -191,62 +566,768 @@ function computeTemplatePages(templateId, templateData, lang) {
   const col = Math.max(2, Math.min(3, Number(td.columns) || 2));
 
   const paddingTop = 70;
-  const usableH = PAGE_HEIGHT - paddingTop - 80;
+  const usableH = PAGE_HEIGHT - paddingTop - DEFAULT_FOOTER_SPACE;
 
   const cardH = variant === 'A' ? 172 : variant === 'B' ? 160 : 188;
   const gap = variant === 'A' ? 18 : variant === 'B' ? 14 : 22;
 
-  const rowsPerPage = Math.max(1, Math.floor((usableH - headerH) / (cardH + gap)));
+  const rowsPerPage = Math.max(1, Math.floor((usableH - headerH - FEATURE_RIBBON_H - FEATURE_RIBBON_GAP) / (cardH + gap)));
   const perPage = rowsPerPage * col;
 
-  return Math.max(1, Math.ceil((cells.length || 0) / perPage) || 1);
+  return Math.max(getMinTemplatePages(style), Math.ceil((cells.length || 0) / perPage) || 1);
 }
 
-function TemplatePicker({ onPick, lang }) {
-  const title = lang === 'ko' ? '템플릿 선택' : 'Select template';
+function getMinTemplatePages(style) {
+  return clampNum(style?.minPages ?? 1, 1, 12);
+}
 
-  const groups = [
-    { id: 'T1', name: lang === 'ko' ? '리스트' : 'List', variants: ['A', 'B', 'C'] },
-    { id: 'T2', name: lang === 'ko' ? '사진 + 리스트' : 'Photo + List', variants: ['A', 'B', 'C'] },
-    { id: 'T3', name: lang === 'ko' ? '그리드' : 'Grid', variants: ['A', 'B', 'C'] },
+function cloneLayoutForCancel(value) {
+  if (!value || typeof value !== 'object') return null;
+  try {
+    return JSON.parse(JSON.stringify(sanitizeLayoutMediaSafe(value)));
+  } catch {
+    return null;
+  }
+}
+
+function hasUsableTemplateMedia(value) {
+  if (!value) return false;
+  if (typeof value !== 'string') return true;
+  return value.trim().length > 0;
+}
+
+function getTemplateDataKey(templateData) {
+  const key = String(templateData?.style?.templateKey || '').slice(0, 3);
+  return isPremiumTemplateId(key) ? key : null;
+}
+
+function getCanonicalTemplateId(layoutLike) {
+  const styleKey = getTemplateDataKey(layoutLike?.templateData);
+  return styleKey || layoutLike?.templateId || null;
+}
+
+function mergeSharedTemplateData(baseData, sourceData) {
+  const base = baseData && typeof baseData === 'object' ? baseData : {};
+  const source = sourceData && typeof sourceData === 'object' ? sourceData : {};
+  const next = { ...base };
+
+  ['logoSrc', 'qrSrc', 'orderUrl', 'phone', 'website', 'currency'].forEach((key) => {
+    if (hasUsableTemplateMedia(source[key])) next[key] = source[key];
+  });
+
+  if (source.style && typeof source.style === 'object') {
+    const baseTemplateKey = base?.style?.templateKey;
+    const sourceTemplateKey = source?.style?.templateKey;
+    const canCarryStyle = !baseTemplateKey || !sourceTemplateKey || baseTemplateKey === sourceTemplateKey;
+    next.style = {
+      ...(base.style || {}),
+      ...(canCarryStyle ? source.style : {}),
+      templateKey: base?.style?.templateKey || source.style.templateKey || next?.style?.templateKey,
+    };
+  }
+
+  if (Array.isArray(source.photos) && source.photos.some(Boolean)) {
+    next.photos = [...source.photos];
+    next.photoSrc = source.photoSrc || source.photos.find(Boolean) || null;
+  } else if (source.photoSrc) {
+    next.photoSrc = source.photoSrc;
+    next.photos = Array.isArray(base.photos) && base.photos.length ? [...base.photos] : [source.photoSrc];
+    if (!next.photos[0]) next.photos[0] = source.photoSrc;
+  }
+
+  return next;
+}
+
+function forceTemplateDataIdentity(templateId, templateData) {
+  const safeTemplateId = String(templateId || '');
+  if (!safeTemplateId || !templateData || typeof templateData !== 'object') return templateData;
+  const variant = safeTemplateId.slice(2, 3) || templateData?.style?.variant || 'A';
+  return {
+    ...templateData,
+    style: {
+      ...(templateData.style || {}),
+      templateKey: safeTemplateId,
+      variant,
+      minPages: isPremiumTemplateId(safeTemplateId) ? 3 : templateData.style?.minPages,
+    },
+  };
+}
+
+function makeTemplateLayout(templateId, templateData, overrides = {}) {
+  return {
+    mode: 'template',
+    templateId,
+    templateData: forceTemplateDataIdentity(templateId, templateData),
+    items: [],
+    pageCount: isPremiumTemplateId(templateId) ? 3 : 1,
+    ...overrides,
+  };
+}
+
+function makeTemplateLayoutForLanguage(templateId, language, sharedSource = null) {
+  const safeLang = language === 'ko' ? 'ko' : 'en';
+  const baseData = makeInitialTemplateData(templateId, safeLang);
+  return makeTemplateLayout(templateId, mergeSharedTemplateData(baseData, sharedSource));
+}
+
+function mergePairedTemplateItems(targetItems, sourceItems) {
+  const target = Array.isArray(targetItems) ? targetItems : [];
+  const source = Array.isArray(sourceItems) ? sourceItems : [];
+
+  return source.map((sourceItem, index) => {
+    const targetItem = target[index] && typeof target[index] === 'object' ? target[index] : {};
+    return {
+      ...targetItem,
+      section: targetItem.section || sourceItem?.section || '',
+      name: targetItem.name || sourceItem?.name || '',
+      price: sourceItem?.price ?? targetItem.price ?? '',
+    };
+  });
+}
+
+function mergePairedTemplateEditData(targetData, sourceData) {
+  const target = targetData && typeof targetData === 'object' ? targetData : {};
+  const source = sourceData && typeof sourceData === 'object' ? sourceData : {};
+  const next = mergeSharedTemplateData(target, source);
+
+  if (Array.isArray(source.rows)) {
+    next.rows = mergePairedTemplateItems(target.rows, source.rows);
+  }
+  if (Array.isArray(source.cells)) {
+    next.cells = mergePairedTemplateItems(target.cells, source.cells);
+  }
+  if (Number.isFinite(Number(source.columns))) {
+    next.columns = source.columns;
+  }
+
+  return next;
+}
+
+function normalizePremiumTemplateLayoutForLanguage(value, language) {
+  if (!value || typeof value !== 'object') return value;
+  const canonicalTemplateId = getCanonicalTemplateId(value);
+  if (value.mode !== 'template' || !isPremiumTemplateId(canonicalTemplateId)) return value;
+
+  const safeLang = language === 'ko' ? 'ko' : 'en';
+  const languageBaseData = makeInitialTemplateData(canonicalTemplateId, safeLang);
+
+  return {
+    ...value,
+    mode: 'template',
+    templateId: canonicalTemplateId,
+    items: [],
+    pageCount: 3,
+    templateData: forceTemplateDataIdentity(
+      canonicalTemplateId,
+      mergePairedTemplateEditData(languageBaseData, value.templateData)
+    ),
+  };
+}
+
+function cacheOptionsForLayout(targetLayout) {
+  const hydrated = !layoutNeedsMediaHydration(targetLayout);
+  return {
+    layout: targetLayout,
+    hasLayoutCache: true,
+    hasFullMediaCache: hydrated,
+  };
+}
+
+function makePremiumTemplateRows(templateKey, lang) {
+  const ko = lang === 'ko';
+  const sets = {
+    T1A: [
+      ['APPETIZERS', ko ? '버라타 토마토' : 'Burrata & Tomato', '14.00'],
+      ['APPETIZERS', ko ? '크리스피 칼라마리' : 'Crispy Calamari', '15.00'],
+      ['APPETIZERS', ko ? '와규 미트볼' : 'Wagyu Meatballs', '16.00'],
+      ['APPETIZERS', ko ? '하우스 시저' : 'House Caesar', '11.00'],
+      ['STEAK', ko ? '프라임 립아이 12oz' : 'Prime Ribeye 12oz', '36.00'],
+      ['STEAK', ko ? '뉴욕 스트립' : 'New York Strip', '34.00'],
+      ['STEAK', ko ? '필레 미뇽' : 'Filet Mignon', '39.00'],
+      ['STEAK', ko ? '본인 립아이' : 'Bone-In Ribeye', '49.00'],
+      ['STEAK', ko ? '브레이즈드 쇼트립' : 'Braised Short Rib', '32.00'],
+      ['SEAFOOD', ko ? '갈릭 버터 살몬' : 'Garlic Butter Salmon', '28.00'],
+      ['SEAFOOD', ko ? '랍스터 링귀니' : 'Lobster Linguine', '35.00'],
+      ['SEAFOOD', ko ? '스캘럽 리조또' : 'Scallop Risotto', '29.00'],
+      ['PASTA', ko ? '머쉬룸 리조또' : 'Wild Mushroom Risotto', '22.00'],
+      ['PASTA', ko ? '트러플 파스타' : 'Truffle Pasta', '24.00'],
+      ['SIDES', ko ? '트러플 맥앤치즈' : 'Truffle Mac & Cheese', '12.00'],
+      ['SIDES', ko ? '크림드 스피니치' : 'Creamed Spinach', '9.00'],
+      ['SIDES', ko ? '유콘 매쉬' : 'Yukon Mash', '8.00'],
+      ['SIDES', ko ? '그릴드 아스파라거스' : 'Grilled Asparagus', '10.00'],
+      ['SOUP & SALAD', ko ? '프렌치 어니언 수프' : 'French Onion Soup', '9.00'],
+      ['SOUP & SALAD', ko ? '비트 고트치즈 샐러드' : 'Beet & Goat Cheese', '11.00'],
+      ['DESSERT', ko ? '초콜릿 라바 케이크' : 'Chocolate Lava Cake', '11.00'],
+      ['DESSERT', ko ? '티라미수' : 'Tiramisu', '10.00'],
+      ['DESSERT', ko ? '크렘 브륄레' : 'Creme Brulee', '10.00'],
+      ['WINE', ko ? '레드 와인 플라이트' : 'Red Wine Flight', '16.00'],
+      ['WINE', ko ? '카베르네 글라스' : 'Cabernet Glass', '15.00'],
+      ['WINE', ko ? '에스프레소 마티니' : 'Espresso Martini', '14.00'],
+      ['BEVERAGE', ko ? '스파클링 워터' : 'Sparkling Water', '4.00'],
+      ['BEVERAGE', ko ? '콜드 브루' : 'Cold Brew', '5.00'],
+    ],
+    T2A: [
+      ['SIGNATURE', ko ? '갈비 BBQ 플래터' : 'Galbi BBQ Platter', '29.99'],
+      ['SIGNATURE', ko ? '돌솥비빔밥' : 'Stone Pot Bibimbap', '15.99'],
+      ['SIGNATURE', ko ? '불고기 라이스볼' : 'Bulgogi Rice Bowl', '15.99'],
+      ['SIGNATURE', ko ? '보쌈 플래터' : 'Bossam Platter', '29.99'],
+      ['BBQ', ko ? '삼겹살 세트' : 'Pork Belly Set', '24.99'],
+      ['BBQ', ko ? 'LA 갈비' : 'LA Galbi', '27.99'],
+      ['BBQ', ko ? '제육볶음' : 'Spicy Pork Bulgogi', '16.99'],
+      ['BBQ', ko ? '양념치킨' : 'Korean Fried Chicken', '18.99'],
+      ['SOUP', ko ? '김치찌개' : 'Kimchi Stew', '13.99'],
+      ['SOUP', ko ? '순두부찌개' : 'Soft Tofu Stew', '12.99'],
+      ['SOUP', ko ? '된장찌개' : 'Soybean Stew', '12.99'],
+      ['SOUP', ko ? '육개장' : 'Spicy Beef Soup', '14.99'],
+      ['SOUP', ko ? '설렁탕' : 'Ox Bone Soup', '13.99'],
+      ['NOODLES', ko ? '해물칼국수' : 'Seafood Knife Noodles', '16.99'],
+      ['NOODLES', ko ? '비빔냉면' : 'Spicy Cold Noodles', '14.99'],
+      ['NOODLES', ko ? '물냉면' : 'Cold Noodles', '13.99'],
+      ['NOODLES', ko ? '짬뽕' : 'Spicy Seafood Noodles', '14.99'],
+      ['SHAREABLES', ko ? '왕만두' : 'King Dumplings', '9.99'],
+      ['SHAREABLES', ko ? '해물파전' : 'Seafood Pancake', '16.99'],
+      ['SHAREABLES', ko ? '잡채' : 'Japchae', '15.99'],
+      ['SHAREABLES', ko ? '떡볶이' : 'Tteokbokki', '12.99'],
+      ['SHAREABLES', ko ? '두부김치' : 'Tofu Kimchi', '15.99'],
+      ['SIDES', ko ? '계란찜' : 'Steamed Egg', '8.99'],
+      ['SIDES', ko ? '콘치즈' : 'Corn Cheese', '8.99'],
+      ['DESSERT', ko ? '호떡' : 'Hotteok', '6.99'],
+      ['DESSERT', ko ? '빙수' : 'Bingsu', '12.99'],
+      ['BEVERAGE', ko ? '식혜' : 'Sweet Rice Punch', '4.99'],
+      ['BEVERAGE', ko ? '수정과' : 'Cinnamon Punch', '4.99'],
+    ],
+    T3A: [
+      ['SUSHI', ko ? '오마카세 롤' : 'Omakase Roll', '18.00'],
+      ['SUSHI', ko ? '스파이시 튜나 크리스피' : 'Spicy Tuna Crispy', '16.00'],
+      ['SUSHI', ko ? '연어 유즈 사시미' : 'Salmon Yuzu Sashimi', '19.00'],
+      ['SUSHI', ko ? '드래곤 롤' : 'Dragon Roll', '17.00'],
+      ['SUSHI', ko ? '스캘럽 니기리' : 'Scallop Nigiri', '16.00'],
+      ['RAMEN', ko ? '블랙마늘 라멘' : 'Black Garlic Ramen', '17.00'],
+      ['RAMEN', ko ? '탄탄멘' : 'Tantanmen', '16.00'],
+      ['RAMEN', ko ? '쇼유 치킨 라멘' : 'Shoyu Chicken Ramen', '15.00'],
+      ['RAMEN', ko ? '해산물 우동' : 'Seafood Udon', '18.00'],
+      ['RAMEN', ko ? '야키소바' : 'Yakisoba', '15.00'],
+      ['IZAKAYA', ko ? '가라아게 바오' : 'Karaage Bao', '12.00'],
+      ['IZAKAYA', ko ? '와규 고추장 타코' : 'Wagyu Gochujang Taco', '15.00'],
+      ['IZAKAYA', ko ? '김치 프라이즈' : 'Kimchi Fries', '11.00'],
+      ['IZAKAYA', ko ? '트러플 교자' : 'Truffle Gyoza', '13.00'],
+      ['IZAKAYA', ko ? '칠리 새우 바오' : 'Chili Shrimp Bao', '13.00'],
+      ['MAIN', ko ? '비프 타다키' : 'Beef Tataki', '22.00'],
+      ['MAIN', ko ? '칠리 크랩 누들' : 'Chili Crab Noodles', '24.00'],
+      ['MAIN', ko ? '연어 포케볼' : 'Salmon Poke Bowl', '18.00'],
+      ['MAIN', ko ? '타이 바질 누들' : 'Thai Basil Noodles', '16.00'],
+      ['MAIN', ko ? '포크 카츠 산도' : 'Pork Katsu Sando', '14.00'],
+      ['COCKTAILS', ko ? '유자 하이볼' : 'Yuzu Highball', '12.00'],
+      ['COCKTAILS', ko ? '시소 칵테일' : 'Shiso Spritz', '13.00'],
+      ['COCKTAILS', ko ? '매실 마티니' : 'Plum Martini', '14.00'],
+      ['COCKTAILS', ko ? '셰프 사케 플라이트' : 'Chef Sake Flight', '19.00'],
+      ['DESSERT', ko ? '말차 티라미수' : 'Matcha Tiramisu', '11.00'],
+      ['DESSERT', ko ? '모찌 아이스크림' : 'Mochi Ice Cream', '9.00'],
+      ['DESSERT', ko ? '흑임자 판나코타' : 'Black Sesame Panna Cotta', '10.00'],
+      ['BEVERAGE', ko ? '망고 유자 에이드' : 'Mango Yuzu Ade', '7.00'],
+      ['BEVERAGE', ko ? '라임 소다' : 'Lime Soda', '6.00'],
+      ['SUSHI', ko ? '토치드 살몬 롤' : 'Torched Salmon Roll', '18.00'],
+    ],
+  };
+
+  return (sets[templateKey] || []).map(([section, name, price]) => ({ section, name, price }));
+}
+
+function getTemplateCards(lang) {
+  const ko = lang === 'ko';
+  return [
+    {
+      id: 'T1A',
+      group: ko ? 'Template A' : 'Template A',
+      name: ko ? '프리미엄 스테이크하우스' : 'Premium Steakhouse',
+      desc: ko ? '다크 호텔 레스토랑 무드, 대형 스테이크 사진, 골드 포인트, 와인/디저트까지 한 화면에 보이는 태블릿 메뉴판' : 'Dark hotel dining mood with large steak photography, gold accents, wine, dessert, and QR ordering guidance.',
+      tags: ko ? ['다크', '골드', '스테이크'] : ['Dark', 'Gold', 'Steak'],
+      accent: '#d7b46a',
+      tone: '#080604',
+    },
+    {
+      id: 'T2A',
+      group: ko ? 'Template B' : 'Template B',
+      name: ko ? '현대적인 한식 레스토랑' : 'Modern Korean Restaurant',
+      desc: ko ? '밝은 우드톤, 감성적인 미니멀 구성, 한식 사진 콜라주와 큼직한 메뉴 리스트가 결합된 메뉴판' : 'Warm wood tone, minimal editorial layout, Korean food collage, clear menu columns, and QR ordering guidance.',
+      tags: ko ? ['우드톤', '한식', '미니멀'] : ['Wood', 'Korean', 'Minimal'],
+      accent: '#7a4b25',
+      tone: '#efe3cf',
+    },
+    {
+      id: 'T3A',
+      group: ko ? 'Template C' : 'Template C',
+      name: ko ? '트렌디 아시안 퓨전' : 'Trendy Asian Fusion',
+      desc: ko ? '강한 비주얼, 네온 포인트, 스시/라멘/이자카야 메뉴를 SNS 감성으로 보여주는 프리미엄 메뉴판' : 'Bold visual-first Asian fusion menu with neon accents, sushi, ramen, izakaya plates, drinks, and QR ordering guidance.',
+      tags: ko ? ['퓨전', '네온', '비주얼'] : ['Fusion', 'Neon', 'Visual'],
+      accent: '#ff3d9a',
+      tone: '#080816',
+    },
   ];
+}
+
+function previewBackground(card) {
+  const patterns = {
+    T1A: `radial-gradient(circle at 84% 12%, ${card.accent}44, transparent 30%), repeating-linear-gradient(95deg, rgba(255,255,255,0.05) 0 1px, transparent 1px 28px), linear-gradient(145deg, ${card.tone}, #050505)`,
+    T1B: `radial-gradient(circle at 78% 14%, ${card.accent}55, transparent 28%), repeating-linear-gradient(135deg, rgba(255,255,255,0.08) 0 2px, transparent 2px 34px), linear-gradient(145deg, ${card.tone}, #050505)`,
+    T1C: `radial-gradient(circle at 18% 16%, ${card.accent}44, transparent 30%), linear-gradient(90deg, rgba(255,255,255,0.07) 1px, transparent 1px), linear-gradient(145deg, ${card.tone}, #f7f3e9)`,
+    T2A: `radial-gradient(circle at 82% 14%, ${card.accent}44, transparent 30%), linear-gradient(115deg, transparent 0 43%, rgba(255,255,255,0.08) 43% 44%, transparent 44% 100%), linear-gradient(145deg, ${card.tone}, #050505)`,
+    T2B: `radial-gradient(circle at 80% 18%, ${card.accent}66, transparent 28%), repeating-linear-gradient(135deg, rgba(239,68,68,0.22) 0 4px, transparent 4px 42px), linear-gradient(145deg, ${card.tone}, #4b1111)`,
+    T2C: `radial-gradient(circle at 20% 18%, ${card.accent}55, transparent 30%), repeating-linear-gradient(110deg, rgba(255,255,255,0.06) 0 2px, transparent 2px 32px), linear-gradient(145deg, ${card.tone}, #3b2432)`,
+    T3A: `radial-gradient(circle at 78% 12%, ${card.accent}44, transparent 30%), radial-gradient(circle, rgba(255,255,255,0.10) 0 1px, transparent 2px), linear-gradient(145deg, ${card.tone}, #101827)`,
+    T3B: `radial-gradient(circle at 18% 16%, ${card.accent}44, transparent 30%), linear-gradient(90deg, rgba(134,239,172,0.12) 1px, transparent 1px), linear-gradient(145deg, ${card.tone}, #172554)`,
+    T3C: `radial-gradient(circle at 82% 18%, ${card.accent}44, transparent 30%), linear-gradient(115deg, transparent 0 46%, rgba(244,114,182,0.18) 46% 47%, transparent 47% 100%), linear-gradient(145deg, ${card.tone}, #050505)`,
+  };
+  return patterns[card.id] || `linear-gradient(145deg, ${card.tone}, #050505)`;
+}
+
+function previewPhotoBackground(card) {
+  return `radial-gradient(circle at 42% 36%, #fff 0 16%, ${card.accent} 17% 34%, transparent 35%), radial-gradient(circle at 60% 54%, rgba(255,255,255,0.78), transparent 22%), ${card.tone}`;
+}
+
+function TemplatePreview({ card }) {
+  const group = card.id.slice(0, 2);
+  const variant = card.id.slice(2);
+  const dense = card.id === 'T3B';
+  const photoHeavy = group === 'T2';
+  const tileHeavy = group === 'T3';
+  const rows = dense ? 9 : tileHeavy ? 6 : photoHeavy ? 3 : 5;
 
   return (
-    <div>
-      <div style={{ fontWeight: 900, fontSize: 18, marginBottom: 12 }}>{title}</div>
-
-      <div style={{ display: 'grid', gap: 12 }}>
-        {groups.map((g) => (
-          <div key={g.id} style={{ display: 'grid', gap: 8 }}>
-            <div style={{ fontWeight: 900, opacity: 0.85 }}>{g.name}</div>
-
-            <div style={{ display: 'grid', gridTemplateColumns: 'repeat(3, 1fr)', gap: 8 }}>
-              {g.variants.map((v) => (
-                <button key={v} style={tpBtn} onClick={() => onPick(`${g.id}${v}`)}>
-                  {g.id}-{v}
-                </button>
-              ))}
-            </div>
-          </div>
-        ))}
+    <div style={{ ...tp.preview, background: previewBackground(card) }}>
+      <div style={{ ...tp.previewAccentGlow, background: card.accent }} />
+      <div style={tp.previewHeader}>
+        <div style={{ ...tp.previewLogo, borderColor: card.accent }} />
+        <div style={tp.previewTitleBlock}>
+          <div style={{ ...tp.previewBrand, background: card.accent }} />
+          <div style={tp.previewSub} />
+        </div>
+        <div style={{ ...tp.previewQr, borderColor: card.accent }}>
+          {Array.from({ length: 9 }).map((_, index) => (
+            <span key={index} style={{ ...tp.previewQrCell, background: index % 2 || index === 4 ? '#111827' : 'transparent' }} />
+          ))}
+        </div>
       </div>
 
-      <div style={{ marginTop: 10, fontSize: 12, opacity: 0.7 }}>
-        {lang === 'ko'
-          ? '* 이후에도 템플릿 입력 패널에서 스타일/크기/색상 조절 가능'
-          : '* You can still adjust style/size/colors in the template panel.'}
+      <div style={tp.previewFeature}>
+        <div style={{ ...tp.previewHeroPhoto, background: previewPhotoBackground(card) }} />
+        <div style={tp.previewHeroText}>
+          <div style={{ ...tp.previewCategory, background: card.accent }} />
+          <div style={tp.previewMiniLine} />
+          <div style={tp.previewMiniLineShort} />
+        </div>
+      </div>
+
+      {group === 'T1' && (
+        <div style={tp.previewRows}>
+          {Array.from({ length: rows }).map((_, index) => (
+            <div key={index} style={{ ...tp.previewLine, borderLeft: `3px solid ${index % 3 === 0 ? card.accent : 'rgba(255,255,255,0.18)'}` }}>
+              <div style={{ ...tp.previewName, width: `${56 + (index % 3) * 9}%` }} />
+              <div style={{ ...tp.previewPrice, background: card.accent }} />
+            </div>
+          ))}
+        </div>
+      )}
+
+      {group === 'T2' && (
+        <div style={tp.previewPhotoBlocks}>
+          {Array.from({ length: rows }).map((_, index) => (
+            <div key={index} style={{ ...tp.previewPhotoBlock, gridTemplateColumns: variant === 'B' ? '1fr 64px' : '64px 1fr' }}>
+              {variant === 'B' ? null : <div style={{ ...tp.previewPhoto, background: `radial-gradient(circle at 35% 30%, #fff, ${card.accent})` }} />}
+              <div style={tp.previewMiniRows}>
+                <div style={{ ...tp.previewCategory, background: card.accent }} />
+                <div style={tp.previewMiniLine} />
+                <div style={tp.previewMiniLineShort} />
+              </div>
+              {variant === 'B' ? <div style={{ ...tp.previewPhoto, background: `radial-gradient(circle at 35% 30%, #fff, ${card.accent})` }} /> : null}
+            </div>
+          ))}
+        </div>
+      )}
+
+      {group === 'T3' && (
+        <div style={{ ...tp.previewGrid, gridTemplateColumns: dense ? 'repeat(3, 1fr)' : 'repeat(2, 1fr)' }}>
+          {Array.from({ length: rows }).map((_, index) => (
+            <div key={index} style={{ ...tp.previewTile, minHeight: dense ? 31 : 40 }}>
+              <div style={{ ...tp.previewTileTitle, width: index % 2 ? '58%' : '74%' }} />
+              <div style={{ ...tp.previewTilePrice, background: card.accent }} />
+            </div>
+          ))}
+        </div>
+      )}
+
+      <div style={tp.previewFooter}>
+        <div style={tp.previewFooterLine} />
+        <div style={{ ...tp.previewFooterCta, background: card.accent }} />
       </div>
     </div>
   );
 }
 
-const tpBtn = {
-  padding: '12px 14px',
-  borderRadius: 12,
-  border: '1px solid #ddd',
-  cursor: 'pointer',
-  fontWeight: 800,
-  background: '#fff',
+function TemplatePicker({ onPick, lang }) {
+  const ko = lang === 'ko';
+  const cards = getTemplateCards(lang);
+
+  return (
+    <div style={tp.wrap}>
+      <div style={tp.top}>
+        <div>
+          <div style={tp.kicker}>{ko ? '레스토랑 바로 사용 템플릿' : 'Ready-to-use restaurant templates'}</div>
+          <div style={tp.title}>{ko ? '로고, 사진, 메뉴명, 가격만 바꾸면 됩니다' : 'Replace logo, photos, menu names, and prices'}</div>
+        </div>
+        <div style={tp.count}>{ko ? `${cards.length}개 · 각 3페이지 세트` : `${cards.length} templates · 3 pages each`}</div>
+      </div>
+
+      <div style={tp.grid}>
+        {cards.map((card) => (
+          <button key={card.id} type="button" style={tp.card} onClick={() => onPick(card.id)}>
+            <TemplatePreview card={card} />
+            <div style={tp.cardBody}>
+              <div style={tp.cardTop}>
+                <div style={tp.group}>{card.group}</div>
+                <div style={tp.id}>{ko ? '3페이지 완성형' : '3-page set'}</div>
+              </div>
+              <div style={tp.name}>{card.name}</div>
+              <div style={tp.desc}>{card.desc}</div>
+              <div style={tp.tags}>
+                {card.tags.map((tag) => (
+                  <span key={tag} style={tp.tag}>{tag}</span>
+                ))}
+              </div>
+              <div style={{ ...tp.choose, background: card.accent }}>
+                {ko ? '이 템플릿 사용' : 'Use this template'}
+              </div>
+            </div>
+          </button>
+        ))}
+      </div>
+
+      <div style={tp.note}>
+        {ko
+          ? '상인은 템플릿을 고른 뒤 메뉴판 위의 로고, 글자, 가격, 사진을 손으로 눌러 바로 바꾸면 됩니다.'
+          : 'After choosing a template, merchants can tap the logo, text, prices, and photos directly on the board to edit them.'}
+      </div>
+    </div>
+  );
+}
+
+const tp = {
+  wrap: {
+    display: 'grid',
+    gap: 18,
+  },
+  top: {
+    display: 'flex',
+    justifyContent: 'space-between',
+    alignItems: 'flex-start',
+    gap: 16,
+  },
+  kicker: {
+    fontSize: 13,
+    fontWeight: 950,
+    color: '#0f766e',
+    letterSpacing: 0.4,
+    textTransform: 'uppercase',
+  },
+  title: {
+    marginTop: 5,
+    fontSize: 24,
+    fontWeight: 1000,
+    color: '#111827',
+    lineHeight: 1.15,
+  },
+  count: {
+    padding: '8px 10px',
+    borderRadius: 999,
+    background: '#f1f5f9',
+    color: '#334155',
+    fontWeight: 900,
+    fontSize: 12,
+    whiteSpace: 'nowrap',
+  },
+  grid: {
+    display: 'grid',
+    gridTemplateColumns: 'repeat(auto-fit, minmax(245px, 1fr))',
+    gap: 14,
+  },
+  card: {
+    appearance: 'none',
+    border: '1px solid #e5e7eb',
+    background: '#fff',
+    borderRadius: 14,
+    padding: 0,
+    overflow: 'hidden',
+    cursor: 'pointer',
+    textAlign: 'left',
+    color: '#111827',
+    boxShadow: '0 10px 26px rgba(15,23,42,0.08)',
+  },
+  preview: {
+    position: 'relative',
+    height: 218,
+    padding: 13,
+    boxSizing: 'border-box',
+    display: 'grid',
+    gap: 10,
+    overflow: 'hidden',
+  },
+  previewAccentGlow: {
+    position: 'absolute',
+    right: -42,
+    top: -46,
+    width: 132,
+    height: 132,
+    borderRadius: 999,
+    opacity: 0.28,
+    filter: 'blur(1px)',
+    pointerEvents: 'none',
+  },
+  previewHeader: {
+    display: 'grid',
+    gridTemplateColumns: '32px 1fr auto',
+    gap: 8,
+    alignItems: 'center',
+  },
+  previewLogo: {
+    width: 30,
+    height: 30,
+    borderRadius: 999,
+    border: '2px solid',
+    background: 'rgba(255,255,255,0.18)',
+  },
+  previewTitleBlock: {
+    display: 'grid',
+    gap: 5,
+  },
+  previewBrand: {
+    height: 9,
+    borderRadius: 999,
+    width: '72%',
+  },
+  previewSub: {
+    height: 6,
+    borderRadius: 999,
+    width: '46%',
+    background: 'rgba(255,255,255,0.50)',
+  },
+  previewChip: {
+    color: '#fff',
+    border: '1px solid',
+    borderRadius: 999,
+    padding: '3px 7px',
+    fontSize: 10,
+    fontWeight: 1000,
+    background: 'rgba(0,0,0,0.22)',
+  },
+  previewQr: {
+    width: 30,
+    height: 30,
+    borderRadius: 6,
+    border: '1px solid',
+    background: 'rgba(255,255,255,0.92)',
+    padding: 4,
+    boxSizing: 'border-box',
+    display: 'grid',
+    gridTemplateColumns: 'repeat(3, 1fr)',
+    gap: 2,
+  },
+  previewQrCell: {
+    borderRadius: 1,
+  },
+  previewFeature: {
+    display: 'grid',
+    gridTemplateColumns: '54px 1fr',
+    gap: 8,
+    padding: 8,
+    borderRadius: 10,
+    background: 'rgba(255,255,255,0.11)',
+    border: '1px solid rgba(255,255,255,0.14)',
+    boxShadow: '0 12px 26px rgba(0,0,0,0.14)',
+  },
+  previewHeroPhoto: {
+    width: 54,
+    height: 54,
+    borderRadius: 10,
+    border: '2px solid rgba(255,255,255,0.64)',
+    boxShadow: '0 8px 18px rgba(0,0,0,0.28)',
+  },
+  previewHeroText: {
+    display: 'grid',
+    gap: 5,
+    alignContent: 'center',
+    minWidth: 0,
+  },
+  previewRows: {
+    display: 'grid',
+    gap: 8,
+  },
+  previewLine: {
+    display: 'grid',
+    gridTemplateColumns: '1fr 40px',
+    gap: 10,
+    alignItems: 'center',
+    padding: '8px 9px',
+    borderRadius: 10,
+    background: 'rgba(255,255,255,0.10)',
+    border: '1px solid rgba(255,255,255,0.12)',
+  },
+  previewName: {
+    height: 8,
+    borderRadius: 999,
+    background: 'rgba(255,255,255,0.72)',
+  },
+  previewPrice: {
+    height: 9,
+    borderRadius: 999,
+  },
+  previewPhotoBlocks: {
+    display: 'grid',
+    gap: 8,
+  },
+  previewPhotoBlock: {
+    display: 'grid',
+    gap: 8,
+    alignItems: 'center',
+    padding: 7,
+    borderRadius: 12,
+    background: 'rgba(255,255,255,0.10)',
+    border: '1px solid rgba(255,255,255,0.12)',
+  },
+  previewPhoto: {
+    width: 50,
+    height: 50,
+    borderRadius: 999,
+    border: '2px solid rgba(255,255,255,0.76)',
+    boxShadow: '0 8px 18px rgba(0,0,0,0.26)',
+  },
+  previewMiniRows: {
+    display: 'grid',
+    gap: 5,
+  },
+  previewCategory: {
+    width: 58,
+    height: 7,
+    borderRadius: 999,
+  },
+  previewMiniLine: {
+    height: 7,
+    borderRadius: 999,
+    background: 'rgba(255,255,255,0.72)',
+  },
+  previewMiniLineShort: {
+    height: 7,
+    width: '64%',
+    borderRadius: 999,
+    background: 'rgba(255,255,255,0.46)',
+  },
+  previewGrid: {
+    display: 'grid',
+    gridTemplateColumns: 'repeat(2, 1fr)',
+    gap: 8,
+  },
+  previewTile: {
+    minHeight: 44,
+    borderRadius: 12,
+    padding: 9,
+    display: 'grid',
+    alignContent: 'space-between',
+    gap: 8,
+    background: 'rgba(255,255,255,0.10)',
+    border: '1px solid rgba(255,255,255,0.12)',
+  },
+  previewTileTitle: {
+    height: 7,
+    borderRadius: 999,
+    background: 'rgba(255,255,255,0.72)',
+  },
+  previewTilePrice: {
+    height: 8,
+    width: 34,
+    borderRadius: 999,
+  },
+  previewFooter: {
+    marginTop: 'auto',
+    display: 'grid',
+    gridTemplateColumns: '1fr 58px',
+    gap: 8,
+    alignItems: 'center',
+    minHeight: 16,
+  },
+  previewFooterLine: {
+    height: 7,
+    borderRadius: 999,
+    background: 'rgba(255,255,255,0.52)',
+    width: '76%',
+  },
+  previewFooterCta: {
+    height: 14,
+    borderRadius: 999,
+  },
+  cardBody: {
+    padding: 14,
+    display: 'grid',
+    gap: 8,
+  },
+  cardTop: {
+    display: 'flex',
+    justifyContent: 'space-between',
+    alignItems: 'center',
+    gap: 8,
+  },
+  group: {
+    color: '#64748b',
+    fontSize: 12,
+    fontWeight: 950,
+  },
+  id: {
+    color: '#0f766e',
+    fontSize: 12,
+    fontWeight: 1000,
+    background: '#ecfdf5',
+    border: '1px solid #bbf7d0',
+    borderRadius: 999,
+    padding: '3px 7px',
+  },
+  name: {
+    fontSize: 17,
+    fontWeight: 1000,
+    lineHeight: 1.15,
+  },
+  desc: {
+    minHeight: 38,
+    color: '#475569',
+    fontSize: 13,
+    fontWeight: 750,
+    lineHeight: 1.35,
+  },
+  tags: {
+    display: 'flex',
+    flexWrap: 'wrap',
+    gap: 6,
+  },
+  tag: {
+    fontSize: 11,
+    fontWeight: 900,
+    color: '#334155',
+    background: '#f8fafc',
+    border: '1px solid #e2e8f0',
+    borderRadius: 999,
+    padding: '4px 7px',
+  },
+  choose: {
+    marginTop: 2,
+    borderRadius: 10,
+    padding: '9px 10px',
+    textAlign: 'center',
+    color: '#111827',
+    fontWeight: 1000,
+  },
+  note: {
+    color: '#475569',
+    fontWeight: 800,
+    fontSize: 13,
+    lineHeight: 1.4,
+  },
 };
 
 export default function MenuEditor() {
@@ -254,9 +1335,11 @@ export default function MenuEditor() {
 
   // ✅ 기본 배경(전체 페이지 default)
   const [bgBlob, setBgBlob] = useState(null);
+  const [bgSignedUrl, setBgSignedUrl] = useState(null);
 
   // ✅ 페이지별 오버라이드 배경 blobs: { [pageNumber]: Blob }
   const [bgOverrides, setBgOverrides] = useState({});
+  const [bgOverrideSignedUrls, setBgOverrideSignedUrls] = useState({});
 
   const [layout, setLayout] = useState(DEFAULT_LAYOUT);
 
@@ -270,6 +1353,8 @@ export default function MenuEditor() {
   const [preview, setPreview] = useState(false);
 
   const [showEditorMenu, setShowEditorMenu] = useState(false);
+  const [toolsVisible, setToolsVisible] = useState(false);
+  const [switchingLang, setSwitchingLang] = useState(null);
 
   const fileInputRef = useRef(null);
   const introVideoInputRef = useRef(null);
@@ -279,12 +1364,16 @@ export default function MenuEditor() {
   const [dragOver, setDragOver] = useState(false);
   const [loading, setLoading] = useState(true);
   const [bgLoading, setBgLoading] = useState(true);
+  const [bgResolved, setBgResolved] = useState(false);
   const [bgAssetsReady, setBgAssetsReady] = useState(false);
   const [assetUploading, setAssetUploading] = useState(false);
   const [assetUploadMessage, setAssetUploadMessage] = useState('');
 
   const layoutSnapshotRef = useRef('');
   const bgSnapshotRef = useRef('');
+  const editStartLayoutRef = useRef(null);
+  const editStartLayoutsRef = useRef(new Map());
+  const editStartLangRef = useRef(null);
 
   // ✅ 보기모드에서만 잠깐 보이는 “수정 버튼” 상태
   const [showEditBtn, setShowEditBtn] = useState(false);
@@ -316,26 +1405,57 @@ export default function MenuEditor() {
   const pinStorageKey = useMemo(() => {
     return userId ? `${PIN_KEY}__${userId}` : PIN_KEY;
   }, [userId]);
+  const pairedTemplateSyncStorageKey = useMemo(() => {
+    return userId ? `${PAIRED_TEMPLATE_SYNC_KEY}__${userId}` : PAIRED_TEMPLATE_SYNC_KEY;
+  }, [userId]);
 
   useEffect(() => {
     let alive = true;
     let unsubscribe = null;
+    let resolved = false;
+
+    try {
+      const cachedUserId = getCurrentUser();
+      if (cachedUserId) {
+        setUserId(cachedUserId);
+        setUserReady(true);
+      }
+    } catch {}
 
     const finalize = (session) => {
       const uid = session?.user?.id;
+      resolved = true;
       if (!uid) {
         clearCurrentUser();
+        if (alive) {
+          setUserReady(false);
+          setLoading(false);
+          setBgLoading(false);
+          setBgResolved(true);
+        }
         router.replace('/login');
+        window.setTimeout(() => {
+          if (window.location.pathname !== '/login') window.location.replace('/login');
+        }, 100);
         return;
       }
       setCurrentUser(uid);
       if (!alive) return;
       setUserId(uid);
       setUserReady(true);
+      setLoading(false);
     };
 
+    const getSessionWithTimeout = (timeoutMs = 1200) =>
+      Promise.race([
+        supabase.auth.getSession(),
+        new Promise((resolve) => {
+          window.setTimeout(() => resolve({ data: { session: null } }), timeoutMs);
+        }),
+      ]);
+
     (async () => {
-      const { data } = await supabase.auth.getSession();
+      const { data } = await getSessionWithTimeout();
       if (data?.session?.user?.id) {
         finalize(data.session);
         return;
@@ -346,13 +1466,16 @@ export default function MenuEditor() {
         if (event === 'INITIAL_SESSION' || event === 'SIGNED_IN' || event === 'TOKEN_REFRESHED') {
           finalize(session);
         }
+        if (event === 'SIGNED_OUT') {
+          finalize(null);
+        }
       });
       unsubscribe = () => sub?.subscription?.unsubscribe?.();
 
       setTimeout(async () => {
-        if (!alive) return;
-        const { data: again } = await supabase.auth.getSession();
-        if (again?.session?.user?.id) finalize(again.session);
+        if (!alive || resolved) return;
+        const { data: again } = await getSessionWithTimeout(800);
+        finalize(again?.session || null);
       }, 1200);
     })();
 
@@ -374,9 +1497,27 @@ export default function MenuEditor() {
   const [lang, setLang] = useState('en');
   const [langReady, setLangReady] = useState(false);
   const [hasInitialView, setHasInitialView] = useState(false);
+  const [initialLanguageWarmupReady, setInitialLanguageWarmupReady] = useState(true);
   const initialLangRef = useRef(null);
   const layoutSyncedLangsRef = useRef(new Set());
   const backgroundSyncedLangsRef = useRef(new Set());
+  const viewCacheRef = useRef(new Map());
+  const templateDraftLayoutsRef = useRef(new Map());
+  const pairedTemplateSyncRef = useRef(null);
+  const editStartTemplateSyncRef = useRef(null);
+  const warmingLangsRef = useRef(new Set());
+  const warmingLanguagePromisesRef = useRef(new Map());
+  const languageCacheRevisionRef = useRef(0);
+  const pageHydrationRequestsRef = useRef(new Set());
+  const backgroundImagePreloadRequestsRef = useRef(new Set());
+  const visualsReadyLangsRef = useRef(new Set());
+  const readyBundleWriteKeysRef = useRef(new Set());
+  const readyBundleAppliedRef = useRef(null);
+  const [readyBundleLookup, setReadyBundleLookup] = useState({
+    identity: null,
+    checked: false,
+    hasBundle: false,
+  });
 
   // ✅ 편집창 페이지 단위 보기
   const [pageView, setPageView] = useState(true);
@@ -401,8 +1542,6 @@ export default function MenuEditor() {
         vv?.width,
         window.innerWidth,
         document.documentElement?.clientWidth,
-        window.screen?.width,
-        window.screen?.availWidth,
       ]
         .map((v) => Number(v) || 0)
         .filter(Boolean);
@@ -411,14 +1550,12 @@ export default function MenuEditor() {
         vv?.height,
         window.innerHeight,
         document.documentElement?.clientHeight,
-        window.screen?.height,
-        window.screen?.availHeight,
       ]
         .map((v) => Number(v) || 0)
         .filter(Boolean);
 
-      setVw(widthCandidates.length ? Math.min(...widthCandidates) : 1280);
-      setVh(heightCandidates.length ? Math.min(...heightCandidates) : 900);
+      setVw(widthCandidates.length ? Math.max(...widthCandidates) : 1280);
+      setVh(heightCandidates.length ? Math.max(...heightCandidates) : 900);
     };
 
     update();
@@ -476,18 +1613,27 @@ export default function MenuEditor() {
     }
   }, [bgBlob, bgOverrides]);
 
-  const loadBackgrounds = useCallback(async (isCancelled, { showLoading = false } = {}) => {
+  const rememberLanguageView = useCallback((language, patch = {}) => {
+    const key = language === 'ko' ? 'ko' : 'en';
+    const previous = viewCacheRef.current.get(key) || {};
+    viewCacheRef.current.set(key, {
+      ...previous,
+      ...patch,
+      updatedAt: Date.now(),
+    });
+  }, []);
+
+  const loadLocalBackgroundBundle = useCallback(async (language, { migrateLegacy = false, pages = null, loadOverrides = true } = {}) => {
     let localBg = null;
     let localOverrides = {};
-    let hasLocalBg = false;
 
     try {
-      const bgKey = menuBgKey(lang);
+      const bgKey = menuBgKey(language);
       const localBgLang = await loadLocalBlob(bgKey);
       const localBgLegacy = localBgLang ? null : await loadLocalBlob(KEYS.MENU_BG);
       const bg = localBgLang || localBgLegacy || null;
 
-      if (!localBgLang && localBgLegacy) {
+      if (migrateLegacy && !localBgLang && localBgLegacy) {
         try {
           await saveBlob(bgKey, localBgLegacy);
         } catch {}
@@ -496,30 +1642,34 @@ export default function MenuEditor() {
       localBg = isBlobLike(bg) ? bg : null;
 
       try {
-        const idxKey = bgOverridesKey(lang);
+        const idxKey = bgOverridesKey(language);
         const overridesLang = await loadLocalJson(idxKey);
         const overridesLegacy = overridesLang ? null : await loadLocalJson(LEGACY_BG_OVERRIDES_KEY);
         const overrides = overridesLang || overridesLegacy || {};
 
-        if (!overridesLang && overridesLegacy) {
+        if (migrateLegacy && !overridesLang && overridesLegacy) {
           try {
             await saveJson(idxKey, overridesLegacy);
           } catch {}
         }
 
-        const pages = Object.keys(overrides || {});
+        const requestedPages = normalizePageList(pages);
+        const overridePages = loadOverrides
+          ? Object.keys(overrides || {})
+          : (requestedPages || []).map(String).filter((page) => page in (overrides || {}));
+
         const map = {};
-        for (const p of pages) {
+        for (const p of overridePages) {
           const pn = Number(p);
           if (!Number.isFinite(pn) || pn < 1) continue;
 
-          const blobLang = await loadLocalBlob(bgPageKey(pn, lang));
+          const blobLang = await loadLocalBlob(bgPageKey(pn, language));
           const blobLegacy = blobLang ? null : await loadLocalBlob(legacyBgPageKey(pn));
           const blob = blobLang || blobLegacy || null;
 
-          if (!blobLang && blobLegacy) {
+          if (migrateLegacy && !blobLang && blobLegacy) {
             try {
-              await saveBlob(bgPageKey(pn, lang), blobLegacy);
+              await saveBlob(bgPageKey(pn, language), blobLegacy);
             } catch {}
           }
 
@@ -527,14 +1677,173 @@ export default function MenuEditor() {
         }
         localOverrides = map;
       } catch {}
+    } catch {}
 
-      hasLocalBg = !!localBg || Object.keys(localOverrides).length > 0;
+    return {
+      bgBlob: localBg,
+      bgOverrides: localOverrides,
+      hasLocalBg: !!localBg || Object.keys(localOverrides).length > 0,
+    };
+  }, []);
+
+  const loadRemoteBackgroundUrlBundle = useCallback(async (language, { loadOverrides = false, pages = null } = {}) => {
+    let nextBgSignedUrl = null;
+    let nextOverrideSignedUrls = {};
+
+    try {
+      nextBgSignedUrl = await getSignedAssetUrl(menuBgKey(language), { expiresInSec: 60 * 60 * 2 });
+
+      const requestedPages = normalizePageList(pages);
+      if (loadOverrides || requestedPages?.length) {
+        const overrides =
+          (await loadLocalJson(bgOverridesKey(language))) ||
+          (await syncJsonFromCloud(bgOverridesKey(language)))?.data ||
+          (await loadLocalJson(LEGACY_BG_OVERRIDES_KEY)) ||
+          {};
+        const overridePages = loadOverrides
+          ? Object.keys(overrides || {})
+          : requestedPages.map(String).filter((page) => page in (overrides || {}));
+
+        const entries = await Promise.all(
+          overridePages.map(async (page) => {
+            const pn = Number(page);
+            if (!Number.isFinite(pn) || pn < 1) return null;
+            const signedUrl = await getSignedAssetUrl(bgPageKey(pn, language), { expiresInSec: 60 * 60 * 2 });
+            return signedUrl ? [pn, signedUrl] : null;
+          })
+        );
+
+        nextOverrideSignedUrls = Object.fromEntries(entries.filter(Boolean));
+      }
+    } catch {}
+
+    return {
+      bgSignedUrl: nextBgSignedUrl,
+      bgOverrideSignedUrls: nextOverrideSignedUrls,
+      hasAnyBg: !!nextBgSignedUrl || Object.keys(nextOverrideSignedUrls).length > 0,
+    };
+  }, []);
+
+  const syncBackgroundBundleFromCloud = useCallback(async (language, { loadOverrides = true } = {}) => {
+    let nextBg = null;
+    let nextOverrides = {};
+
+    try {
+      const syncedBg = (await syncBlobFromCloud(menuBgKey(language)))?.data;
+      const localBg = syncedBg || (await loadLocalBlob(menuBgKey(language))) || null;
+      nextBg = isBlobLike(localBg) ? localBg : null;
+
+      if (loadOverrides) {
+        const overrides =
+          (await syncJsonFromCloud(bgOverridesKey(language)))?.data ||
+          (await loadLocalJson(bgOverridesKey(language))) ||
+          (await loadLocalJson(LEGACY_BG_OVERRIDES_KEY)) ||
+          {};
+
+        const map = {};
+        for (const p of Object.keys(overrides || {})) {
+          const pn = Number(p);
+          if (!Number.isFinite(pn) || pn < 1) continue;
+
+          const blobSync = await syncBlobFromCloud(bgPageKey(pn, language));
+          const blob = blobSync?.data || (await loadLocalBlob(bgPageKey(pn, language))) || null;
+          if (isBlobLike(blob)) map[pn] = blob;
+        }
+        nextOverrides = map;
+      }
+    } catch {}
+
+    return {
+      bgBlob: nextBg,
+      bgOverrides: nextOverrides,
+      hasAnyBg: !!nextBg || Object.keys(nextOverrides).length > 0,
+    };
+  }, []);
+
+  const loadBackgrounds = useCallback(async (isCancelled, { showLoading = false } = {}) => {
+    let localBg = null;
+    let localOverrides = {};
+    let hasLocalBg = false;
+    let hasTargetLocalBg = false;
+    let fastSignedBgUrl = null;
+    let fastSignedOverrideUrls = {};
+
+    if (!isCancelled?.() && showLoading) {
+      setBgResolved(false);
+    }
+
+    try {
+      const localBundle = await withTimeout(
+        loadLocalBackgroundBundle(lang, { migrateLegacy: true, pages: [1], loadOverrides: false }),
+        900,
+        { bgBlob: null, bgOverrides: {}, hasLocalBg: false }
+      );
+      localBg = localBundle.bgBlob;
+      localOverrides = localBundle.bgOverrides;
+      hasLocalBg = localBundle.hasLocalBg;
+      hasTargetLocalBg = localBundle.hasLocalBg;
+
+      if (!hasLocalBg) {
+        const fallbackBundle = await withTimeout(
+          loadLocalBackgroundBundle(fallbackLanguageFor(lang), { pages: [1], loadOverrides: false }),
+          900,
+          { bgBlob: null, bgOverrides: {}, hasLocalBg: false }
+        );
+        if (fallbackBundle.hasLocalBg) {
+          localBg = fallbackBundle.bgBlob;
+          localOverrides = fallbackBundle.bgOverrides;
+          hasLocalBg = true;
+        }
+      }
 
       if (!isCancelled?.() && hasLocalBg) {
         setBgBlob(localBg);
         setBgOverrides(localOverrides);
+        setBgSignedUrl(null);
+        setBgOverrideSignedUrls({});
+        rememberLanguageView(lang, {
+          bgBlob: localBg,
+          bgOverrides: localOverrides,
+          bgSignedUrl: null,
+          bgOverrideSignedUrls: {},
+          hasBackgroundCache: true,
+        });
       }
     } catch {}
+
+    if (!hasLocalBg && !isCancelled?.()) {
+      const targetSignedBundle = await withTimeout(
+        loadRemoteBackgroundUrlBundle(lang, { loadOverrides: false, pages: [1] }),
+        1200,
+        { hasAnyBg: false }
+      );
+      const signedBundle = targetSignedBundle.hasAnyBg
+        ? targetSignedBundle
+        : await withTimeout(
+            loadRemoteBackgroundUrlBundle(fallbackLanguageFor(lang), { loadOverrides: false, pages: [1] }),
+            1200,
+            { hasAnyBg: false }
+          );
+
+      if (signedBundle.hasAnyBg && !isCancelled?.()) {
+        hasLocalBg = true;
+        hasTargetLocalBg = true;
+        fastSignedBgUrl = signedBundle.bgSignedUrl || null;
+        fastSignedOverrideUrls = signedBundle.bgOverrideSignedUrls || {};
+        backgroundSyncedLangsRef.current.add(lang);
+        setBgBlob(null);
+        setBgOverrides({});
+        setBgSignedUrl(fastSignedBgUrl);
+        setBgOverrideSignedUrls(fastSignedOverrideUrls);
+        rememberLanguageView(lang, {
+          bgBlob: null,
+          bgOverrides: {},
+          bgSignedUrl: fastSignedBgUrl,
+          bgOverrideSignedUrls: fastSignedOverrideUrls,
+          hasBackgroundCache: true,
+        });
+      }
+    }
 
     const shouldBlock = showLoading && !hasLocalBg;
     if (!isCancelled?.()) {
@@ -542,6 +1851,7 @@ export default function MenuEditor() {
         setBgLoading(true);
         setBgAssetsReady(false);
       } else {
+        if (hasLocalBg) setBgResolved(true);
         setBgLoading(false);
       }
     }
@@ -550,13 +1860,23 @@ export default function MenuEditor() {
 
     const shouldRemoteSync =
       !backgroundSyncedLangsRef.current.has(lang) &&
-      (lang === initialLangRef.current || !hasLocalBg);
+      (lang === initialLangRef.current || !hasTargetLocalBg);
 
     if (!shouldRemoteSync) {
       if (!hasLocalBg && !isCancelled?.()) {
         setBgBlob(null);
         setBgOverrides({});
+        setBgSignedUrl(null);
+        setBgOverrideSignedUrls({});
+        rememberLanguageView(lang, {
+          bgBlob: null,
+          bgOverrides: {},
+          bgSignedUrl: null,
+          bgOverrideSignedUrls: {},
+          hasBackgroundCache: true,
+        });
       }
+      if (!isCancelled?.()) setBgResolved(true);
       return { hasLocalBg };
     }
 
@@ -567,63 +1887,78 @@ export default function MenuEditor() {
     let hasAnyBg = hasLocalBg;
 
     try {
-      const syncResult = await syncBlobFromCloud(menuBgKey(lang));
-      if (isBlobLike(syncResult?.data)) {
-        finalBg = syncResult.data;
+      const shouldLoadOverridesNow = !showLoading || hasLocalBg;
+      const targetBundle = await withTimeout(
+        syncBackgroundBundleFromCloud(lang, { loadOverrides: shouldLoadOverridesNow }),
+        showLoading ? 1800 : 3000,
+        { hasAnyBg: false, bgBlob: null, bgOverrides: {} }
+      );
+      if (targetBundle.hasAnyBg) {
+        finalBg = targetBundle.bgBlob;
+        finalOverrides = targetBundle.bgOverrides;
         hasAnyBg = true;
       }
 
-      try {
-        const overridesSync = await syncJsonFromCloud(bgOverridesKey(lang));
-        const overrides =
-          overridesSync?.data ||
-          (await loadLocalJson(bgOverridesKey(lang))) ||
-          (await loadLocalJson(LEGACY_BG_OVERRIDES_KEY)) ||
-          {};
-
-        const map = {};
-        for (const p of Object.keys(overrides || {})) {
-          const pn = Number(p);
-          if (!Number.isFinite(pn) || pn < 1) continue;
-
-          const blobSync = await syncBlobFromCloud(bgPageKey(pn, lang));
-          if (isBlobLike(blobSync?.data)) {
-            map[pn] = blobSync.data;
-            continue;
-          }
-
-          const localBlob = await loadLocalBlob(bgPageKey(pn, lang));
-          if (isBlobLike(localBlob)) map[pn] = localBlob;
+      if (!hasAnyBg) {
+        const fallbackBundle = await withTimeout(
+          syncBackgroundBundleFromCloud(fallbackLanguageFor(lang), { loadOverrides: shouldLoadOverridesNow }),
+          showLoading ? 1800 : 3000,
+          { hasAnyBg: false, bgBlob: null, bgOverrides: {} }
+        );
+        if (fallbackBundle.hasAnyBg) {
+          finalBg = fallbackBundle.bgBlob;
+          finalOverrides = fallbackBundle.bgOverrides;
+          hasAnyBg = true;
         }
-
-        finalOverrides = map;
-        hasAnyBg = hasAnyBg || Object.keys(map).length > 0;
-      } catch {}
+      }
     } catch {} finally {
       if (!isCancelled?.()) {
         if (hasAnyBg) {
-          setBgBlob(finalBg || null);
-          setBgOverrides(finalOverrides || {});
+          const hasDownloadedBg = !!finalBg || Object.keys(finalOverrides || {}).length > 0;
+          setBgBlob(hasDownloadedBg ? finalBg || null : null);
+          setBgOverrides(hasDownloadedBg ? finalOverrides || {} : {});
+          setBgSignedUrl(hasDownloadedBg ? null : fastSignedBgUrl);
+          setBgOverrideSignedUrls(hasDownloadedBg ? {} : fastSignedOverrideUrls);
         } else {
           setBgBlob(null);
           setBgOverrides({});
+          setBgSignedUrl(null);
+          setBgOverrideSignedUrls({});
         }
+        const hasDownloadedBg = !!finalBg || Object.keys(finalOverrides || {}).length > 0;
+        rememberLanguageView(lang, {
+          bgBlob: hasAnyBg && hasDownloadedBg ? finalBg || null : null,
+          bgOverrides: hasAnyBg && hasDownloadedBg ? finalOverrides || {} : {},
+          bgSignedUrl: hasAnyBg && !hasDownloadedBg ? fastSignedBgUrl : null,
+          bgOverrideSignedUrls: hasAnyBg && !hasDownloadedBg ? fastSignedOverrideUrls : {},
+          hasBackgroundCache: true,
+        });
+        setBgResolved(true);
         setBgLoading(false);
       }
     }
 
-    return { hasLocalBg, hasAnyBg };
-  }, [lang]);
+    if (showLoading && hasAnyBg && !hasLocalBg && !isCancelled?.()) {
+      syncBackgroundBundleFromCloud(lang, { loadOverrides: true }).then((bundle) => {
+        if (isCancelled?.() || !bundle?.hasAnyBg) return;
+        const nextBg = bundle.bgBlob || finalBg || null;
+        const nextOverrides = bundle.bgOverrides || {};
+        setBgBlob(nextBg);
+        setBgOverrides(nextOverrides);
+        setBgSignedUrl(null);
+        setBgOverrideSignedUrls({});
+        rememberLanguageView(lang, {
+          bgBlob: nextBg,
+          bgOverrides: nextOverrides,
+          bgSignedUrl: null,
+          bgOverrideSignedUrls: {},
+          hasBackgroundCache: true,
+        });
+      });
+    }
 
-  useEffect(() => {
-    if (!userReady || !langReady) return;
-    let cancelled = false;
-    const isCancelled = () => cancelled;
-    loadBackgrounds(isCancelled, { showLoading: true });
-    return () => {
-      cancelled = true;
-    };
-  }, [userReady, langReady, loadBackgrounds]);
+    return { hasLocalBg, hasAnyBg };
+  }, [lang, loadLocalBackgroundBundle, loadRemoteBackgroundUrlBundle, rememberLanguageView, syncBackgroundBundleFromCloud]);
 
   useEffect(() => {
     try {
@@ -655,6 +1990,31 @@ export default function MenuEditor() {
     }
   }, [userReady, pinStorageKey]);
 
+  useEffect(() => {
+    if (!userReady) return;
+    try {
+      const parsed = JSON.parse(localStorage.getItem(pairedTemplateSyncStorageKey) || 'null');
+      pairedTemplateSyncRef.current = parsed?.templateId
+        ? { templateId: String(parsed.templateId), ts: Number(parsed.ts || 0) || Date.now() }
+        : null;
+    } catch {
+      pairedTemplateSyncRef.current = null;
+    }
+  }, [userReady, pairedTemplateSyncStorageKey]);
+
+  const setPairedTemplateSync = useCallback((templateId) => {
+    const safeTemplateId = isPremiumTemplateId(templateId) ? String(templateId) : null;
+    const nextSync = safeTemplateId ? { templateId: safeTemplateId, ts: Date.now() } : null;
+    pairedTemplateSyncRef.current = nextSync;
+    try {
+      if (nextSync) {
+        localStorage.setItem(pairedTemplateSyncStorageKey, JSON.stringify(nextSync));
+      } else {
+        localStorage.removeItem(pairedTemplateSyncStorageKey);
+      }
+    } catch {}
+  }, [pairedTemplateSyncStorageKey]);
+
   const normalizeLoadedLayout = useCallback((raw) => {
     const base = raw && typeof raw === 'object' ? raw : DEFAULT_LAYOUT;
 
@@ -676,9 +2036,13 @@ export default function MenuEditor() {
       const n = Number(key);
       return Number.isFinite(n) ? Math.max(max, n) : max;
     }, 1);
+    const pageCountFromLayout = Number(base.pageCount) > 0 ? Math.floor(Number(base.pageCount)) : 1;
+    const pageCountFromTemplate = isPremiumTemplateId(base.templateId) ? 3 : 1;
 
     const pageCount = Math.max(
       1,
+      pageCountFromLayout,
+      pageCountFromTemplate,
       pageCountFromItems,
       pageCountFromBackgrounds
     );
@@ -693,34 +2057,541 @@ export default function MenuEditor() {
     };
   }, []);
 
-  const persistLayout = useCallback(
-    async (nextLayout) => {
-      const normalized = normalizeLoadedLayout(nextLayout) || DEFAULT_LAYOUT;
-      const sanitized = sanitizeLayoutMediaSafe(normalized);
+  const writeReadyLayoutBundle = useCallback((language, nextLayout) => {
+    const safeLang = language === 'ko' ? 'ko' : 'en';
+    const cached = viewCacheRef.current.get(safeLang) || {};
+    const imageUrls = getAllLayoutImageUrls(nextLayout);
+    const imagePreloadStats = {
+      total: imageUrls.length,
+      loaded: imageUrls.length,
+      failed: 0,
+      failedUrls: [],
+    };
 
-      setLayout(normalized);
-      await saveJson(menuLayoutKey(lang), sanitized);
-      return sanitized;
+    writeWindowReadyView({
+      language: safeLang,
+      userId,
+      layout: nextLayout,
+      bgSignedUrl: cached.bgSignedUrl || null,
+      bgOverrideSignedUrls: cached.bgOverrideSignedUrls || {},
+    });
+
+    return writeMenuReadyBundleAsync({
+      language: safeLang,
+      userId,
+      layout: nextLayout,
+      bgSignedUrl: cached.bgSignedUrl || null,
+      bgOverrideSignedUrls: cached.bgOverrideSignedUrls || {},
+      imagePreloadStats,
+    });
+  }, [userId]);
+
+  const rememberReadyLayout = useCallback((language, nextLayout) => {
+    const safeLang = language === 'ko' ? 'ko' : 'en';
+    rememberLanguageView(safeLang, cacheOptionsForLayout(nextLayout));
+    layoutSyncedLangsRef.current.add(safeLang);
+    if (!layoutNeedsMediaHydration(nextLayout)) {
+      visualsReadyLangsRef.current.add(safeLang);
+    }
+    writeReadyLayoutBundle(safeLang, nextLayout).catch(() => {});
+  }, [rememberLanguageView, writeReadyLayoutBundle]);
+
+  const applyPairedTemplate = useCallback(
+    async (templateId) => {
+      const sourceData = layout?.mode === 'template' ? layout.templateData : null;
+      const koLayout = normalizeLoadedLayout(makeTemplateLayoutForLanguage(templateId, 'ko', sourceData));
+      const enLayout = normalizeLoadedLayout(makeTemplateLayoutForLanguage(templateId, 'en', sourceData));
+      const activeLayout = lang === 'ko' ? koLayout : enLayout;
+
+      templateDraftLayoutsRef.current = new Map([
+        ['ko', koLayout],
+        ['en', enLayout],
+      ]);
+      setLayout(activeLayout);
+
+      return activeLayout;
+    },
+    [lang, layout, normalizeLoadedLayout]
+  );
+
+  const updateTemplateDraftLayout = useCallback(
+    (nextLayout, language = lang) => {
+      const safeLang = language === 'ko' ? 'ko' : 'en';
+      const normalized = normalizeLoadedLayout(nextLayout);
+
+      const currentTemplateId = getCanonicalTemplateId(normalized);
+      if (normalized?.mode !== 'template' || !isPremiumTemplateId(currentTemplateId)) {
+        setLayout(normalized);
+        return normalized;
+      }
+
+      const currentLayout = normalizeLoadedLayout(makeTemplateLayout(
+        currentTemplateId,
+        normalized.templateData
+      ));
+      const otherLang = safeLang === 'ko' ? 'en' : 'ko';
+      const draftMap = templateDraftLayoutsRef.current instanceof Map
+        ? templateDraftLayoutsRef.current
+        : new Map();
+      const otherDraft = draftMap.get(otherLang);
+      const otherBase =
+        otherDraft?.mode === 'template' && otherDraft?.templateId === currentLayout.templateId
+          ? otherDraft
+          : makeTemplateLayoutForLanguage(currentLayout.templateId, otherLang, currentLayout.templateData);
+      const otherLayout = normalizeLoadedLayout(makeTemplateLayout(
+        currentLayout.templateId,
+        mergePairedTemplateEditData(
+          otherBase.templateData || makeInitialTemplateData(currentLayout.templateId, otherLang),
+          currentLayout.templateData
+        )
+      ));
+
+      draftMap.set(safeLang, currentLayout);
+      draftMap.set(otherLang, otherLayout);
+      templateDraftLayoutsRef.current = draftMap;
+      setLayout(currentLayout);
+      return currentLayout;
     },
     [lang, normalizeLoadedLayout]
   );
 
+  const persistLayout = useCallback(
+    async (nextLayout) => {
+      languageCacheRevisionRef.current += 1;
+      warmingLangsRef.current.clear();
+      warmingLanguagePromisesRef.current.clear();
+      let normalized = normalizeLayoutTextForLanguage(normalizeLoadedLayout(nextLayout), lang) || DEFAULT_LAYOUT;
+
+      const normalizedTemplateId = getCanonicalTemplateId(normalized);
+      if (normalized?.mode === 'template' && isPremiumTemplateId(normalizedTemplateId)) {
+        normalized = normalizeLoadedLayout(makeTemplateLayout(
+          normalizedTemplateId,
+          normalized.templateData
+        ));
+        const otherLang = lang === 'ko' ? 'en' : 'ko';
+        const draftMap = templateDraftLayoutsRef.current instanceof Map
+          ? templateDraftLayoutsRef.current
+          : new Map();
+        const otherDraft = draftMap.get(otherLang);
+        const otherRaw = await withTimeout(loadLocalJson(menuLayoutKey(otherLang)), 900, null);
+        const canReuseOther =
+          otherRaw?.mode === 'template' &&
+          otherRaw?.templateId === normalized.templateId;
+        const canReuseDraft =
+          otherDraft?.mode === 'template' &&
+          otherDraft?.templateId === normalized.templateId;
+        const otherBase = canReuseDraft
+          ? otherDraft
+          : canReuseOther
+          ? normalizeLoadedLayout(otherRaw)
+          : makeTemplateLayoutForLanguage(normalized.templateId, otherLang, normalized.templateData);
+        const otherLayout = normalizeLoadedLayout(makeTemplateLayout(
+          normalized.templateId,
+          mergePairedTemplateEditData(
+            otherBase.templateData || makeInitialTemplateData(normalized.templateId, otherLang),
+            normalized.templateData
+          )
+        ));
+        const sanitizedCurrent = sanitizeLayoutMediaSafe(normalized);
+        const sanitizedOther = sanitizeLayoutMediaSafe(otherLayout);
+
+        setPairedTemplateSync(normalized.templateId);
+        setLayout(normalized);
+        rememberReadyLayout(lang, normalized);
+        rememberReadyLayout(otherLang, otherLayout);
+        await Promise.all([
+          saveJson(menuLayoutKey(lang), sanitizedCurrent),
+          saveJson(menuLayoutKey(otherLang), sanitizedOther),
+          writeReadyLayoutBundle(lang, normalized),
+          writeReadyLayoutBundle(otherLang, otherLayout),
+        ]);
+        return sanitizedCurrent;
+      }
+
+      const sanitized = sanitizeLayoutMediaSafe(normalized);
+
+      if (normalized?.mode === 'custom') {
+        setPairedTemplateSync(null);
+      }
+      setLayout(normalized);
+      rememberReadyLayout(lang, normalized);
+      await Promise.all([
+        saveJson(menuLayoutKey(lang), sanitized),
+        writeReadyLayoutBundle(lang, normalized),
+      ]);
+      return sanitized;
+    },
+    [lang, normalizeLoadedLayout, rememberReadyLayout, setPairedTemplateSync, writeReadyLayoutBundle]
+  );
+
+  const repairLayoutMediaFromFallback = useCallback(
+    async (targetLayout, targetLanguage) => {
+      const safeTargetLang = targetLanguage === 'ko' ? 'ko' : 'en';
+      if (!layoutNeedsMediaHydration(targetLayout)) return targetLayout;
+
+      const fallbackLang = fallbackLanguageFor(safeTargetLang);
+      let fallbackRaw = viewCacheRef.current.get(fallbackLang)?.layout || null;
+
+      if (!fallbackRaw) {
+        fallbackRaw = await withTimeout(loadLocalJson(menuLayoutKey(fallbackLang)), 1200, null);
+      }
+
+      if (!fallbackRaw) {
+        const remote = await withTimeout(syncJsonFromCloud(menuLayoutKey(fallbackLang)), 3000, null);
+        fallbackRaw = remote?.data || null;
+      }
+
+      if (!isUsableMenuLayout(fallbackRaw)) return targetLayout;
+
+      let fallbackLayout = normalizeLayoutTextForLanguage(normalizeLoadedLayout(fallbackRaw), fallbackLang);
+      const migratedFallback = await migrateLegacyInlineMediaSafe(fallbackLayout);
+      fallbackLayout = await withTimeout(hydrateLayoutMediaSafe(migratedFallback.layout), 5000, migratedFallback.layout);
+
+      const repaired = repairMissingMediaItemsFromFallback(targetLayout, fallbackLayout);
+      if (!repaired.changed) return targetLayout;
+
+      const hydratedRepairedLayout = layoutNeedsMediaHydration(repaired.layout)
+        ? await withTimeout(hydrateLayoutMediaSafe(repaired.layout), 5000, repaired.layout)
+        : repaired.layout;
+
+      await saveJson(menuLayoutKey(safeTargetLang), sanitizeLayoutMediaSafe(hydratedRepairedLayout));
+      return hydratedRepairedLayout;
+    },
+    [normalizeLoadedLayout]
+  );
+
+  useEffect(() => {
+    if (!userReady || !langReady) return;
+    if (edit) return;
+
+    const identity = menuReadyBundleIdentity(lang, userId);
+    const syncedTemplateId = pairedTemplateSyncRef.current?.templateId || null;
+    if (readyBundleAppliedRef.current === identity) {
+      setReadyBundleLookup((prev) => (
+        prev.identity === identity && prev.checked && prev.hasBundle
+          ? prev
+          : { identity, checked: true, hasBundle: true }
+      ));
+      return;
+    }
+
+    const windowReadyView = readWindowReadyView(lang, userId);
+    if (windowReadyView?.layout) {
+      const readyLayout = normalizeLayoutTextForLanguage(normalizeLoadedLayout(windowReadyView.layout), lang);
+      if (layoutConflictsWithSyncedTemplate(readyLayout, syncedTemplateId)) {
+        setReadyBundleLookup({ identity, checked: true, hasBundle: false });
+      } else {
+        readyBundleAppliedRef.current = identity;
+        layoutSyncedLangsRef.current.add(lang);
+        const hasWindowBackground =
+          !!windowReadyView.bgSignedUrl ||
+          Object.keys(windowReadyView.bgOverrideSignedUrls || {}).length > 0;
+        if (hasWindowBackground) backgroundSyncedLangsRef.current.add(lang);
+        visualsReadyLangsRef.current.add(lang);
+
+        setLayout(readyLayout);
+        setBgBlob(null);
+        setBgOverrides({});
+        setBgSignedUrl(windowReadyView.bgSignedUrl || null);
+        setBgOverrideSignedUrls(windowReadyView.bgOverrideSignedUrls || {});
+        setBgAssetsReady(hasWindowBackground);
+        setBgResolved(true);
+        setBgLoading(false);
+        setLoading(false);
+        setHasInitialView(true);
+        rememberLanguageView(lang, {
+          layout: readyLayout,
+          hasLayoutCache: true,
+          hasFullMediaCache: !layoutNeedsMediaHydration(readyLayout),
+          bgBlob: null,
+          bgOverrides: {},
+          bgSignedUrl: windowReadyView.bgSignedUrl || null,
+          bgOverrideSignedUrls: windowReadyView.bgOverrideSignedUrls || {},
+          hasBackgroundCache: hasWindowBackground,
+        });
+        setReadyBundleLookup({ identity, checked: true, hasBundle: true });
+        return;
+      }
+    }
+
+    let cancelled = false;
+    setReadyBundleLookup({ identity, checked: false, hasBundle: false });
+
+    (async () => {
+      const bundle =
+        readMenuReadyBundle(lang, userId) ||
+        await withTimeout(readMenuReadyBundleAsync(lang, userId), 900, null);
+      if (cancelled) return;
+      if (!bundle?.layout) {
+        setReadyBundleLookup({ identity, checked: true, hasBundle: false });
+        return;
+      }
+
+      const bundledLayout = normalizeLayoutTextForLanguage(normalizeLoadedLayout(bundle.layout), lang);
+      if (layoutConflictsWithSyncedTemplate(bundledLayout, syncedTemplateId)) {
+        setReadyBundleLookup({ identity, checked: true, hasBundle: false });
+        return;
+      }
+      if (!isUsableMenuLayout(bundledLayout)) {
+        setReadyBundleLookup({ identity, checked: true, hasBundle: false });
+        return;
+      }
+
+      readyBundleAppliedRef.current = identity;
+      layoutSyncedLangsRef.current.add(lang);
+      if (readyBundleImagesComplete(bundle)) {
+        visualsReadyLangsRef.current.add(lang);
+      }
+      const hasBundleBackground =
+        !!bundle.bgSignedUrl ||
+        Object.keys(bundle.bgOverrideSignedUrls || {}).length > 0;
+      if (hasBundleBackground) {
+        backgroundSyncedLangsRef.current.add(lang);
+      }
+
+      setLayout(bundledLayout);
+      setBgBlob(null);
+      setBgOverrides({});
+      setBgSignedUrl(bundle.bgSignedUrl || null);
+      setBgOverrideSignedUrls(bundle.bgOverrideSignedUrls || {});
+      setBgAssetsReady(hasBundleBackground);
+      setBgResolved(true);
+      setBgLoading(false);
+      setLoading(false);
+      setHasInitialView(true);
+
+      rememberLanguageView(lang, {
+        layout: bundledLayout,
+        hasLayoutCache: true,
+        hasFullMediaCache: !layoutNeedsMediaHydration(bundledLayout),
+        bgBlob: null,
+        bgOverrides: {},
+        bgSignedUrl: bundle.bgSignedUrl || null,
+        bgOverrideSignedUrls: bundle.bgOverrideSignedUrls || {},
+        hasBackgroundCache: hasBundleBackground,
+      });
+      setReadyBundleLookup({ identity, checked: true, hasBundle: true });
+    })();
+
+    return () => {
+      cancelled = true;
+    };
+  }, [userReady, userId, langReady, lang, edit, normalizeLoadedLayout, rememberLanguageView]);
+
+  useEffect(() => {
+    if (!userReady || !langReady) return;
+    if (edit) return;
+    const identity = menuReadyBundleIdentity(lang, userId);
+    const cachedForLang = viewCacheRef.current.get(lang);
+    if (readyBundleAppliedRef.current === identity && cachedForLang?.hasBackgroundCache) return;
+    if (
+      readyBundleLookup.identity === identity &&
+      readyBundleLookup.checked &&
+      readyBundleLookup.hasBundle &&
+      cachedForLang?.hasBackgroundCache
+    ) return;
+    if (hasInitialView) {
+      const cached = viewCacheRef.current.get(lang);
+      if (cached?.hasBackgroundCache) {
+        setBgResolved(true);
+        setBgLoading(false);
+        return;
+      }
+    }
+
+    let cancelled = false;
+    const isCancelled = () => cancelled;
+    loadBackgrounds(isCancelled, { showLoading: true });
+    return () => {
+      cancelled = true;
+    };
+  }, [userReady, userId, langReady, lang, hasInitialView, loadBackgrounds, readyBundleLookup]);
+
+  const preloadLanguageView = useCallback(
+    async (language) => {
+      if (!userReady || !langReady) return null;
+      const targetLang = language === 'ko' ? 'ko' : 'en';
+      const cacheRevision = languageCacheRevisionRef.current;
+      const isCacheRevisionCurrent = () => languageCacheRevisionRef.current === cacheRevision;
+      const rememberLanguageViewIfCurrent = (targetLanguage, patch) => {
+        if (!isCacheRevisionCurrent()) return false;
+        rememberLanguageView(targetLanguage, patch);
+        return true;
+      };
+      const cached = viewCacheRef.current.get(targetLang);
+      const cachedLayoutReady =
+        cached?.hasLayoutCache &&
+        cached?.hasFullMediaCache &&
+        !layoutNeedsMediaHydration(cached.layout);
+      if (cachedLayoutReady && cached?.hasBackgroundCache) return cached;
+
+      const readyBundle =
+        readMenuReadyBundle(targetLang, userId) ||
+        await withTimeout(readMenuReadyBundleAsync(targetLang, userId), 900, null);
+      if (readyBundle?.layout) {
+        const bundledLayout = normalizeLayoutTextForLanguage(normalizeLoadedLayout(readyBundle.layout), targetLang);
+        if (isUsableMenuLayout(bundledLayout)) {
+          const hasBundleBackground =
+            !!readyBundle.bgSignedUrl ||
+            Object.keys(readyBundle.bgOverrideSignedUrls || {}).length > 0;
+          if (!rememberLanguageViewIfCurrent(targetLang, {
+            layout: bundledLayout,
+            hasLayoutCache: true,
+            hasFullMediaCache: !layoutNeedsMediaHydration(bundledLayout),
+            bgBlob: null,
+            bgOverrides: {},
+            bgSignedUrl: readyBundle.bgSignedUrl || null,
+            bgOverrideSignedUrls: readyBundle.bgOverrideSignedUrls || {},
+            hasBackgroundCache: hasBundleBackground,
+          })) {
+            return viewCacheRef.current.get(targetLang) || null;
+          }
+          if (readyBundleImagesComplete(readyBundle)) {
+            visualsReadyLangsRef.current.add(targetLang);
+          }
+          layoutSyncedLangsRef.current.add(targetLang);
+          if (hasBundleBackground) backgroundSyncedLangsRef.current.add(targetLang);
+          return viewCacheRef.current.get(targetLang) || null;
+        }
+      }
+
+      const pending = warmingLanguagePromisesRef.current.get(targetLang);
+      if (pending) return pending;
+
+      const work = (async () => {
+        let nextCache = viewCacheRef.current.get(targetLang) || {};
+
+        warmingLangsRef.current.add(targetLang);
+        try {
+          if (
+            nextCache?.hasLayoutCache &&
+            !nextCache?.hasFullMediaCache &&
+            !layoutNeedsMediaHydration(nextCache.layout)
+          ) {
+            rememberLanguageViewIfCurrent(targetLang, { hasFullMediaCache: true });
+            nextCache = viewCacheRef.current.get(targetLang) || nextCache;
+          }
+
+          if (!nextCache?.hasLayoutCache || layoutNeedsMediaHydration(nextCache.layout)) {
+            const key = menuLayoutKey(targetLang);
+            const saved = nextCache?.layout || await loadLocalJson(key);
+            const remote = saved ? null : await syncJsonFromCloud(key);
+            const rawLayout = saved || remote?.data || null;
+
+            if (isUsableMenuLayout(rawLayout)) {
+              let safeLay = normalizeLayoutTextForLanguage(normalizeLoadedLayout(rawLayout), targetLang);
+              const migratedLocal = await migrateLegacyInlineMediaSafe(safeLay);
+              safeLay = await withTimeout(hydrateLayoutMediaSafe(migratedLocal.layout), 15000, migratedLocal.layout);
+              safeLay = await withTimeout(repairLayoutMediaFromFallback(safeLay, targetLang), 5000, safeLay);
+              rememberLanguageViewIfCurrent(targetLang, {
+                layout: safeLay,
+                hasLayoutCache: true,
+                hasFullMediaCache: !layoutNeedsMediaHydration(safeLay),
+              });
+              nextCache = viewCacheRef.current.get(targetLang) || nextCache;
+            }
+          }
+
+          if (!nextCache?.hasBackgroundCache) {
+            const localBundle = await loadLocalBackgroundBundle(targetLang, { loadOverrides: true });
+            const fallbackBundle = localBundle.hasLocalBg
+              ? null
+              : await loadLocalBackgroundBundle(fallbackLanguageFor(targetLang), { loadOverrides: true });
+            const bundle = localBundle.hasLocalBg ? localBundle : fallbackBundle || localBundle;
+
+            if (bundle.hasLocalBg) {
+              rememberLanguageViewIfCurrent(targetLang, {
+                bgBlob: bundle.bgBlob,
+                bgOverrides: bundle.bgOverrides,
+                bgSignedUrl: null,
+                bgOverrideSignedUrls: {},
+                hasBackgroundCache: true,
+              });
+            } else {
+              const signedBundle = await loadRemoteBackgroundUrlBundle(targetLang, { loadOverrides: true });
+              rememberLanguageViewIfCurrent(targetLang, {
+                bgBlob: null,
+                bgOverrides: {},
+                bgSignedUrl: signedBundle.bgSignedUrl || null,
+                bgOverrideSignedUrls: signedBundle.bgOverrideSignedUrls || {},
+                hasBackgroundCache: true,
+              });
+            }
+          }
+        } catch (error) {
+          console.error('preloadLanguageView failed', error);
+        } finally {
+          if (isCacheRevisionCurrent()) {
+            if (viewCacheRef.current.get(targetLang)?.hasLayoutCache) {
+              layoutSyncedLangsRef.current.add(targetLang);
+            }
+            if (viewCacheRef.current.get(targetLang)?.hasBackgroundCache) {
+              backgroundSyncedLangsRef.current.add(targetLang);
+            }
+            const finalCache = viewCacheRef.current.get(targetLang);
+            if (finalCache?.layout && !layoutNeedsMediaHydration(finalCache.layout)) {
+              const stats = await withTimeout(
+                preloadImageUrlsUntilReady(getAllLayoutImageUrls(finalCache.layout), 6000, 2),
+                10000,
+                null
+              );
+              if (imagePreloadStatsComplete(finalCache.layout, stats) && isCacheRevisionCurrent()) {
+                visualsReadyLangsRef.current.add(targetLang);
+                writeWindowReadyView({
+                  language: targetLang,
+                  userId,
+                  layout: finalCache.layout,
+                  bgSignedUrl: finalCache.bgSignedUrl || null,
+                  bgOverrideSignedUrls: finalCache.bgOverrideSignedUrls || {},
+                });
+                writeMenuReadyBundleAsync({
+                  language: targetLang,
+                  userId,
+                  layout: finalCache.layout,
+                  bgSignedUrl: finalCache.bgSignedUrl || null,
+                  bgOverrideSignedUrls: finalCache.bgOverrideSignedUrls || {},
+                  imagePreloadStats: stats,
+                }).catch((error) => {
+                  console.error('write preloaded language bundle failed', error);
+                });
+              }
+            }
+          }
+          warmingLangsRef.current.delete(targetLang);
+          warmingLanguagePromisesRef.current.delete(targetLang);
+        }
+
+        return viewCacheRef.current.get(targetLang) || null;
+      })();
+
+      warmingLanguagePromisesRef.current.set(targetLang, work);
+      return work;
+    },
+    [userReady, userId, langReady, normalizeLoadedLayout, rememberLanguageView, loadLocalBackgroundBundle, loadRemoteBackgroundUrlBundle, repairLayoutMediaFromFallback]
+  );
+
 
   const refreshLayoutFromCloud = useCallback(
-    async ({ showLoading = false } = {}) => {
+    async ({ showLoading = false, force = false } = {}) => {
       if (!userReady) return null;
       if (showLoading) setLoading(true);
       try {
-        const syncResult = await syncJsonFromCloud(menuLayoutKey(lang), {
-          onRemoteDiff: () => {
-            if (showLoading) setLoading(true);
-          },
-        });
+        const syncResult = await withTimeout(
+          syncJsonFromCloud(menuLayoutKey(lang), {
+            force,
+            onRemoteDiff: () => {
+              if (showLoading) setLoading(true);
+            },
+          }),
+          5000,
+          null
+        );
         if (!syncResult?.data) return null;
 
-        let safeLay = normalizeLoadedLayout(syncResult.data);
+        let safeLay = normalizeLayoutTextForLanguage(normalizeLoadedLayout(syncResult.data), lang);
         const migratedRemote = await migrateLegacyInlineMediaSafe(safeLay);
-        safeLay = await hydrateLayoutMediaSafe(migratedRemote.layout);
+        safeLay = await withTimeout(hydrateLayoutMediaSafe(migratedRemote.layout), 15000, migratedRemote.layout);
+        safeLay = await withTimeout(repairLayoutMediaFromFallback(safeLay, lang), 5000, safeLay);
 
         const nextSnapshot = JSON.stringify(sanitizeLayoutMediaSafe(safeLay));
         const changed = nextSnapshot !== layoutSnapshotRef.current;
@@ -731,8 +2602,12 @@ export default function MenuEditor() {
           if (migratedRemote.changed) {
             await persistLayout(safeLay);
           }
-          setTimeout(() => hardResetScrollTop('auto'), 0);
         }
+        rememberLanguageView(lang, {
+          layout: safeLay,
+          hasLayoutCache: true,
+          hasFullMediaCache: !layoutNeedsMediaHydration(safeLay),
+        });
 
         return safeLay;
       } catch (error) {
@@ -742,7 +2617,7 @@ export default function MenuEditor() {
         if (showLoading) setLoading(false);
       }
     },
-    [userReady, lang, normalizeLoadedLayout, persistLayout]
+    [userReady, lang, normalizeLoadedLayout, persistLayout, rememberLanguageView, repairLayoutMediaFromFallback]
   );
 
   const refreshBackgroundsFromCloud = useCallback(
@@ -783,45 +2658,135 @@ export default function MenuEditor() {
           bgSnapshotRef.current = nextMeta;
           setBgBlob(nextBg);
           setBgOverrides(nextOverrides);
+          setBgSignedUrl(null);
+          setBgOverrideSignedUrls({});
         }
+        rememberLanguageView(lang, {
+          bgBlob: nextBg,
+          bgOverrides: nextOverrides,
+          bgSignedUrl: null,
+          bgOverrideSignedUrls: {},
+          hasBackgroundCache: true,
+        });
       } catch (error) {
         console.error('refreshBackgroundsFromCloud failed', error);
       }
     },
-    [userReady, lang, loadBackgrounds]
+    [userReady, lang, loadBackgrounds, rememberLanguageView]
   );
 
   useEffect(() => {
     if (!userReady || !langReady) return;
+    if (edit) return;
+    const identity = menuReadyBundleIdentity(lang, userId);
+    if (readyBundleAppliedRef.current === identity) return;
+    if (readyBundleLookup.identity === identity && readyBundleLookup.checked && readyBundleLookup.hasBundle) return;
+
     let cancelled = false;
 
     (async () => {
       let saved = null;
-      let legacy = null;
       let hasLocalLayout = false;
+      let hasUsableLocalLayout = false;
+      let hasTargetLocalLayout = false;
+      let hasUsableTargetLocalLayout = false;
+      let usingTargetLayout = false;
 
       try {
         const key = menuLayoutKey(lang);
-        saved = await loadLocalJson(key);
-        legacy = saved ? null : await loadLocalJson(KEYS.MENU_LAYOUT);
-        hasLocalLayout = !!saved || !!legacy;
+        const targetSaved = await withTimeout(loadLocalJson(key), 1200, null);
+        hasTargetLocalLayout = !!targetSaved;
+
+        if (hasTargetLocalLayout) {
+          const syncedTemplateId = pairedTemplateSyncRef.current?.templateId || null;
+          if (layoutConflictsWithSyncedTemplate(targetSaved, syncedTemplateId)) {
+            const cachedForLang = viewCacheRef.current.get(lang)?.layout;
+            const fallbackLang = fallbackLanguageFor(lang);
+            const cachedFallback = viewCacheRef.current.get(fallbackLang)?.layout;
+            const sourceTemplate =
+              cachedForLang?.mode === 'template' && getCanonicalTemplateId(cachedForLang) === syncedTemplateId
+                ? cachedForLang
+                : cachedFallback?.mode === 'template' && getCanonicalTemplateId(cachedFallback) === syncedTemplateId
+                ? cachedFallback
+                : layout?.mode === 'template' && getCanonicalTemplateId(layout) === syncedTemplateId
+                ? layout
+                : null;
+            saved = normalizeLoadedLayout(
+              makeTemplateLayoutForLanguage(syncedTemplateId, lang, sourceTemplate?.templateData)
+            );
+            await saveJson(menuLayoutKey(lang), sanitizeLayoutMediaSafe(saved));
+          } else {
+            saved = targetSaved;
+          }
+          usingTargetLayout = true;
+        }
+
+        hasLocalLayout = isUsableMenuLayout(saved);
 
         if (hasLocalLayout) {
-          const lay = saved || legacy || DEFAULT_LAYOUT;
+          const lay = saved || DEFAULT_LAYOUT;
 
-          let safeLay = normalizeLoadedLayout(lay);
+          let safeLay = normalizeLayoutTextForLanguage(normalizeLoadedLayout(lay), lang);
           const migratedLocal = await migrateLegacyInlineMediaSafe(safeLay);
-          safeLay = await hydrateLayoutMediaSafe(migratedLocal.layout);
+          const hydratedLay = await withTimeout(
+            hydrateLayoutMediaSafe(migratedLocal.layout),
+            15000,
+            migratedLocal.layout
+          );
+          safeLay = await withTimeout(
+            repairLayoutMediaFromFallback(hydratedLay, lang),
+            5000,
+            hydratedLay
+          );
+          const allImageUrls = getAllLayoutImageUrls(safeLay);
+          preloadImageUrlsUntilReady(allImageUrls, 6000, 2)
+            .then((stats) => {
+              if (!imagePreloadStatsComplete(safeLay, stats)) return;
+              visualsReadyLangsRef.current.add(lang);
+              const writeKey = `initial:${lang}:${userId || 'user'}:${stats.total}:${safeLay.items?.length || 0}`;
+              if (readyBundleWriteKeysRef.current.has(writeKey)) return;
+              readyBundleWriteKeysRef.current.add(writeKey);
+              writeWindowReadyView({
+                language: lang,
+                userId,
+                layout: safeLay,
+                bgSignedUrl: bgSignedUrl || null,
+                bgOverrideSignedUrls: bgOverrideSignedUrls || {},
+              });
+              return writeMenuReadyBundleAsync({
+                language: lang,
+                userId,
+                layout: safeLay,
+                bgSignedUrl: bgSignedUrl || null,
+                bgOverrideSignedUrls: bgOverrideSignedUrls || {},
+                imagePreloadStats: stats,
+              });
+            })
+            .catch((error) => {
+              console.error('initial menu image preload failed', error);
+            });
 
-          if (!cancelled) setLayout(safeLay);
-
-          if (!saved && legacy) {
-            await persistLayout(safeLay);
-          } else if (migratedLocal.changed) {
-            await persistLayout(safeLay);
+          if (!cancelled) {
+            setLayout(safeLay);
+            rememberLanguageView(lang, {
+              layout: safeLay,
+              hasLayoutCache: true,
+              hasFullMediaCache: !layoutNeedsMediaHydration(safeLay),
+            });
+            setLoading(false);
           }
 
-          if (!cancelled) setTimeout(() => hardResetScrollTop('auto'), 0);
+          rememberLanguageView(lang, {
+            layout: safeLay,
+            hasLayoutCache: true,
+            hasFullMediaCache: !layoutNeedsMediaHydration(safeLay),
+          });
+          hasUsableLocalLayout = safeLay.mode === 'custom' || safeLay.mode === 'template';
+          hasUsableTargetLocalLayout = usingTargetLayout && hasUsableLocalLayout;
+
+          if (usingTargetLayout && migratedLocal.changed) {
+            await persistLayout(safeLay);
+          }
         }
       } finally {
         if (!cancelled) setLoading(false);
@@ -829,12 +2794,19 @@ export default function MenuEditor() {
 
       const shouldRemoteSync =
         !layoutSyncedLangsRef.current.has(lang) &&
-        (lang === initialLangRef.current || !hasLocalLayout);
+        (lang === initialLangRef.current || !hasTargetLocalLayout || !hasUsableTargetLocalLayout);
 
       if (shouldRemoteSync && !cancelled) {
         layoutSyncedLangsRef.current.add(lang);
-        const remoteLayout = await refreshLayoutFromCloud({ showLoading: !hasLocalLayout });
-        if (!remoteLayout && !hasLocalLayout && !cancelled) {
+        const remoteLayout = await withTimeout(
+          refreshLayoutFromCloud({
+            showLoading: !hasLocalLayout || !hasUsableLocalLayout,
+            force: !hasUsableLocalLayout,
+          }),
+          hasLocalLayout ? 6000 : 10000,
+          null
+        );
+        if (!isUsableMenuLayout(remoteLayout) && !hasLocalLayout && !cancelled) {
           setLayout(DEFAULT_LAYOUT);
         }
       } else if (!hasLocalLayout && !cancelled) {
@@ -847,16 +2819,46 @@ export default function MenuEditor() {
     return () => {
       cancelled = true;
     };
-  }, [userReady, langReady, lang, normalizeLoadedLayout, persistLayout, refreshLayoutFromCloud]);
-
+  }, [userReady, userId, langReady, lang, edit, layout, normalizeLoadedLayout, persistLayout, refreshLayoutFromCloud, repairLayoutMediaFromFallback, readyBundleLookup]);
 
   useEffect(() => {
-    setPageIndex(1);
-    requestAnimationFrame(() => {
-      hardResetScrollTop('auto');
-      setTimeout(() => hardResetScrollTop('auto'), 0);
+    if (!userReady || !langReady) return;
+    if (layout?.mode !== 'custom') return;
+
+    const items = Array.isArray(layout?.items) ? layout.items : [];
+    const needsHydration = items.some((item) => {
+      if (!item || (item.type !== 'image' && item.type !== 'video')) return false;
+      return !!item.assetPath && (!item.src || isBlobUrlSrc(item.src));
     });
-  }, [lang]);
+    if (!needsHydration) return;
+
+    const requestKey = `${lang}:all-media`;
+    if (pageHydrationRequestsRef.current.has(requestKey)) return;
+    pageHydrationRequestsRef.current.add(requestKey);
+
+    let cancelled = false;
+    (async () => {
+      try {
+        const hydratedPageLayout = await hydrateLayoutMediaSafe(layout);
+        if (cancelled) return;
+        await preloadImageUrlsUntilReady(getAllLayoutImageUrls(hydratedPageLayout), 8000, 2);
+        if (cancelled) return;
+
+        setLayout(hydratedPageLayout);
+        rememberLanguageView(lang, {
+          layout: hydratedPageLayout,
+          hasLayoutCache: true,
+          hasFullMediaCache: !layoutNeedsMediaHydration(hydratedPageLayout),
+        });
+      } finally {
+        pageHydrationRequestsRef.current.delete(requestKey);
+      }
+    })();
+
+    return () => {
+      cancelled = true;
+    };
+  }, [userReady, langReady, lang, layout, rememberLanguageView]);
 
 
   useEffect(() => {
@@ -956,23 +2958,487 @@ export default function MenuEditor() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [edit, preview]);
 
-  const setLanguage = (next) => {
-    if (next === lang) return;
+  const applyCachedLanguageView = (cached) => {
+    if (!cached) return;
 
-    // ✅ 언어 전환 시 무조건 1페이지로
+    if (cached?.hasLayoutCache && cached.layout) {
+      setLayout(cached.layout);
+      try {
+        layoutSnapshotRef.current = JSON.stringify(sanitizeLayoutMediaSafe(cached.layout));
+      } catch {}
+    }
+
+    if (cached?.hasBackgroundCache) {
+      setBgBlob(cached.bgBlob || null);
+      setBgOverrides(cached.bgOverrides || {});
+      setBgSignedUrl(cached.bgSignedUrl || null);
+      setBgOverrideSignedUrls(cached.bgOverrideSignedUrls || {});
+      setBgAssetsReady(true);
+      setBgResolved(true);
+      setBgLoading(false);
+    }
+  };
+
+  const preloadCachedLanguageVisuals = async (language, cached) => {
+    if (!cached) return;
+
+    const tempUrls = [];
+    const backgroundUrls = [];
+
+    try {
+      const overrideKeys = Array.from(new Set([
+        ...Object.keys(cached.bgOverrides || {}),
+        ...Object.keys(cached.bgOverrideSignedUrls || {}),
+      ]));
+
+      overrideKeys.forEach((pageKey) => {
+        const page = Number(pageKey);
+        const pageOverrideBlob = cached.bgOverrides?.[pageKey] || cached.bgOverrides?.[page];
+        const pageOverrideSignedUrl = cached.bgOverrideSignedUrls?.[pageKey] || cached.bgOverrideSignedUrls?.[page];
+        if (pageOverrideSignedUrl) {
+          backgroundUrls.push(pageOverrideSignedUrl);
+          return;
+        }
+
+        if (isBlobLike(pageOverrideBlob) && typeof URL !== 'undefined') {
+          const objectUrl = URL.createObjectURL(pageOverrideBlob);
+          tempUrls.push(objectUrl);
+          backgroundUrls.push(objectUrl);
+        }
+      });
+
+      if (cached.bgSignedUrl) {
+        backgroundUrls.push(cached.bgSignedUrl);
+      } else if (isBlobLike(cached.bgBlob) && typeof URL !== 'undefined') {
+        const objectUrl = URL.createObjectURL(cached.bgBlob);
+        tempUrls.push(objectUrl);
+        backgroundUrls.push(objectUrl);
+      }
+
+      const menuImageUrls = getAllLayoutImageUrls(cached.layout);
+      const [menuStats] = await Promise.all([
+        preloadImageUrlsUntilReady(menuImageUrls, 5000, 1),
+        preloadImageUrls(backgroundUrls, 1800),
+      ]);
+      if (imagePreloadStatsComplete(cached.layout, menuStats)) {
+        visualsReadyLangsRef.current.add(language);
+      }
+    } finally {
+      tempUrls.forEach((url) => {
+        try {
+          URL.revokeObjectURL(url);
+        } catch {}
+      });
+    }
+  };
+
+  const setLanguage = async (nextLanguage) => {
+    const next = nextLanguage === 'ko' ? 'ko' : 'en';
+    if (switchingLang || next === lang) return;
+
+    if (edit) {
+      const currentLang = lang === 'ko' ? 'ko' : 'en';
+      const draftMap = templateDraftLayoutsRef.current instanceof Map
+        ? templateDraftLayoutsRef.current
+        : new Map();
+      const startSnapshots = editStartLayoutsRef.current instanceof Map
+        ? editStartLayoutsRef.current
+        : new Map();
+      const currentDraft = normalizeLoadedLayout(layout);
+      if (isUsableMenuLayout(currentDraft)) {
+        draftMap.set(currentLang, currentDraft);
+      }
+
+      const targetDraft = draftMap.get(next) || startSnapshots.get(next) || null;
+      if (currentDraft?.mode !== 'template') {
+        if (!isUsableMenuLayout(targetDraft)) return;
+        const targetLayout = normalizeLayoutTextForLanguage(normalizeLoadedLayout(targetDraft), next);
+        draftMap.set(next, targetLayout);
+        templateDraftLayoutsRef.current = draftMap;
+        setLayout(targetLayout);
+        setLang(next);
+        setPageIndex(1);
+        hardResetScrollTop('auto');
+        try {
+          localStorage.setItem(LANG_KEY, next);
+        } catch {}
+        return;
+      }
+
+      if (targetDraft?.mode === 'custom') {
+        const targetLayout = normalizeLayoutTextForLanguage(normalizeLoadedLayout(targetDraft), next);
+        draftMap.set(next, targetLayout);
+        templateDraftLayoutsRef.current = draftMap;
+        setLayout(targetLayout);
+        setLang(next);
+        setPageIndex(1);
+        hardResetScrollTop('auto');
+        try {
+          localStorage.setItem(LANG_KEY, next);
+        } catch {}
+        return;
+      }
+
+      if (currentDraft?.mode === 'template') {
+        const activeTemplateId = getCanonicalTemplateId(currentDraft);
+        if (!isPremiumTemplateId(activeTemplateId)) {
+          return;
+        }
+        setSwitchingLang(next);
+        setPageIndex(1);
+        hardResetScrollTop('auto');
+
+        try {
+          const currentLayout = normalizeLoadedLayout(makeTemplateLayout(
+            activeTemplateId,
+            currentDraft.templateData
+          ));
+          draftMap.set(currentLang, currentLayout);
+
+          const targetBase =
+            targetDraft?.mode === 'template' && targetDraft?.templateId === currentLayout.templateId
+              ? targetDraft
+              : makeTemplateLayoutForLanguage(currentLayout.templateId, next, currentLayout.templateData);
+          const targetLayout = normalizeLoadedLayout(makeTemplateLayout(
+            currentLayout.templateId,
+            mergePairedTemplateEditData(
+              targetBase.templateData || makeInitialTemplateData(currentLayout.templateId, next),
+              currentLayout.templateData
+            )
+          ));
+
+          draftMap.set(next, targetLayout);
+          templateDraftLayoutsRef.current = draftMap;
+          setLayout(targetLayout);
+          setLang(next);
+          try {
+            localStorage.setItem(LANG_KEY, next);
+          } catch {}
+        } finally {
+          setSwitchingLang(null);
+        }
+        return;
+      }
+    }
+
+    const currentLayoutLang = lang === 'ko' ? 'ko' : 'en';
+    const syncedTemplateId = pairedTemplateSyncRef.current?.templateId || null;
+    const currentLayoutTemplateId = getCanonicalTemplateId(layout);
+    const currentLayoutConflictsWithSync =
+      syncedTemplateId &&
+      layout?.mode === 'template' &&
+      currentLayoutTemplateId &&
+      currentLayoutTemplateId !== syncedTemplateId;
+
+    if (!currentLayoutConflictsWithSync) {
+      rememberLanguageView(currentLayoutLang, {
+        layout,
+        bgBlob,
+        bgOverrides,
+        bgSignedUrl,
+        bgOverrideSignedUrls,
+        hasLayoutCache: true,
+        hasFullMediaCache: !layoutNeedsMediaHydration(layout),
+        hasBackgroundCache: true,
+      });
+    }
+
+    if (syncedTemplateId && isPremiumTemplateId(syncedTemplateId)) {
+      setSwitchingLang(next);
+      setPageIndex(1);
+      hardResetScrollTop('auto');
+
+      try {
+        const currentCachedLayout = viewCacheRef.current.get(currentLayoutLang)?.layout || null;
+        const targetCached = viewCacheRef.current.get(next) || null;
+        const targetSavedRaw = await withTimeout(loadLocalJson(menuLayoutKey(next)), 700, null);
+        const matchingCurrentSource = [layout, currentCachedLayout]
+          .map((candidate) => normalizeLoadedLayout(candidate))
+          .find((candidate) => (
+            candidate?.mode === 'template' &&
+            getCanonicalTemplateId(candidate) === syncedTemplateId
+          ));
+        const matchingTargetSource = [targetSavedRaw, targetCached?.layout]
+          .map((candidate) => normalizeLoadedLayout(candidate))
+          .find((candidate) => (
+            candidate?.mode === 'template' &&
+            getCanonicalTemplateId(candidate) === syncedTemplateId
+          ));
+        const targetSeed = matchingTargetSource ||
+          normalizeLoadedLayout(makeTemplateLayoutForLanguage(
+            syncedTemplateId,
+            next,
+            matchingCurrentSource?.templateData
+          ));
+        const targetTemplateData = matchingCurrentSource?.templateData
+          ? mergePairedTemplateEditData(
+              targetSeed.templateData || makeInitialTemplateData(syncedTemplateId, next),
+              matchingCurrentSource.templateData
+            )
+          : (targetSeed.templateData || makeInitialTemplateData(syncedTemplateId, next));
+        const targetLayout = normalizeLayoutTextForLanguage(
+          normalizeLoadedLayout(makeTemplateLayout(syncedTemplateId, targetTemplateData)),
+          next
+        );
+
+        rememberLanguageView(next, cacheOptionsForLayout(targetLayout));
+        setLayout(targetLayout);
+        setLang(next);
+        layoutSyncedLangsRef.current.add(next);
+        writeWindowReadyView({
+          language: next,
+          userId,
+          layout: targetLayout,
+          bgSignedUrl: targetCached?.bgSignedUrl || null,
+          bgOverrideSignedUrls: targetCached?.bgOverrideSignedUrls || {},
+        });
+        saveJson(menuLayoutKey(next), sanitizeLayoutMediaSafe(targetLayout)).catch(() => {});
+        writeReadyLayoutBundle(next, targetLayout).catch(() => {});
+        try {
+          localStorage.setItem(LANG_KEY, next);
+        } catch {}
+      } finally {
+        setSwitchingLang(null);
+      }
+      return;
+    }
+
+    const activeViewTemplateId = currentLayoutTemplateId;
+    if (layout?.mode === 'template' && isPremiumTemplateId(activeViewTemplateId)) {
+      setSwitchingLang(next);
+      setPageIndex(1);
+      hardResetScrollTop('auto');
+
+      try {
+        let targetCustomLayout = null;
+        const targetCached = viewCacheRef.current.get(next);
+        const pairedTemplateSync = pairedTemplateSyncRef.current;
+        const shouldPreferTargetCustom =
+          pairedTemplateSync?.templateId !== activeViewTemplateId;
+        if (shouldPreferTargetCustom) {
+          const rawTargetLayout = await withTimeout(loadLocalJson(menuLayoutKey(next)), 900, null);
+          if (rawTargetLayout?.mode === 'custom') {
+            targetCustomLayout = normalizeLayoutTextForLanguage(normalizeLoadedLayout(rawTargetLayout), next);
+          } else if (!rawTargetLayout && targetCached?.layout?.mode === 'custom') {
+            targetCustomLayout = normalizeLayoutTextForLanguage(normalizeLoadedLayout(targetCached.layout), next);
+          }
+        }
+
+        if (targetCustomLayout?.mode === 'custom') {
+          let readyCustomLayout = targetCustomLayout;
+          if (layoutNeedsMediaHydration(readyCustomLayout)) {
+            readyCustomLayout = await withTimeout(
+              hydrateLayoutMediaSafe(readyCustomLayout),
+              9000,
+              readyCustomLayout
+            );
+            readyCustomLayout = await withTimeout(
+              repairLayoutMediaFromFallback(readyCustomLayout, next),
+              4000,
+              readyCustomLayout
+            );
+          }
+
+          const nextCustomCache = {
+            ...(targetCached || {}),
+            layout: readyCustomLayout,
+            hasLayoutCache: true,
+            hasFullMediaCache: !layoutNeedsMediaHydration(readyCustomLayout),
+          };
+          rememberLanguageView(next, nextCustomCache);
+          applyCachedLanguageView(nextCustomCache);
+          if (!nextCustomCache.hasBackgroundCache) {
+            setLayout(readyCustomLayout);
+            setBgResolved(true);
+            setBgLoading(false);
+          }
+          setLang(next);
+          layoutSyncedLangsRef.current.add(next);
+          try {
+            localStorage.setItem(LANG_KEY, next);
+          } catch {}
+          return;
+        }
+
+        const currentLayout = normalizeLoadedLayout(makeTemplateLayout(
+          activeViewTemplateId,
+          layout.templateData
+        ));
+        const targetCachedLayout = viewCacheRef.current.get(next)?.layout;
+        const targetBase =
+          targetCachedLayout?.mode === 'template' &&
+          getCanonicalTemplateId(targetCachedLayout) === currentLayout.templateId
+            ? normalizeLoadedLayout(targetCachedLayout)
+            : makeTemplateLayoutForLanguage(currentLayout.templateId, next, currentLayout.templateData);
+        const targetLayout = normalizeLoadedLayout(makeTemplateLayout(
+          currentLayout.templateId,
+          mergePairedTemplateEditData(
+            targetBase.templateData || makeInitialTemplateData(currentLayout.templateId, next),
+            currentLayout.templateData
+          )
+        ));
+
+        rememberLanguageView(currentLayoutLang, cacheOptionsForLayout(currentLayout));
+        rememberLanguageView(next, cacheOptionsForLayout(targetLayout));
+        setLayout(targetLayout);
+        setLang(next);
+        layoutSyncedLangsRef.current.add(next);
+        writeWindowReadyView({
+          language: next,
+          userId,
+          layout: targetLayout,
+          bgSignedUrl: viewCacheRef.current.get(next)?.bgSignedUrl || null,
+          bgOverrideSignedUrls: viewCacheRef.current.get(next)?.bgOverrideSignedUrls || {},
+        });
+        writeReadyLayoutBundle(next, targetLayout).catch(() => {});
+        try {
+          localStorage.setItem(LANG_KEY, next);
+        } catch {}
+      } finally {
+        setSwitchingLang(null);
+      }
+      return;
+    }
+
+    setSwitchingLang(next);
     setPageIndex(1);
     hardResetScrollTop('auto');
-
-    setLang(next);
     try {
-      localStorage.setItem(LANG_KEY, next);
-    } catch {}
+      let cached = viewCacheRef.current.get(next);
+      if (cached?.layout && !layoutMatchesLanguage(cached.layout, next)) {
+        cached = null;
+        rememberLanguageView(next, {
+          layout: null,
+          hasLayoutCache: false,
+          hasFullMediaCache: false,
+        });
+      }
+      if (
+        !cached?.hasLayoutCache ||
+        !cached?.hasFullMediaCache ||
+        layoutNeedsMediaHydration(cached.layout) ||
+        !cached?.hasBackgroundCache
+      ) {
+        cached = await withTimeout(
+          preloadLanguageView(next),
+          6500,
+          viewCacheRef.current.get(next) || cached || null
+        );
+      }
 
-    // ✅ 기존 화면을 유지한 채 새 언어 자산을 교체해서 깜빡임 최소화
-    requestAnimationFrame(() => {
-      hardResetScrollTop('auto');
-      setTimeout(() => hardResetScrollTop('auto'), 0);
-    });
+      cached = viewCacheRef.current.get(next) || cached;
+
+      if (!isUsableMenuLayout(cached?.layout) || layoutNeedsMediaHydration(cached.layout)) {
+        let rawLayout =
+          cached?.layout ||
+          await withTimeout(loadLocalJson(menuLayoutKey(next)), 1600, null) ||
+          null;
+
+        if (rawLayout && !layoutMatchesLanguage(rawLayout, next)) {
+          rawLayout = null;
+        }
+
+        if (!rawLayout) {
+          rawLayout = (await withTimeout(
+            syncJsonFromCloud(menuLayoutKey(next), { force: true }),
+            7000,
+            null
+          ))?.data || null;
+        }
+
+        if (rawLayout && !layoutMatchesLanguage(rawLayout, next)) {
+          rawLayout = null;
+        }
+
+        if (isUsableMenuLayout(rawLayout)) {
+          let safeLayout = normalizeLayoutTextForLanguage(normalizeLoadedLayout(rawLayout), next);
+          const migrated = await migrateLegacyInlineMediaSafe(safeLayout);
+          safeLayout = await withTimeout(hydrateLayoutMediaSafe(migrated.layout), 15000, migrated.layout);
+          safeLayout = await withTimeout(repairLayoutMediaFromFallback(safeLayout, next), 5000, safeLayout);
+          cached = {
+            ...(cached || {}),
+            layout: safeLayout,
+            hasLayoutCache: true,
+            hasFullMediaCache: !layoutNeedsMediaHydration(safeLayout),
+          };
+          rememberLanguageView(next, cached);
+        }
+      }
+
+      if (cached?.layout && layoutNeedsMediaHydration(cached.layout)) {
+        let hydratedLayout = await withTimeout(hydrateLayoutMediaSafe(cached.layout), 15000, cached.layout);
+        hydratedLayout = await withTimeout(repairLayoutMediaFromFallback(hydratedLayout, next), 5000, hydratedLayout);
+        cached = {
+          ...cached,
+          layout: hydratedLayout,
+          hasLayoutCache: true,
+          hasFullMediaCache: !layoutNeedsMediaHydration(hydratedLayout),
+        };
+        rememberLanguageView(next, cached);
+      }
+
+      if (cached?.layout) {
+        const normalizedCachedLayout = normalizeLayoutTextForLanguage(normalizeLoadedLayout(cached.layout), next);
+        if (normalizedCachedLayout !== cached.layout) {
+          cached = {
+            ...cached,
+            layout: normalizedCachedLayout,
+            hasLayoutCache: true,
+            hasFullMediaCache: !layoutNeedsMediaHydration(normalizedCachedLayout),
+          };
+          rememberLanguageView(next, cached);
+        }
+      }
+
+      if (!cached?.hasLayoutCache || !isUsableMenuLayout(cached?.layout)) {
+        throw new Error('Language view cache is not ready');
+      }
+
+      if (layoutNeedsMediaHydration(cached.layout)) {
+        throw new Error('Language media is not ready');
+      }
+
+      const hasReadyVisuals =
+        visualsReadyLangsRef.current.has(next) &&
+        cached?.hasFullMediaCache &&
+        !layoutNeedsMediaHydration(cached.layout);
+
+      if (!hasReadyVisuals) {
+        await withTimeout(preloadCachedLanguageVisuals(next, cached), 5500, null);
+      }
+
+      applyCachedLanguageView(cached);
+      if (!cached?.hasBackgroundCache) {
+        setLayout(cached.layout);
+        try {
+          layoutSnapshotRef.current = JSON.stringify(sanitizeLayoutMediaSafe(cached.layout));
+        } catch {}
+        setBgResolved(true);
+        setBgLoading(false);
+      }
+      layoutSyncedLangsRef.current.add(next);
+      writeWindowReadyView({
+        language: next,
+        userId,
+        layout: cached.layout,
+        bgSignedUrl: cached.bgSignedUrl || null,
+        bgOverrideSignedUrls: cached.bgOverrideSignedUrls || {},
+      });
+      setLang(next);
+      try {
+        localStorage.setItem(LANG_KEY, next);
+      } catch {}
+
+      if (hasReadyVisuals) {
+        preloadCachedLanguageVisuals(next, cached).catch((error) => {
+          console.error('cached language visual refresh failed', error);
+        });
+      }
+    } catch (error) {
+      console.error('setLanguage failed', error);
+    } finally {
+      setSwitchingLang(null);
+    }
   };
 
 
@@ -1049,7 +3515,7 @@ export default function MenuEditor() {
       const parsed = JSON.parse(raw);
       const targetLang = parsed?.language === 'ko' || parsed?.language === 'en' ? parsed.language : lang;
 
-      let importedLayout = normalizeLoadedLayout(sanitizeLayout(parsed?.layout));
+      let importedLayout = normalizeLayoutTextForLanguage(normalizeLoadedLayout(sanitizeLayout(parsed?.layout)), targetLang);
       const backgroundPages = parsed?.backgrounds?.pages && typeof parsed.backgrounds.pages === 'object'
         ? parsed.backgrounds.pages
         : {};
@@ -1091,6 +3557,8 @@ export default function MenuEditor() {
         setLayout(hydratedImported);
         setBgBlob(nextBgBlob);
         setBgOverrides(nextOverrideBlobs);
+        setBgSignedUrl(null);
+        setBgOverrideSignedUrls({});
         setBgAssetsReady(true);
         setBgLoading(false);
       } else {
@@ -1109,85 +3577,14 @@ export default function MenuEditor() {
     }
   };
 
-  const cloneBlobSafe = (blob) => {
-    if (!blob) return null;
-    try {
-      return blob.slice(0, blob.size, blob.type);
-    } catch {
-      return blob;
-    }
-  };
-
-  const copyKoreanMenuToEnglish = async () => {
-    try {
-      const sourceLayoutRaw = lang === 'ko' ? layout : ((await loadLocalJson(menuLayoutKey('ko'))) || DEFAULT_LAYOUT);
-      const sourceLayout = sanitizeLayout(sourceLayoutRaw);
-
-      const sourceBgBlob = lang === 'ko'
-        ? bgBlob
-        : await loadLocalBlob(menuBgKey('ko'));
-
-      const sourceOverrideIndex = lang === 'ko'
-        ? Object.fromEntries(Object.keys(bgOverrides || {}).map((page) => [page, true]))
-        : ((await loadLocalJson(bgOverridesKey('ko'))) || {});
-
-      const sourceOverrideBlobs = {};
-      for (const page of Object.keys(sourceOverrideIndex || {})) {
-        sourceOverrideBlobs[page] = lang === 'ko'
-          ? (bgOverrides?.[page] || null)
-          : await loadLocalBlob(bgPageKey(page, 'ko'));
-      }
-
-      const nextLayout = sanitizeLayout(JSON.parse(JSON.stringify(sourceLayout)));
-
-      if (sourceBgBlob) {
-        await saveBlob(menuBgKey('en'), cloneBlobSafe(sourceBgBlob));
-      } else {
-        await removeKey(menuBgKey('en'));
-      }
-
-      const existingTargetIndex = (await loadLocalJson(bgOverridesKey('en'))) || {};
-      for (const page of Object.keys(existingTargetIndex)) {
-        if (!(page in (sourceOverrideIndex || {}))) {
-          await removeKey(bgPageKey(page, 'en'));
-        }
-      }
-
-      const nextOverrideIndex = {};
-      const nextOverrideBlobs = {};
-      for (const page of Object.keys(sourceOverrideIndex || {})) {
-        const blob = sourceOverrideBlobs?.[page];
-        if (!blob) continue;
-        const clonedBlob = cloneBlobSafe(blob);
-        nextOverrideBlobs[page] = clonedBlob;
-        nextOverrideIndex[page] = true;
-        await saveBlob(bgPageKey(page, 'en'), clonedBlob);
-      }
-
-      await saveJson(bgOverridesKey('en'), nextOverrideIndex);
-      await saveJson(menuLayoutKey('en'), nextLayout);
-
-      setLang('en');
-      try { localStorage.setItem(LANG_KEY, 'en'); } catch {}
-      setLayout(nextLayout);
-      setBgBlob(sourceBgBlob ? cloneBlobSafe(sourceBgBlob) : null);
-      setBgOverrides(nextOverrideBlobs);
-      setBgAssetsReady(true);
-      setBgLoading(false);
-      setPageIndex(1);
-      setPreview(false);
-      setEdit(false);
-      setTimeout(() => hardResetScrollTop('auto'), 0);
-
-      window.alert(T.copyKoToEnDone);
-    } catch (error) {
-      console.error(error);
-      window.alert(T.copyKoToEnFail);
-    }
-  };
-
   // ✅ 영상으로 돌아가기
-  const goIntro = () => router.push('/intro');
+  const goIntro = (event) => {
+    event?.preventDefault();
+    router.push('/intro');
+    window.setTimeout(() => {
+      if (window.location.pathname !== '/intro') window.location.assign('/intro');
+    }, 500);
+  };
 
   // ✅ 로그아웃 처리
   const handleLogout = async () => {
@@ -1199,31 +3596,39 @@ export default function MenuEditor() {
   };
 
   // ✅ 기본 배경 URL
-  const bgUrl = useMemo(() => {
+  const bgObjectUrl = useMemo(() => {
     if (!isBlobLike(bgBlob)) return null;
     return URL.createObjectURL(bgBlob);
   }, [bgBlob]);
+  const bgUrl = bgObjectUrl || bgSignedUrl || null;
 
   // ✅ 페이지별 배경 URL map
-  const bgOverrideUrls = useMemo(() => {
+  const bgObjectOverrideUrls = useMemo(() => {
     const map = {};
     for (const [k, blob] of Object.entries(bgOverrides || {})) {
       if (isBlobLike(blob)) map[k] = URL.createObjectURL(blob);
     }
     return map;
   }, [bgOverrides]);
+  const bgOverrideUrls = useMemo(
+    () => ({
+      ...(bgOverrideSignedUrls || {}),
+      ...(bgObjectOverrideUrls || {}),
+    }),
+    [bgObjectOverrideUrls, bgOverrideSignedUrls]
+  );
 
   // ✅ URL revoke cleanup
   useEffect(() => {
     return () => {
-      if (bgUrl) URL.revokeObjectURL(bgUrl);
-      for (const u of Object.values(bgOverrideUrls || {})) {
+      if (bgObjectUrl) URL.revokeObjectURL(bgObjectUrl);
+      for (const u of Object.values(bgObjectOverrideUrls || {})) {
         try {
           URL.revokeObjectURL(u);
         } catch {}
       }
     };
-  }, [bgUrl, bgOverrideUrls]);
+  }, [bgObjectUrl, bgObjectOverrideUrls]);
 
   // ✅ 배경 이미지 로드 완료까지 대기(초기 표시용 현재 페이지만 선로딩)
   useEffect(() => {
@@ -1240,6 +3645,10 @@ export default function MenuEditor() {
     const urls = [currentPageBgUrl].filter(Boolean);
 
     setBgAssetsReady(false);
+    const fallbackTimer = window.setTimeout(() => {
+      if (!cancelled) setBgAssetsReady(true);
+    }, 1800);
+
     Promise.all(
       urls.map(
         (url) =>
@@ -1251,27 +3660,126 @@ export default function MenuEditor() {
           })
       )
     ).then(() => {
-      if (!cancelled) setBgAssetsReady(true);
+      if (!cancelled) {
+        window.clearTimeout(fallbackTimer);
+        setBgAssetsReady(true);
+      }
     });
 
     return () => {
       cancelled = true;
+      window.clearTimeout(fallbackTimer);
     };
   }, [bgUrl, bgOverrideUrls, pageIndex]);
 
   useEffect(() => {
+    if (!userReady || !langReady) return;
+    if (initialLanguageWarmupReady) return;
+    if (!isUsableMenuLayout(layout)) {
+      if (!loading && (bgResolved || readyBundleLookup.checked)) {
+        setInitialLanguageWarmupReady(true);
+      }
+      return;
+    }
+
+    let cancelled = false;
+    (async () => {
+      await withTimeout(preloadLanguageView(lang === 'en' ? 'ko' : 'en'), 10000, null);
+      if (!cancelled) setInitialLanguageWarmupReady(true);
+    })();
+
+    return () => {
+      cancelled = true;
+    };
+  }, [
+    userReady,
+    langReady,
+    lang,
+    layout,
+    loading,
+    bgResolved,
+    readyBundleLookup.checked,
+    initialLanguageWarmupReady,
+    preloadLanguageView,
+  ]);
+
+  useEffect(() => {
     if (hasInitialView) return;
-    if (!loading && !bgLoading && (!bgUrl || bgAssetsReady)) {
+    if (!loading && (isUsableMenuLayout(layout) || bgResolved || readyBundleLookup.checked)) {
       setHasInitialView(true);
     }
-  }, [hasInitialView, loading, bgLoading, bgUrl, bgAssetsReady]);
+  }, [hasInitialView, loading, layout, bgResolved, readyBundleLookup.checked]);
 
-  // ✅ 배경이 세팅되면 무조건 맨위로 (2페이지 잔상 방지)
   useEffect(() => {
-    if (!bgUrl) return;
+    if (!hasInitialView || !userReady || !langReady) return;
+    preloadLanguageView(lang === 'en' ? 'ko' : 'en');
+  }, [hasInitialView, userReady, langReady, lang, preloadLanguageView]);
+
+  useEffect(() => {
+    if (!hasInitialView || !userReady || !langReady) return;
+    if (!isUsableMenuLayout(layout) || layoutNeedsMediaHydration(layout)) return;
+
+    writeWindowReadyView({
+      language: lang,
+      userId,
+      layout,
+      bgSignedUrl: bgSignedUrl || null,
+      bgOverrideSignedUrls: bgOverrideSignedUrls || {},
+    });
+  }, [hasInitialView, userReady, userId, langReady, lang, layout, bgSignedUrl, bgOverrideSignedUrls]);
+
+  useEffect(() => {
+    if (!hasInitialView || !layout?.items?.length) return;
+
+    const pageCount = Math.max(1, Number(layout.pageCount || 1));
+    const pages = Array.from({ length: pageCount }, (_, index) => index + 1);
+    const urls = Array.from(new Set(
+      pages.flatMap((page) => getLayoutImageUrlsForPage(layout, page))
+    ));
+    if (!urls.length) return;
+
+    const requestKey = `${lang}:${urls.join('|')}`;
+    if (backgroundImagePreloadRequestsRef.current.has(requestKey)) return;
+    backgroundImagePreloadRequestsRef.current.add(requestKey);
+
+    const timer = window.setTimeout(() => {
+      preloadImageUrls(urls, 8000).then((stats) => {
+        if (imagePreloadStatsComplete(layout, stats)) {
+          visualsReadyLangsRef.current.add(lang);
+          const writeKey = `${lang}:${userId || 'user'}:${stats.total}:${layout.items?.length || 0}:${bgSignedUrl || ''}:${Object.keys(bgOverrideSignedUrls || {}).join(',')}`;
+          if (!readyBundleWriteKeysRef.current.has(writeKey)) {
+            readyBundleWriteKeysRef.current.add(writeKey);
+            writeWindowReadyView({
+              language: lang,
+              userId,
+              layout,
+              bgSignedUrl: bgSignedUrl || null,
+              bgOverrideSignedUrls: bgOverrideSignedUrls || {},
+            });
+            writeMenuReadyBundleAsync({
+              language: lang,
+              userId,
+              layout,
+              bgSignedUrl: bgSignedUrl || null,
+              bgOverrideSignedUrls: bgOverrideSignedUrls || {},
+              imagePreloadStats: stats,
+            }).catch((error) => {
+              console.error('write menu ready bundle failed', error);
+            });
+          }
+        }
+      });
+    }, 250);
+
+    return () => window.clearTimeout(timer);
+  }, [hasInitialView, lang, userId, layout, bgSignedUrl, bgOverrideSignedUrls]);
+
+  // 초기 화면이 열리기 전에는 첫 페이지 위치를 맞추고, 이후 사용자 페이지 이동은 유지한다.
+  useEffect(() => {
+    if (!bgUrl || hasInitialView) return;
     setTimeout(() => hardResetScrollTop('auto'), 0);
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [bgUrl]);
+  }, [bgUrl, hasInitialView]);
 
   const uploadAssetToCloud = async (file, assetKey, successMessage = '클라우드 업로드 완료!') => {
     setAssetUploading(true);
@@ -1298,9 +3806,11 @@ export default function MenuEditor() {
     }
 
     setBgBlob(file);
+    setBgSignedUrl(null);
 
     // ✅ "배경(전체) 선택"은 페이지별 override보다 우선해서 전체 페이지에 바로 반영
     setBgOverrides({});
+    setBgOverrideSignedUrls({});
     try {
       await saveJson(bgOverridesKey(lang), {});
     } catch (e) {
@@ -1346,6 +3856,12 @@ export default function MenuEditor() {
     }
 
     setBgOverrides((prev) => ({ ...(prev || {}), [p]: file }));
+    setBgOverrideSignedUrls((prev) => {
+      const next = { ...(prev || {}) };
+      delete next[p];
+      delete next[String(p)];
+      return next;
+    });
 
     // overrides 인덱스 저장
     try {
@@ -1368,6 +3884,12 @@ export default function MenuEditor() {
     setBgOverrides((prev) => {
       const next = { ...(prev || {}) };
       delete next[p];
+      return next;
+    });
+    setBgOverrideSignedUrls((prev) => {
+      const next = { ...(prev || {}) };
+      delete next[p];
+      delete next[String(p)];
       return next;
     });
 
@@ -1472,15 +3994,43 @@ export default function MenuEditor() {
     setPinModalOpen(true);
   };
 
-  const submitPin = () => {
+  const submitPin = async () => {
     if (!(pinInput || '').trim()) {
       setPinError(lang === 'ko' ? '비밀번호를 입력해 주세요.' : 'Please enter your PIN.');
       return;
     }
     if ((pinInput || '').trim() === pin) {
+      const currentLang = lang === 'ko' ? 'ko' : 'en';
+      const otherLang = currentLang === 'ko' ? 'en' : 'ko';
+      const currentSnapshot = cloneLayoutForCancel(layout);
+      const startSnapshots = new Map();
+
+      if (currentSnapshot) {
+        startSnapshots.set(currentLang, currentSnapshot);
+      }
+
+      try {
+        const otherCached = viewCacheRef.current.get(otherLang)?.layout || null;
+        const otherRaw = otherCached || await withTimeout(loadLocalJson(menuLayoutKey(otherLang)), 900, null);
+        if (isUsableMenuLayout(otherRaw)) {
+          const otherSnapshot = cloneLayoutForCancel(
+            normalizeLayoutTextForLanguage(normalizeLoadedLayout(otherRaw), otherLang)
+          );
+          if (otherSnapshot) startSnapshots.set(otherLang, otherSnapshot);
+        }
+      } catch {}
+
+      editStartLayoutRef.current = currentSnapshot;
+      editStartLayoutsRef.current = startSnapshots;
+      editStartLangRef.current = currentLang;
+      editStartTemplateSyncRef.current = pairedTemplateSyncRef.current
+        ? { ...pairedTemplateSyncRef.current }
+        : null;
+      templateDraftLayoutsRef.current = new Map();
       setPinModalOpen(false);
       setEdit(true);
       setPreview(false);
+      setToolsVisible(false);
       setPinInput('');
       setPinError('');
       // ✅ edit 진입 시 스크롤 맨위로
@@ -1543,7 +4093,7 @@ export default function MenuEditor() {
       introVideo: '인트로 비디오 변경',
       pageBg: '페이지 배경',
       pinSettings: '비밀번호 설정',
-      editorMenu: '에디터 메뉴',
+      editorMenu: '관리',
       pinEnterTitle: '비밀번호 입력',
       pinEnterDesc: '수정하려면 비밀번호(기본 0000)를 입력하세요.',
       confirm: '확인',
@@ -1587,9 +4137,6 @@ export default function MenuEditor() {
       backupExportFail: '백업 파일 저장 중 문제가 발생했습니다.',
       backupImportDone: '백업 파일을 불러왔습니다.',
       backupImportFail: '백업 파일을 불러오지 못했습니다.',
-      copyKoToEn: '한글 메뉴판 전체를 영어로 복사',
-      copyKoToEnDone: '한글 메뉴판 전체를 영어 메뉴판으로 복사했습니다.',
-      copyKoToEnFail: '영어 메뉴판 복사 중 문제가 발생했습니다.',
     },
     en: {
       pickBgTitle: 'Select a menu background',
@@ -1608,7 +4155,7 @@ export default function MenuEditor() {
       introVideo: 'Change intro video',
       pageBg: 'Page Background',
       pinSettings: 'PIN Settings',
-      editorMenu: 'Editor Menu',
+      editorMenu: 'Manage',
       pinEnterTitle: 'Enter PIN',
       pinEnterDesc: 'Enter your PIN (default 0000) to edit.',
       confirm: 'Confirm',
@@ -1651,17 +4198,20 @@ export default function MenuEditor() {
       backupExportFail: 'Failed to save backup file.',
       backupImportDone: 'Backup file restored.',
       backupImportFail: 'Could not restore the backup file.',
-      copyKoToEn: 'Copy Full Korean Menu to English',
-      copyKoToEnDone: 'Copied the full Korean menu to the English menu.',
-      copyKoToEnFail: 'Failed to copy the menu to English.',
     },
   }[lang];
 
   const isOverlayOpen = pinModalOpen || settingsOpen || editModeModalOpen || pageBgModalOpen;
 
+  const handleToolsVisibleChange = (visible) => {
+    setToolsVisible(!!visible);
+    if (visible) setShowEditorMenu(false);
+  };
+
   useEffect(() => {
     if (!edit || preview || isOverlayOpen) {
       setShowEditorMenu(false);
+      setToolsVisible(false);
     }
   }, [edit, preview, isOverlayOpen]);
 
@@ -1706,7 +4256,12 @@ export default function MenuEditor() {
     return Math.max(1, ...keys.map((key) => Number(key) || 1));
   }, [bgOverrides]);
 
-  const totalPages = useMemo(() => Math.max(1, Number(computedPages || 1), highestBgOverridePage), [computedPages, highestBgOverridePage]);
+  const premiumThreePageTemplate = layout?.mode === 'template' && ['T1A', 'T2A', 'T3A'].includes(layout?.templateId || '');
+  const totalPages = useMemo(
+    () => (premiumThreePageTemplate ? Math.max(1, Number(computedPages || 1)) : Math.max(1, Number(computedPages || 1), highestBgOverridePage)),
+    [computedPages, highestBgOverridePage, premiumThreePageTemplate]
+  );
+  const preloadSinkUrls = useMemo(() => getAllLayoutImageUrls(layout), [layout]);
 
   // ✅ 컨텐츠 높이
   const contentHeight = useMemo(() => {
@@ -1723,24 +4278,69 @@ export default function MenuEditor() {
     return !edit && !preview;
   }, [edit, preview]);
 
-  // ✅ 보기모드 스케일: 세로는 지금처럼 두고, 가로는 태블릿 폭까지 채울 수 있게 분리 계산
+  const editPageTurnEnabled = useMemo(() => {
+    return edit && !preview && (layout.mode === 'custom' || layout.mode === 'template');
+  }, [edit, layout.mode, preview]);
+
+  const horizontalPageTurnEnabled = pageTurnEnabled || editPageTurnEnabled;
+
+  // ✅ 보기모드 스케일: 손님용 메뉴 화면은 세로 화면을 채우되 crop 없이 높이는 맞춤
   const viewScaleY = useMemo(() => {
     const viewportHeight = Math.max(320, Number(vh) || PAGE_HEIGHT);
     const fitByHeight = Math.max(0.01, (viewportHeight - VIEW_GUTTER_Y * 2) / PAGE_HEIGHT);
 
-    return Math.max(MIN_VIEW_SCALE, Math.min(1, fitByHeight));
+    return Math.max(MIN_VIEW_SCALE, fitByHeight);
   }, [vh]);
 
   const viewScaleX = useMemo(() => {
     const viewportWidth = Math.max(320, Number(vw) || PAGE_WIDTH);
     const fitByWidth = Math.max(0.01, (viewportWidth - VIEW_GUTTER_X * 2) / PAGE_WIDTH);
 
-    if (!VIEW_FILL_SCREEN_X) {
-      return Math.max(MIN_VIEW_SCALE, Math.min(1, fitByWidth));
-    }
-
     return Math.max(MIN_VIEW_SCALE, fitByWidth);
   }, [vw]);
+
+  const isScaledCustomEdit = edit && !preview && (layout.mode === 'custom' || layout.mode === 'template');
+
+  const isWideEditViewport = useMemo(() => {
+    const viewportWidth = Math.max(320, Number(vw) || PAGE_WIDTH);
+    const viewportHeight = Math.max(480, Number(vh) || PAGE_HEIGHT);
+    return isScaledCustomEdit && viewportWidth >= 1100 && viewportWidth > viewportHeight * 1.12;
+  }, [isScaledCustomEdit, vh, vw]);
+
+  const editSidePanelOpen = edit && !preview && (toolsVisible || (layout.mode === 'template' && tplPanelOpen));
+
+  const editCanvasScale = useMemo(() => {
+    if (!isScaledCustomEdit) return 1;
+    const viewportWidth = Math.max(320, Number(vw) || PAGE_WIDTH);
+    const viewportHeight = Math.max(480, Number(vh) || PAGE_HEIGHT);
+    const isWideDesktop = viewportWidth >= 1100 && viewportWidth > viewportHeight * 1.12;
+
+    if (isWideDesktop) {
+      const reservedSideSpace = editSidePanelOpen ? 620 : 260;
+      const fitByWorkspaceWidth = Math.max(0.5, (viewportWidth - reservedSideSpace) / PAGE_WIDTH);
+      const comfortableHeight = Math.max(0.5, (viewportHeight - 180) / PAGE_HEIGHT);
+      return Math.min(0.72, Math.max(comfortableHeight, fitByWorkspaceWidth));
+    }
+
+    const fitByWidth = Math.max(0.32, (viewportWidth - 32) / PAGE_WIDTH);
+    const fitByHeight = Math.max(0.32, (viewportHeight - 156) / PAGE_HEIGHT);
+
+    return Math.min(1, fitByWidth, fitByHeight);
+  }, [editSidePanelOpen, isScaledCustomEdit, vh, vw]);
+
+  const editCanvasScaleX = useMemo(() => {
+    if (!isScaledCustomEdit) return 1;
+    if (isWideEditViewport) return editCanvasScale;
+    const viewportWidth = Math.max(320, Number(vw) || PAGE_WIDTH);
+    return Math.max(0.32, viewportWidth / PAGE_WIDTH);
+  }, [editCanvasScale, isScaledCustomEdit, isWideEditViewport, vw]);
+
+  const editCanvasScaleY = useMemo(() => {
+    if (!isScaledCustomEdit) return 1;
+    if (isWideEditViewport) return editCanvasScale;
+    const viewportHeight = Math.max(480, Number(vh) || PAGE_HEIGHT);
+    return Math.max(0.32, (viewportHeight - EDIT_ACTION_BAR_SPACE) / PAGE_HEIGHT);
+  }, [editCanvasScale, isScaledCustomEdit, isWideEditViewport, vh]);
 
   const effectiveScaleY = useMemo(() => {
     if (edit || preview) return 1;
@@ -1758,11 +4358,27 @@ export default function MenuEditor() {
 
   const viewPageHeightScaled = useMemo(() => PAGE_HEIGHT * effectiveScaleY, [effectiveScaleY]);
 
+  const stageContentScaleX = isScaledCustomEdit ? editCanvasScaleX : 1;
+  const stageContentScaleY = isScaledCustomEdit ? editCanvasScaleY : 1;
+  const stageContentWidth = isScaledCustomEdit
+    ? PAGE_WIDTH * stageContentScaleX
+    : edit || preview
+      ? PAGE_WIDTH
+      : PAGE_WIDTH * effectiveScale;
+  const stageContentHeight = isScaledCustomEdit
+    ? fullScrollHeight * stageContentScaleY
+    : edit || preview
+      ? fullScrollHeight
+      : fullScrollHeight * effectiveScale;
+
+  const editPageWidthScaled = useMemo(() => PAGE_WIDTH * stageContentScaleX, [stageContentScaleX]);
+  const editPageHeightScaled = useMemo(() => PAGE_HEIGHT * stageContentScaleY, [stageContentScaleY]);
+
   // ✅ pageTurnEnabled 켜질 때: 스크롤 잔상 제거
   useEffect(() => {
-    if (!pageTurnEnabled) return;
+    if (!horizontalPageTurnEnabled) return;
     hardResetScrollTop('auto');
-  }, [pageTurnEnabled]);
+  }, [horizontalPageTurnEnabled]);
 
   // ✅ totalPages가 줄었을 때 pageIndex 보정
   useEffect(() => {
@@ -1788,7 +4404,7 @@ export default function MenuEditor() {
 
   // ✅ 보기 모드에서 pageIndex 변경 시 해당 페이지로 스냅 위치 동기화
   useEffect(() => {
-    if (!pageTurnEnabled || edit || preview) return;
+    if (!horizontalPageTurnEnabled || preview) return;
 
     const sc = stageScrollRef.current;
     if (!sc) return;
@@ -1804,7 +4420,7 @@ export default function MenuEditor() {
     if (Math.abs((Number(sc.scrollLeft) || 0) - targetLeft) > 2) {
       sc.scrollTo({ left: targetLeft, behavior: 'auto' });
     }
-  }, [pageTurnEnabled, edit, preview, pageIndex, totalPages, vw]);
+  }, [horizontalPageTurnEnabled, preview, pageIndex, totalPages, vw]);
 
   // ✅ edit에서 pageView 켰을 때 페이지 스크롤 이동(편집 전용)
   const scrollToPage = (pi) => {
@@ -1827,7 +4443,7 @@ export default function MenuEditor() {
   }, [pageIndex, totalPages]);
 
   useEffect(() => {
-    if (!edit || preview || !pageView) return;
+    if (!edit || preview || !pageView || editPageTurnEnabled) return;
     const sc = stageScrollRef.current;
     if (!sc) return;
 
@@ -1844,7 +4460,7 @@ export default function MenuEditor() {
       sc.removeEventListener('scroll', syncPageFromScroll);
       window.removeEventListener('resize', syncPageFromScroll);
     };
-  }, [edit, preview, pageView, getScrollBasedPageIndex]);
+  }, [edit, preview, pageView, editPageTurnEnabled, getScrollBasedPageIndex]);
 
   useEffect(() => {
     if (!edit) return;
@@ -1853,32 +4469,96 @@ export default function MenuEditor() {
       const nextPageCount = Math.max(1, Number(totalPages || 1));
       if (currentPageCount === nextPageCount) return prev;
       const next = { ...prev, pageCount: nextPageCount };
-      persistLayout(next);
       return next;
     });
   }, [edit, totalPages, lang]);
 
   useEffect(() => {
-    if (!edit) return;
+    if (!edit || editPageTurnEnabled) return;
     if (preview) return;
     if (!pageView) return;
     scrollToPage(pageIndex);
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [pageIndex, edit, pageView, preview]);
+  }, [pageIndex, edit, pageView, preview, editPageTurnEnabled]);
 
   const handleSaveAll = async () => {
-    const next = { ...layout };
+    const currentLang = lang === 'ko' ? 'ko' : 'en';
+    const draftMap = templateDraftLayoutsRef.current instanceof Map
+      ? templateDraftLayoutsRef.current
+      : new Map();
+    const pendingTemplateDraft = draftMap.get(currentLang);
+    const pendingTemplateId = getCanonicalTemplateId(pendingTemplateDraft);
+    const saveSource =
+      pendingTemplateDraft?.mode === 'template' && isPremiumTemplateId(pendingTemplateId)
+        ? pendingTemplateDraft
+        : layout;
+    const next = normalizeLoadedLayout({ ...saveSource });
     setLayout(next);
     await persistLayout(next);
+    editStartLayoutRef.current = null;
+    editStartLayoutsRef.current = new Map();
+    editStartLangRef.current = null;
+    editStartTemplateSyncRef.current = null;
+    templateDraftLayoutsRef.current = new Map();
 
     setPreview(false);
     setEdit(false);
+    setShowEditorMenu(false);
+    setToolsVisible(false);
     hideEditButton();
     setPageIndex(1);
     setTimeout(() => hardResetScrollTop('auto'), 0);
   };
 
-  const handleExitPreview = () => setPreview(false);
+  const handleCancelEdit = async () => {
+    const previous = editStartLayoutRef.current;
+    const previousSnapshots = editStartLayoutsRef.current instanceof Map
+      ? editStartLayoutsRef.current
+      : new Map();
+    const previousLang = editStartLangRef.current === 'ko' ? 'ko' : editStartLangRef.current === 'en' ? 'en' : null;
+    const restoreLang = previousLang || (lang === 'ko' ? 'ko' : 'en');
+    const restoreLayout = previousSnapshots.get(restoreLang) || previous;
+
+    if (restoreLayout) {
+      setLayout(restoreLayout);
+    }
+
+    const restoreEntries = Array.from(previousSnapshots.entries())
+      .filter(([, snapshot]) => isUsableMenuLayout(snapshot));
+    await Promise.all(restoreEntries.map(async ([language, snapshot]) => {
+      const safeLang = language === 'ko' ? 'ko' : 'en';
+      const sanitized = sanitizeLayoutMediaSafe(snapshot);
+      rememberLanguageView(safeLang, cacheOptionsForLayout(snapshot));
+      await saveJson(menuLayoutKey(safeLang), sanitized);
+    }));
+
+    if (previousLang && previousLang !== lang) {
+      setLang(previousLang);
+      try {
+        localStorage.setItem(LANG_KEY, previousLang);
+      } catch {}
+    }
+
+    setPairedTemplateSync(editStartTemplateSyncRef.current?.templateId || null);
+    editStartLayoutRef.current = null;
+    editStartLayoutsRef.current = new Map();
+    editStartLangRef.current = null;
+    editStartTemplateSyncRef.current = null;
+    templateDraftLayoutsRef.current = new Map();
+    setPreview(false);
+    setEdit(false);
+    setShowEditorMenu(false);
+    setToolsVisible(false);
+    setTplPanelOpen(true);
+    hideEditButton();
+    setPageIndex(1);
+    setTimeout(() => hardResetScrollTop('auto'), 0);
+  };
+
+  const handleExitPreview = () => {
+    setPreview(false);
+    setToolsVisible(false);
+  };
 
   const getPageBgUrl = (pageNum) => {
     const overrideUrl = bgOverrideUrls?.[String(pageNum)] || bgOverrideUrls?.[pageNum];
@@ -1890,20 +4570,22 @@ export default function MenuEditor() {
     if (!bgUrl) return null;
 
     const pagesForBg = pageTurnEnabled ? totalPages : totalPages; // 동일, 구조만 명시
+    const bgScaleX = isScaledCustomEdit ? stageContentScaleX : 1;
+    const bgScaleY = isScaledCustomEdit ? stageContentScaleY : 1;
     return Array.from({ length: pagesForBg }).map((_, i) => {
       const pageNum = i + 1;
       const useUrl = getPageBgUrl(pageNum);
 
-      const top = i * (PAGE_HEIGHT + PAGE_GAP);
+      const top = i * (PAGE_HEIGHT + PAGE_GAP) * bgScaleY;
       return (
         <div
           key={i}
           style={{
             position: 'absolute',
             left: 0,
-            width: PAGE_WIDTH,
+            width: PAGE_WIDTH * bgScaleX,
             top,
-            height: PAGE_HEIGHT,
+            height: PAGE_HEIGHT * bgScaleY,
             backgroundImage: `url(${useUrl})`,
             backgroundRepeat: 'no-repeat',
             backgroundPosition: 'top center',
@@ -1946,7 +4628,7 @@ export default function MenuEditor() {
 
   // ✅ 보기모드 스와이프/휠 처리
   const onViewScroll = useCallback((event) => {
-    if (!pageTurnEnabled || edit || preview) return;
+    if (!horizontalPageTurnEnabled || preview) return;
 
     const sc = event?.currentTarget || stageScrollRef.current;
     if (!sc) return;
@@ -1961,10 +4643,10 @@ export default function MenuEditor() {
       viewPageChangeSourceRef.current = 'scroll';
       setPageIndex(derivedPage);
     }
-  }, [pageTurnEnabled, edit, preview, vw, totalPages, pageIndex]);
+  }, [horizontalPageTurnEnabled, preview, vw, totalPages, pageIndex]);
 
   const onViewWheel = useCallback((event) => {
-    if (!pageTurnEnabled || edit || preview) return;
+    if (!horizontalPageTurnEnabled || preview) return;
 
     const sc = stageScrollRef.current;
     if (!sc) return;
@@ -1974,19 +4656,33 @@ export default function MenuEditor() {
 
     event.preventDefault();
     sc.scrollLeft += primaryDelta;
-  }, [pageTurnEnabled, edit, preview]);
+  }, [horizontalPageTurnEnabled, preview]);
 
   const renderCanvasLayer = (width = `${PAGE_WIDTH}px`, height = fullScrollHeight, options = {}) => {
     const viewPageNumber = Number(options?.viewPageNumber) > 0 ? Math.floor(Number(options.viewPageNumber)) : null;
+    const editPageNumber = Number(options?.editPageNumber) > 0 ? Math.floor(Number(options.editPageNumber)) : null;
+    const canvasFullScrollHeight = Number(options?.fullScrollHeight) > 0 ? Number(options.fullScrollHeight) : fullScrollHeight;
+    const canvasInteractionScale = Number(options?.interactionScale) > 0 ? Number(options.interactionScale) : 1;
+    const canvasInteractionScaleX = Number(options?.interactionScaleX) > 0 ? Number(options.interactionScaleX) : canvasInteractionScale;
+    const canvasInteractionScaleY = Number(options?.interactionScaleY) > 0 ? Number(options.interactionScaleY) : canvasInteractionScale;
+    const canvasInspectorTop = Number(options?.inspectorTop) > 0 ? Number(options.inspectorTop) : 118;
     if (layout.mode === 'template') {
       return (
-        <div style={{ position: 'relative', width, height, overflow: 'visible' }}>
+        <div
+          style={{ position: 'relative', width, height, overflow: 'visible' }}
+          onClick={() => {
+            if (!edit || preview) return;
+            setTplPanelOpen(true);
+            setShowEditorMenu(false);
+          }}
+        >
           <TemplateCanvas
             lang={lang}
             editing={edit}
             uiMode={preview ? 'preview' : edit ? 'edit' : 'view'}
             panelOpen={tplPanelOpen}
             onTogglePanel={(open) => setTplPanelOpen(open)}
+            directTouchEdit
             pageHeight={PAGE_HEIGHT}
             pageGap={PAGE_GAP}
             fullScrollHeight={fullScrollHeight}
@@ -1995,15 +4691,10 @@ export default function MenuEditor() {
             data={layout.templateData}
             onChange={(nextData) => {
               const next = { ...layout, mode: 'template', templateData: nextData };
-              setLayout(next);
-              persistLayout(next);
+              updateTemplateDraftLayout(next);
             }}
-            onCancel={() => {
-              setPreview(false);
-              setEdit(false);
-              hideEditButton();
-              setPageIndex(1);
-              setTimeout(() => hardResetScrollTop('auto'), 0);
+            onCancel={(items) => {
+              handleCancelEdit();
             }}
           />
         </div>
@@ -2011,41 +4702,80 @@ export default function MenuEditor() {
     }
 
     if (layout.mode === 'custom') {
+      const allItems = Array.isArray(layout.items) ? layout.items : [];
+      const safeEditPageNumber = edit && editPageNumber
+        ? Math.min(Math.max(1, editPageNumber), totalPages)
+        : null;
+      const editPageTop = safeEditPageNumber
+        ? (safeEditPageNumber - 1) * (PAGE_HEIGHT + PAGE_GAP)
+        : 0;
+      const editPageBottom = editPageTop + PAGE_HEIGHT;
+      const pageScopedItems = safeEditPageNumber
+        ? allItems
+            .filter((item) => {
+              const top = Number(item?.y) || 0;
+              const bottom = top + Math.max(1, Number(item?.h) || 0);
+              return bottom > editPageTop && top < editPageBottom;
+            })
+            .map((item) => ({ ...item, y: (Number(item?.y) || 0) - editPageTop }))
+        : allItems;
+      const pageScopedItemIds = new Set(pageScopedItems.map((item) => item.id));
+      const mergePageScopedItems = (nextItems) => {
+        if (!safeEditPageNumber) return Array.isArray(nextItems) ? nextItems : allItems;
+
+        const absolutePageItems = (Array.isArray(nextItems) ? nextItems : pageScopedItems)
+          .map((item) => ({
+            ...item,
+            y: (Number(item?.y) || 0) + editPageTop,
+          }));
+        const absoluteIds = new Set(absolutePageItems.map((item) => item.id));
+        const keptItems = allItems.filter((item) => !pageScopedItemIds.has(item.id) && !absoluteIds.has(item.id));
+
+        return [...keptItems, ...absolutePageItems].sort((a, b) => (a.z || 0) - (b.z || 0));
+      };
+
       return (
         <div style={{ position: 'relative', width, height, overflow: 'visible' }}>
           <CustomCanvas
             lang={lang}
-            inspectorTop={118}
-            items={layout.items}
+            inspectorTop={canvasInspectorTop}
+            interactionScale={canvasInteractionScale}
+            interactionScaleX={canvasInteractionScaleX}
+            interactionScaleY={canvasInteractionScaleY}
+            items={pageScopedItems}
             editing={edit}
             uiMode={preview ? 'preview' : edit ? 'edit' : 'view'}
             scrollRef={stageScrollRef}
             pageWidth={PAGE_WIDTH}
             pageHeight={PAGE_HEIGHT}
             pageGap={PAGE_GAP}
-            currentPage={pageIndex}
+            fullScrollHeight={canvasFullScrollHeight}
+            currentPage={safeEditPageNumber ? 1 : pageIndex}
             viewPageNumber={viewPageNumber}
+            controlsHidden={isOverlayOpen}
+            toolsVisible={toolsVisible}
+            onToolsVisibleChange={handleToolsVisibleChange}
+            toolsLauncherHidden={showEditorMenu}
+            suppressToolsAutoOpen={showEditorMenu || isOverlayOpen}
             onChangeItems={(items) => {
-              const next = { ...layout, mode: 'custom', items };
+              const next = { ...layout, mode: 'custom', items: mergePageScopedItems(items) };
               setLayout(next);
             }}
             onSave={(items) => {
-              const next = { ...layout, mode: 'custom', items };
+              const next = { ...layout, mode: 'custom', items: mergePageScopedItems(items) };
               setLayout(next);
               persistLayout(next);
 
               setPreview(false);
               setEdit(false);
+              setShowEditorMenu(false);
+              setToolsVisible(false);
               hideEditButton();
               setPageIndex(1);
               setTimeout(() => hardResetScrollTop('auto'), 0);
             }}
-            onCancel={() => {
-              setPreview(false);
-              setEdit(false);
-              hideEditButton();
-              setPageIndex(1);
-              setTimeout(() => hardResetScrollTop('auto'), 0);
+            onCancel={(items) => {
+              handleCancelEdit();
             }}
           />
         </div>
@@ -2205,23 +4935,18 @@ export default function MenuEditor() {
 
       {editModeModalOpen && (
         <div style={styles.modalBg} onClick={() => setEditModeModalOpen(false)}>
-          <div style={styles.modal} onClick={(e) => e.stopPropagation()}>
-            <div style={{ fontWeight: 900, fontSize: 18, marginBottom: 10 }}>{T.changeMode}</div>
-
+          <div style={{ ...styles.modal, ...styles.templateModal }} onClick={(e) => e.stopPropagation()}>
             <div style={{ display: 'grid', gap: 12 }}>
-              <div style={{ fontWeight: 900, marginBottom: 4 }}>{T.pickTemplate}</div>
               <TemplatePicker
                 lang={lang}
-                onPick={(fullId) => {
+                onPick={async (fullId) => {
                   setEditModeModalOpen(false);
-
-                  const data = makeInitialTemplateData(fullId, lang);
-                  const next = { mode: 'template', templateId: fullId, templateData: data, items: [] };
-
-                  setLayout(next);
-                  persistLayout(next);
+                  await applyPairedTemplate(fullId);
                   setEdit(true);
                   setPreview(false);
+                  setTplPanelOpen(true);
+                  setToolsVisible(false);
+                  setShowEditorMenu(false);
                   setPageIndex(1);
                   setTimeout(() => hardResetScrollTop('auto'), 0);
                 }}
@@ -2233,11 +4958,18 @@ export default function MenuEditor() {
                 style={styles.primaryBtn}
                 onClick={() => {
                   const next = { ...layout, mode: 'custom', templateId: null, templateData: null };
+                  const currentLang = lang === 'ko' ? 'ko' : 'en';
+                  const draftMap = templateDraftLayoutsRef.current instanceof Map
+                    ? templateDraftLayoutsRef.current
+                    : new Map();
+                  draftMap.set(currentLang, normalizeLoadedLayout(next));
+                  templateDraftLayoutsRef.current = draftMap;
                   setLayout(next);
-                  persistLayout(next);
                   setEditModeModalOpen(false);
                   setEdit(true);
                   setPreview(false);
+                  setToolsVisible(false);
+                  setShowEditorMenu(false);
                   setPageIndex(1);
                   setTimeout(() => hardResetScrollTop('auto'), 0);
                 }}
@@ -2354,14 +5086,132 @@ export default function MenuEditor() {
         >
           {Array.from({ length: totalPages }).map((_, index) => {
             const pageNum = index + 1;
-            const shouldRenderContent = Math.abs(pageNum - pageIndex) <= VIEW_PAGE_RENDER_RADIUS;
-
-            return renderViewPageSegment(pageNum, pageWidthScaled, pageHeightScaled, shouldRenderContent);
+            return renderViewPageSegment(pageNum, pageWidthScaled, pageHeightScaled, true);
           })}
         </div>
       </div>
     );
   };
+
+  const renderEditPageSegment = (pageNum, shouldRenderContent) => {
+    const safePageNum = Math.min(Math.max(1, pageNum), totalPages);
+    const pageBgUrl = getPageBgUrl(safePageNum);
+
+    return (
+      <section
+        key={`edit-page-${safePageNum}`}
+        style={{
+          position: 'relative',
+          flex: '0 0 100%',
+          width: '100%',
+          height: '100%',
+          display: 'flex',
+          alignItems: 'flex-start',
+          justifyContent: 'center',
+          scrollSnapAlign: 'center',
+          scrollSnapStop: 'always',
+          minHeight: '100%',
+          padding: isWideEditViewport ? '84px 24px 110px' : 0,
+          boxSizing: 'border-box',
+        }}
+      >
+        <div
+          style={{
+            ...styles.editPageFrame,
+            width: editPageWidthScaled,
+            height: editPageHeightScaled,
+          }}
+        >
+          <div style={{ ...styles.editPageMask, width: editPageWidthScaled, height: editPageHeightScaled }}>
+            <div
+              style={{
+                position: 'relative',
+                width: editPageWidthScaled,
+                height: editPageHeightScaled,
+                overflow: 'hidden',
+              }}
+            >
+              {pageBgUrl ? (
+                <div
+                  style={{
+                    position: 'absolute',
+                    inset: 0,
+                    backgroundImage: `url(${pageBgUrl})`,
+                    backgroundRepeat: 'no-repeat',
+                    backgroundPosition: 'top center',
+                    backgroundSize: '100% 100%',
+                    zIndex: 0,
+                    pointerEvents: 'none',
+                  }}
+                />
+              ) : null}
+              {shouldRenderContent ? (
+                layout.mode === 'template' ? (
+                  <div
+                    style={{
+                      position: 'relative',
+                      width: PAGE_WIDTH,
+                      height: PAGE_HEIGHT,
+                      transform: `translateZ(0) scaleX(${stageContentScaleX}) scaleY(${stageContentScaleY})`,
+                      transformOrigin: 'top left',
+                    }}
+                  >
+                    <div style={{ ...styles.page, height: PAGE_HEIGHT, margin: 0 }}>
+                      {renderCanvasLayer(`${PAGE_WIDTH}px`, PAGE_HEIGHT, { viewPageNumber: safePageNum })}
+                    </div>
+                  </div>
+                ) : (
+                  renderCanvasLayer(editPageWidthScaled, editPageHeightScaled, {
+                    editPageNumber: safePageNum,
+                    fullScrollHeight: PAGE_HEIGHT,
+                    interactionScale: stageContentScaleX,
+                    interactionScaleX: stageContentScaleX,
+                    interactionScaleY: stageContentScaleY,
+                    inspectorTop: 118,
+                  })
+                )
+              ) : null}
+            </div>
+          </div>
+        </div>
+      </section>
+    );
+  };
+
+  const renderEditPages = () => (
+    <div
+      ref={stageScrollRef}
+      style={{
+        ...styles.stage,
+        overflowX: 'auto',
+        overflowY: isWideEditViewport ? 'auto' : 'hidden',
+        scrollSnapType: 'x mandatory',
+        WebkitOverflowScrolling: 'touch',
+        overscrollBehaviorX: 'contain',
+        overscrollBehaviorY: isWideEditViewport ? 'contain' : 'none',
+        touchAction: isWideEditViewport ? 'pan-x pan-y pinch-zoom' : 'pan-x pinch-zoom',
+        scrollbarWidth: 'none',
+        boxSizing: 'border-box',
+      }}
+      onScroll={onViewScroll}
+      onWheel={onViewWheel}
+    >
+      <div
+        style={{
+          display: 'flex',
+          alignItems: 'center',
+          height: '100%',
+        }}
+      >
+        {Array.from({ length: totalPages }).map((_, index) => {
+          const pageNum = index + 1;
+          const shouldRenderContent = pageNum === pageIndex;
+
+          return renderEditPageSegment(pageNum, shouldRenderContent);
+        })}
+      </div>
+    </div>
+  );
 
   const renderFloatingUi = () => {
     if (preview) return null;
@@ -2370,24 +5220,57 @@ export default function MenuEditor() {
       <>
         {!isOverlayOpen && (
           <div style={langWrapStyle}>
-            <div style={langRowStyle}>
-              <button
-                style={{ ...langBtnStyle, ...(lang === 'en' ? langBtnActiveStyle : {}) }}
-                onClick={() => setLanguage('en')}
-                aria-label="English"
-                title="English"
-              >
-                🇺🇸
-              </button>
-              <button
-                style={{ ...langBtnStyle, ...(lang === 'ko' ? langBtnActiveStyle : {}) }}
-                onClick={() => setLanguage('ko')}
-                aria-label="Korean"
-                title="한국어"
-              >
-                🇰🇷
-              </button>
-            </div>
+            {edit ? (
+              <div style={langRowStyle}>
+                <button
+                  style={{ ...langBtnStyle, ...(lang === 'en' ? langBtnActiveStyle : {}), ...(switchingLang ? styles.langBtnDisabled : {}) }}
+                  onClick={() => setLanguage('en')}
+                  disabled={!!switchingLang}
+                  aria-label="English"
+                  title="English"
+                >
+                  🇺🇸
+                </button>
+                <button
+                  style={{ ...langBtnStyle, ...(lang === 'ko' ? langBtnActiveStyle : {}), ...(switchingLang ? styles.langBtnDisabled : {}) }}
+                  onClick={() => setLanguage('ko')}
+                  disabled={!!switchingLang}
+                  aria-label="Korean"
+                  title="한국어"
+                >
+                  🇰🇷
+                </button>
+              </div>
+            ) : (
+              <div style={langRowStyle}>
+                <button
+                  style={{ ...langBtnStyle, ...(lang === 'en' ? langBtnActiveStyle : {}), ...(switchingLang ? styles.langBtnDisabled : {}) }}
+                  onClick={() => setLanguage('en')}
+                  disabled={!!switchingLang}
+                  aria-label="English"
+                  title="English"
+                >
+                  <span style={styles.langFlag}>🇺🇸</span>
+                  <span style={styles.langCode}>EN</span>
+                </button>
+                <button
+                  style={{ ...langBtnStyle, ...(lang === 'ko' ? langBtnActiveStyle : {}), ...(switchingLang ? styles.langBtnDisabled : {}) }}
+                  onClick={() => setLanguage('ko')}
+                  disabled={!!switchingLang}
+                  aria-label="Korean"
+                  title="한국어"
+                >
+                  <span style={styles.langFlag}>🇰🇷</span>
+                  <span style={styles.langCode}>KO</span>
+                </button>
+              </div>
+            )}
+
+            {switchingLang && (
+              <div style={styles.switchingLangPill}>
+                {switchingLang === 'ko' ? '한국어 준비 중...' : 'English loading...'}
+              </div>
+            )}
 
             {!edit && showEditBtn && (
               <div style={styles.editActionsRow}>
@@ -2430,19 +5313,178 @@ export default function MenuEditor() {
         )}
 
         {!isOverlayOpen && !edit && (
-          <button style={styles.backBtn} onClick={goIntro}>
-            {T.backToVideo}
-          </button>
+          <a href="/intro" style={styles.backBtn} onClick={goIntro}>
+            <span style={styles.backBtnIcon} aria-hidden="true">
+              <span style={styles.backBtnTriangle} />
+            </span>
+            <span>{T.backToVideo}</span>
+          </a>
+        )}
+
+        {editPageTurnEnabled && !isOverlayOpen && !toolsVisible && (
+          <div style={styles.editorMenuBar} onMouseDown={(e) => e.stopPropagation()}>
+            <button
+              style={styles.menuBtnDark}
+              onClick={() => {
+                setShowEditorMenu((prev) => {
+                  const next = !prev;
+                  if (next) setToolsVisible(false);
+                  return next;
+                });
+              }}
+            >
+              {T.editorMenu}
+            </button>
+          </div>
+        )}
+
+        {editPageTurnEnabled && showEditorMenu && !isOverlayOpen && (
+          <div style={styles.editMenu} onMouseDown={(e) => e.stopPropagation()}>
+            <button
+              style={styles.menuBtn}
+              onClick={() => {
+                setTplPanelOpen(false);
+                setEditModeModalOpen(true);
+              }}
+            >
+              {T.changeMode}
+            </button>
+
+            <button style={styles.menuBtn} onClick={() => setPageBgModalOpen(true)}>
+              {T.pageBg}
+            </button>
+
+            <button style={styles.menuBtn} onClick={openIntroVideoPicker}>
+              {T.introVideo}
+            </button>
+
+            <button
+              style={styles.menuBtn}
+              onClick={() => {
+                setSettingsError('');
+                setSettingsMsg('');
+                setSettingsOpen(true);
+              }}
+            >
+              {T.pinSettings}
+            </button>
+
+            <button style={styles.menuBtn} onClick={openFilePicker}>
+              {T.changeBg}
+            </button>
+
+            <button style={styles.menuBtn} onClick={exportBackupFile}>
+              {T.backupExport}
+            </button>
+
+            <button style={styles.menuBtn} onClick={openBackupImportPicker}>
+              {T.backupImport}
+            </button>
+
+            <button
+              style={styles.menuBtnDark}
+              onClick={() => {
+                setShowEditorMenu(false);
+                setToolsVisible(false);
+                setPreview(true);
+              }}
+            >
+              {T.preview}
+            </button>
+
+            <input
+              ref={fileInputRef}
+              type="file"
+              accept="image/*"
+              style={{ display: 'none' }}
+              onChange={(e) => uploadBg(e.target.files?.[0])}
+            />
+
+            <input
+              ref={introVideoInputRef}
+              type="file"
+              accept="video/*"
+              style={{ display: 'none' }}
+              onChange={(e) => uploadIntroVideo(e.target.files?.[0])}
+            />
+
+            <input
+              ref={backupImportInputRef}
+              type="file"
+              accept="application/json,.json"
+              style={{ display: 'none' }}
+              onChange={async (e) => {
+                const file = e.target.files?.[0];
+                await importBackupFile(file);
+                e.target.value = '';
+              }}
+            />
+          </div>
+        )}
+
+        {edit && !preview && layout.mode === 'template' && !isOverlayOpen && (
+          <div style={styles.templateActionBar} onMouseDown={(e) => e.stopPropagation()}>
+            <button style={styles.menuBtnDark} onClick={handleSaveAll}>
+              {T.save}
+            </button>
+            <button style={styles.menuBtn} onClick={handleCancelEdit}>
+              {T.cancel}
+            </button>
+          </div>
+        )}
+
+        {horizontalPageTurnEnabled && totalPages > 1 && !isOverlayOpen && (
+          <>
+            <div style={styles.pagePill}>
+              {Math.min(Math.max(1, Number(pageIndex) || 1), totalPages)} / {totalPages}
+            </div>
+            <button
+              type="button"
+              style={{
+                ...styles.pageNavBtn,
+                ...styles.pageNavLeft,
+                ...(pageIndex <= 1 ? styles.pageNavBtnDisabled : null),
+              }}
+              onClick={() => setPageIndex((prev) => Math.max(1, prev - 1))}
+              disabled={pageIndex <= 1}
+              aria-label={T.prev}
+              title={T.prev}
+            >
+              ‹
+            </button>
+            <button
+              type="button"
+              style={{
+                ...styles.pageNavBtn,
+                ...styles.pageNavRight,
+                ...(pageIndex >= totalPages ? styles.pageNavBtnDisabled : null),
+              }}
+              onClick={() => setPageIndex((prev) => Math.min(totalPages, prev + 1))}
+              disabled={pageIndex >= totalPages}
+              aria-label={T.next}
+              title={T.next}
+            >
+              ›
+            </button>
+          </>
         )}
       </>
     );
   };
 
+  const hasRenderableMenu = isUsableMenuLayout(layout);
+  const initialLoadResolved =
+    !loading &&
+    (hasRenderableMenu || bgResolved || readyBundleLookup.checked);
+  const isInitialLoading = !hasInitialView && !initialLoadResolved;
+
   return (
     <div style={styles.container}>
-      {!hasInitialView && (loading || bgLoading || (bgUrl && !bgAssetsReady)) ? (
-        <div style={styles.loadingScreen} aria-label="loading-screen" />
-      ) : !bgUrl ? (
+      {isInitialLoading ? (
+        <div style={styles.loadingScreen} aria-label="loading-screen">
+          <div style={styles.loadingText}>{lang === 'ko' ? '메뉴 준비 중...' : 'Preparing menu...'}</div>
+        </div>
+      ) : bgResolved && !bgUrl && !hasRenderableMenu ? (
         <div style={styles.setupWrap}>
           <div style={styles.setupCard}>
             <div style={styles.title}>{T.pickBgTitle}</div>
@@ -2498,6 +5540,8 @@ export default function MenuEditor() {
             <div style={styles.smallNote}>{T.keep}</div>
           </div>
         </div>
+      ) : editPageTurnEnabled ? (
+        renderEditPages()
       ) : pageTurnEnabled ? (
         renderViewPages()
       ) : (
@@ -2510,6 +5554,7 @@ export default function MenuEditor() {
             overflowY: 'auto',
             WebkitOverflowScrolling: 'touch',
             touchAction: edit || preview ? 'auto' : 'pan-y',
+            boxSizing: 'border-box',
           }}
         >
           {/* ✅ mover: 보기모드에서만 translate, 편집/미리보기는 none */}
@@ -2519,15 +5564,18 @@ export default function MenuEditor() {
               justifyContent: 'center',
               paddingLeft: 0,
               paddingRight: 0,
-              minWidth: edit || preview ? 'max(100%, 1080px)' : '100%',
+              paddingTop: edit && !preview ? 118 : 0,
+              paddingBottom: edit && !preview ? 88 : 0,
+              boxSizing: 'border-box',
+              minWidth: isScaledCustomEdit ? '100%' : edit || preview ? 'max(100%, 1080px)' : '100%',
             }}
           >
             {/* ✅ content wrapper: 보기모드는 실제 박스 폭도 같이 줄여서 Android/WebView 잘림 방지 */}
             <div
               style={{
                 position: 'relative',
-                width: edit || preview ? PAGE_WIDTH : PAGE_WIDTH * effectiveScale,
-                height: edit || preview ? fullScrollHeight : fullScrollHeight * effectiveScale,
+                width: stageContentWidth,
+                height: stageContentHeight,
                 overflow: 'visible',
                 margin: '0 auto',
                 flex: '0 0 auto',
@@ -2536,7 +5584,8 @@ export default function MenuEditor() {
               <div
                 style={{
                   ...styles.page,
-                  height: fullScrollHeight,
+                  width: isScaledCustomEdit ? stageContentWidth : PAGE_WIDTH,
+                  height: isScaledCustomEdit ? stageContentHeight : fullScrollHeight,
                   transform: edit || preview ? 'none' : `scale(${effectiveScale})`,
                   transformOrigin: 'top left',
                   margin: 0,
@@ -2548,7 +5597,7 @@ export default function MenuEditor() {
                 {edit && !preview && (
                 <>
                   {Array.from({ length: totalPages - 1 }).map((_, i) => {
-                    const y = (i + 1) * PAGE_HEIGHT + i * PAGE_GAP;
+                    const y = ((i + 1) * PAGE_HEIGHT + i * PAGE_GAP) * stageContentScaleY;
                     return (
                       <div
                         key={i}
@@ -2557,7 +5606,7 @@ export default function MenuEditor() {
                           left: 0,
                           right: 0,
                           top: y,
-                          height: PAGE_GAP,
+                          height: PAGE_GAP * stageContentScaleY,
                           background: 'rgba(0,0,0,0.65)',
                           borderTop: '1px dashed rgba(255,255,255,0.55)',
                           borderBottom: '1px dashed rgba(255,255,255,0.55)',
@@ -2571,11 +5620,17 @@ export default function MenuEditor() {
               )}
 
               {/* ✅ 편집 메뉴 */}
-              {edit && !preview && !isOverlayOpen && (
+              {edit && !preview && !isOverlayOpen && !toolsVisible && (
                 <div style={styles.editorMenuBar} onMouseDown={(e) => e.stopPropagation()}>
                   <button
                     style={styles.menuBtnDark}
-                    onClick={() => setShowEditorMenu((prev) => !prev)}
+                    onClick={() => {
+                      setShowEditorMenu((prev) => {
+                        const next = !prev;
+                        if (next) setToolsVisible(false);
+                        return next;
+                      });
+                    }}
                   >
                     {T.editorMenu}
                   </button>
@@ -2626,11 +5681,14 @@ export default function MenuEditor() {
                     {T.backupImport}
                   </button>
 
-                  <button style={styles.menuBtn} onClick={copyKoreanMenuToEnglish}>
-                    {T.copyKoToEn}
-                  </button>
-
-                  <button style={styles.menuBtnDark} onClick={() => setPreview(true)}>
+                  <button
+                    style={styles.menuBtnDark}
+                    onClick={() => {
+                      setShowEditorMenu(false);
+                      setToolsVisible(false);
+                      setPreview(true);
+                    }}
+                  >
                     {T.preview}
                   </button>
 
@@ -2688,20 +5746,28 @@ export default function MenuEditor() {
               )}
 
               {layout.mode === 'template' && edit && !preview && !isOverlayOpen && !tplPanelOpen && (
-                <button style={styles.tplShowBtn} onClick={() => setTplPanelOpen(true)}>
+                <button style={{ ...styles.tplShowBtn, display: 'none' }} onClick={() => setTplPanelOpen(true)}>
                   {T.showTplPanel}
                 </button>
               )}
 
               {/* ✅ Template */}
               {layout.mode === 'template' && (
-                <div style={{ position: 'relative', width: PAGE_WIDTH, height: '100%', overflow: 'hidden' }}>
+                <div
+                  style={{ position: 'relative', width: PAGE_WIDTH, height: '100%', overflow: 'hidden' }}
+                  onClick={() => {
+                    if (!edit || preview) return;
+                    setTplPanelOpen(true);
+                    setShowEditorMenu(false);
+                  }}
+                >
                 <TemplateCanvas
                   lang={lang}
                   editing={edit}
                   uiMode={preview ? 'preview' : edit ? 'edit' : 'view'}
                   panelOpen={tplPanelOpen}
                   onTogglePanel={(open) => setTplPanelOpen(open)}
+                  directTouchEdit
                   pageHeight={PAGE_HEIGHT}
                   pageGap={PAGE_GAP}
                   fullScrollHeight={fullScrollHeight}
@@ -2709,15 +5775,10 @@ export default function MenuEditor() {
                   data={layout.templateData}
                   onChange={(nextData) => {
                     const next = { ...layout, mode: 'template', templateData: nextData };
-                    setLayout(next);
-                    persistLayout(next);
+                    updateTemplateDraftLayout(next);
                   }}
-                  onCancel={() => {
-                    setPreview(false);
-                    setEdit(false);
-                    hideEditButton();
-                    setPageIndex(1);
-                    setTimeout(() => hardResetScrollTop('auto'), 0);
+                  onCancel={(items) => {
+                    handleCancelEdit();
                   }}
                 />
                 </div>
@@ -2725,16 +5786,31 @@ export default function MenuEditor() {
 
               {/* ✅ Custom */}
               {layout.mode === 'custom' && (
-                <div style={{ position: 'relative', width: PAGE_WIDTH, height: '100%', overflow: 'hidden' }}>
+                <div
+                  style={{
+                    position: 'relative',
+                    width: isScaledCustomEdit ? stageContentWidth : PAGE_WIDTH,
+                    height: '100%',
+                    overflow: 'hidden',
+                  }}
+                >
                 <CustomCanvas
                   lang={lang}
                   inspectorTop={118}
+                  interactionScale={stageContentScaleX}
+                  interactionScaleX={stageContentScaleX}
+                  interactionScaleY={stageContentScaleY}
                   items={layout.items}
                   editing={edit}
                   uiMode={preview ? 'preview' : edit ? 'edit' : 'view'}
                   scrollRef={stageScrollRef}
             pageWidth={PAGE_WIDTH}
             pageHeight={PAGE_HEIGHT}
+                  controlsHidden={isOverlayOpen}
+                  toolsVisible={toolsVisible}
+                  onToolsVisibleChange={handleToolsVisibleChange}
+                  toolsLauncherHidden={showEditorMenu}
+                  suppressToolsAutoOpen={showEditorMenu || isOverlayOpen}
                   onChangeItems={(items) => {
                     const next = { ...layout, mode: 'custom', items };
                     setLayout(next);
@@ -2746,16 +5822,14 @@ export default function MenuEditor() {
 
                     setPreview(false);
                     setEdit(false);
+                    setShowEditorMenu(false);
+                    setToolsVisible(false);
                     hideEditButton();
                     setPageIndex(1);
                     setTimeout(() => hardResetScrollTop('auto'), 0);
                   }}
-                  onCancel={() => {
-                    setPreview(false);
-                    setEdit(false);
-                    hideEditButton();
-                    setPageIndex(1);
-                    setTimeout(() => hardResetScrollTop('auto'), 0);
+                  onCancel={(items) => {
+                    handleCancelEdit();
                   }}
                 />
                 </div>
@@ -2773,27 +5847,16 @@ export default function MenuEditor() {
                     setTimeout(() => hardResetScrollTop('auto'), 0);
                   }}
                 >
-                  <div style={styles.modal} onClick={(e) => e.stopPropagation()}>
-                    <div style={{ fontWeight: 800, fontSize: 18, marginBottom: 10 }}>{T.editModePick}</div>
-
+                  <div style={{ ...styles.modal, ...styles.templateModal }} onClick={(e) => e.stopPropagation()}>
                     <TemplatePicker
                       lang={lang}
-                      onPick={(fullId) => {
-                        const initTemplateData = makeInitialTemplateData(fullId, lang);
-
-                        const next = {
-                          ...layout,
-                          mode: 'template',
-                          templateId: fullId,
-                          templateData: initTemplateData,
-                          items: [],
-                        };
-                        setLayout(next);
-                        persistLayout(next);
-
+                      onPick={async (fullId) => {
+                        await applyPairedTemplate(fullId);
                         setEdit(true);
                         setPreview(false);
                         setTplPanelOpen(true);
+                        setToolsVisible(false);
+                        setShowEditorMenu(false);
                         setPageIndex(1);
                         setTimeout(() => hardResetScrollTop('auto'), 0);
                       }}
@@ -2805,10 +5868,17 @@ export default function MenuEditor() {
                       style={styles.primaryBtn}
                       onClick={() => {
                         const next = { ...layout, mode: 'custom', templateId: null, templateData: null };
+                        const currentLang = lang === 'ko' ? 'ko' : 'en';
+                        const draftMap = templateDraftLayoutsRef.current instanceof Map
+                          ? templateDraftLayoutsRef.current
+                          : new Map();
+                        draftMap.set(currentLang, normalizeLoadedLayout(next));
+                        templateDraftLayoutsRef.current = draftMap;
                         setLayout(next);
-                        persistLayout(next);
                         setEdit(true);
                         setPreview(false);
+                        setToolsVisible(false);
+                        setShowEditorMenu(false);
                         setPageIndex(1);
                         setTimeout(() => hardResetScrollTop('auto'), 0);
                       }}
@@ -2831,69 +5901,29 @@ export default function MenuEditor() {
                   </div>
                 </div>
               )}
-
-              {/* ✅ 편집 중에도 전환 가능한 "편집 방식 변경" 모달 */}
-              {edit && !preview && editModeModalOpen && (
-                <div style={styles.modalBg} onClick={() => setEditModeModalOpen(false)}>
-                  <div style={styles.modal} onClick={(e) => e.stopPropagation()}>
-                    <div style={{ fontWeight: 900, fontSize: 18, marginBottom: 10 }}>{T.changeMode}</div>
-
-                    <TemplatePicker
-                      lang={lang}
-                      onPick={(fullId) => {
-                        const initTemplateData = makeInitialTemplateData(fullId, lang);
-
-                        const next = {
-                          ...layout,
-                          mode: 'template',
-                          templateId: fullId,
-                          templateData: initTemplateData,
-                          items: [],
-                        };
-                        setLayout(next);
-                        persistLayout(next);
-                        setEditModeModalOpen(false);
-                        setEdit(true);
-                        setPreview(false);
-                        setTplPanelOpen(true);
-                        setPageIndex(1);
-                        setTimeout(() => hardResetScrollTop('auto'), 0);
-                      }}
-                    />
-
-                    <div style={{ height: 12 }} />
-
-                    <button
-                      style={styles.primaryBtn}
-                      onClick={() => {
-                        const next = { ...layout, mode: 'custom', templateId: null, templateData: null };
-                        setLayout(next);
-                        persistLayout(next);
-                        setEditModeModalOpen(false);
-                        setEdit(true);
-                        setPreview(false);
-                        setPageIndex(1);
-                        setTimeout(() => hardResetScrollTop('auto'), 0);
-                      }}
-                    >
-                      {T.freeEdit}
-                    </button>
-
-                    <button style={styles.secondaryBtn} onClick={() => setEditModeModalOpen(false)}>
-                      {T.close}
-                    </button>
-                  </div>
-                </div>
-              )}
-
             </div>
           </div>
         </div>
       </div>
       )}
 
-      {renderFloatingUi()}
-      {renderModals()}
+      {!isInitialLoading && preloadSinkUrls.length > 0 && (
+        <div style={styles.imagePreloadSink} aria-hidden="true">
+          {preloadSinkUrls.map((src, index) => (
+            <img
+              key={`${src}-${index}`}
+              src={src}
+              alt=""
+              loading="eager"
+              decoding="sync"
+              fetchPriority="high"
+              style={styles.imagePreloadSinkImg}
+            />
+          ))}
+        </div>
+      )}
+      {!isInitialLoading && renderFloatingUi()}
+      {!isInitialLoading && renderModals()}
     </div>
   );
 }
@@ -2903,90 +5933,738 @@ function makeInitialTemplateData(fullId, lang) {
   const group = (fullId || '').slice(0, 2);
   const variant = (fullId || '').slice(2, 3) || 'A';
   const isKo = lang === 'ko';
+  const id = `${group}${variant}`;
 
-  const defaultTitle =
-    group === 'T1'
-      ? isKo
-        ? '오늘의 메뉴'
-        : 'Today’s Menu'
-      : group === 'T2'
-      ? isKo
-        ? '추천 메뉴'
-        : 'Featured'
-      : isKo
-      ? '메뉴'
-      : 'Menu';
+  const titles = {
+    T1A: isKo ? 'Prime Dinner Menu' : 'Prime Dinner Menu',
+    T1B: isKo ? 'Combo Counter Menu' : 'Combo Counter Menu',
+    T1C: isKo ? 'Coffee · Brunch · Bakery' : 'Coffee · Brunch · Bakery',
+    T2A: isKo ? 'Korean Signature Menu' : 'Korean Signature Menu',
+    T2B: isKo ? 'Burger & Chicken Combos' : 'Burger & Chicken Combos',
+    T2C: isKo ? 'Seasonal Specials' : 'Seasonal Specials',
+    T3A: isKo ? 'Asian Fusion Menu' : 'Asian Fusion Menu',
+    T3B: isKo ? 'Quick Service Picks' : 'Quick Service Picks',
+    T3C: isKo ? 'Pub & Bar Specials' : 'Pub & Bar Specials',
+  };
+
+  const stylePresets = {
+    T1A: { accentColor: '#d7b46a', lineSpacing: 1.04, rowGap: 10, uiScale: 0.94, minPages: 3 },
+    T1B: { accentColor: '#fb923c', lineSpacing: 1.06, rowGap: 12, uiScale: 0.9 },
+    T1C: { accentColor: '#5eead4', lineSpacing: 1.18, rowGap: 18, uiScale: 0.82 },
+    T2A: { accentColor: '#7a4b25', lineSpacing: 1.05, rowGap: 10, uiScale: 0.94, minPages: 3 },
+    T2B: { accentColor: '#ef4444', lineSpacing: 1.04, rowGap: 12, uiScale: 0.88 },
+    T2C: { accentColor: '#38bdf8', lineSpacing: 1.14, rowGap: 16, uiScale: 0.84 },
+    T3A: { accentColor: '#ff3d9a', lineSpacing: 1.02, rowGap: 10, uiScale: 0.94, minPages: 3 },
+    T3B: { accentColor: '#22c55e', lineSpacing: 1.05, rowGap: 12, uiScale: 0.88 },
+    T3C: { accentColor: '#f472b6', lineSpacing: 1.16, rowGap: 18, uiScale: 0.82 },
+  };
 
   const baseStyle = {
     fontFamily: 'system-ui',
     textColor: '#ffffff',
-    accentColor: 'rgba(255,255,255,0.65)',
+    accentColor: '#f8d36a',
     lineSpacing: 1.12,
     rowGap: 14,
     forceTwoDecimals: true,
     uiScale: 0.85,
+    minPages: 3,
+    templateKey: id,
+    ...(stylePresets[id] || {}),
     variant,
   };
 
-  const common = {
-    restaurantName: isKo ? '한소반' : 'Hansoban',
-    logoSrc: null,
+  const brandPresets = {
+    T1A: {
+      restaurantName: isKo ? 'Oak & Ember' : 'Oak & Ember',
+      tagline: isKo ? 'PRIME STEAK · SEAFOOD · WINE' : 'PRIME STEAK · SEAFOOD · WINE',
+      footerText: isKo ? 'Order on Your Phone' : 'Order on Your Phone',
+    },
+    T1B: {
+      restaurantName: isKo ? 'Flash Burger' : 'Flash Burger',
+      tagline: isKo ? 'BURGERS · CHICKEN · COMBOS' : 'BURGERS · CHICKEN · COMBOS',
+      footerText: isKo ? 'Combos served all day' : 'Combos served all day',
+    },
+    T1C: {
+      restaurantName: isKo ? 'Mellow Cup Cafe' : 'Mellow Cup Cafe',
+      tagline: isKo ? 'COFFEE · BRUNCH · BAKERY' : 'COFFEE · BRUNCH · BAKERY',
+      footerText: isKo ? 'Fresh pastries every morning' : 'Fresh pastries every morning',
+    },
+    T2A: {
+      restaurantName: isKo ? '한소반' : 'Hansoban',
+      tagline: isKo ? '소반에 담은 계절 한식 · 반상 · 구이' : 'Modern Korean Bansang · Soban · Grill',
+      footerText: isKo ? 'Order on Your Phone' : 'Order on Your Phone',
+    },
+    T2B: {
+      restaurantName: isKo ? 'Stack House' : 'Stack House',
+      tagline: isKo ? 'BURGERS · FRIED CHICKEN · FRIES' : 'BURGERS · FRIED CHICKEN · FRIES',
+      footerText: isKo ? 'Fresh combos ready fast' : 'Fresh combos ready fast',
+    },
+    T2C: {
+      restaurantName: isKo ? 'Blue Market Grill' : 'Blue Market Grill',
+      tagline: isKo ? 'SEASONAL · SEAFOOD · LUNCH' : 'SEASONAL · SEAFOOD · LUNCH',
+      footerText: isKo ? 'Ask about today’s market special' : 'Ask about today’s market special',
+    },
+    T3A: {
+      restaurantName: isKo ? 'Neon Umami' : 'Neon Umami',
+      tagline: isKo ? 'SUSHI · RAMEN · IZAKAYA · COCKTAILS' : 'SUSHI · RAMEN · IZAKAYA · COCKTAILS',
+      footerText: isKo ? 'Order on Your Phone' : 'Order on Your Phone',
+    },
+    T3B: {
+      restaurantName: isKo ? 'Green Line Bowls' : 'Green Line Bowls',
+      tagline: isKo ? 'BOWLS · TACOS · WINGS' : 'BOWLS · TACOS · WINGS',
+      footerText: isKo ? 'Fast picks for dine-in and takeout' : 'Fast picks for dine-in and takeout',
+    },
+    T3C: {
+      restaurantName: isKo ? 'Copper Room Pub' : 'Copper Room Pub',
+      tagline: isKo ? 'COCKTAILS · TAPAS · HAPPY HOUR' : 'COCKTAILS · TAPAS · HAPPY HOUR',
+      footerText: isKo ? 'Evening specials available at the bar' : 'Evening specials available at the bar',
+    },
   };
+
+  const common = {
+    restaurantName: brandPresets[id]?.restaurantName || (isKo ? '한소반' : 'Hansoban'),
+    logoSrc: null,
+    tagline: brandPresets[id]?.tagline || 'DINE-IN · TAKEOUT · DELIVERY',
+    phone: '+1 555 123 4567',
+    website: 'yourrestaurant.com',
+    orderUrl: '',
+    qrSrc: null,
+    footerText: brandPresets[id]?.footerText || (isKo ? 'Fresh food made daily' : 'Fresh food made daily'),
+    photos: makeTemplatePhotoSet(id, baseStyle.accentColor),
+    caption: isKo ? '대표 음식 사진 업로드' : 'Upload featured food photo',
+  };
+
+  const listSamples = {
+    T1A: [
+      [isKo ? 'Prime Ribeye 12oz' : 'Prime Ribeye 12oz', '36.00'],
+      [isKo ? 'New York Strip' : 'New York Strip', '34.00'],
+      [isKo ? 'Filet Mignon' : 'Filet Mignon', '39.00'],
+      [isKo ? 'Garlic Butter Salmon' : 'Garlic Butter Salmon', '28.00'],
+      [isKo ? 'Truffle Mac & Cheese' : 'Truffle Mac & Cheese', '12.00'],
+      [isKo ? 'Charred Broccolini' : 'Charred Broccolini', '10.00'],
+      [isKo ? 'House Caesar' : 'House Caesar', '11.00'],
+      [isKo ? 'French Onion Soup' : 'French Onion Soup', '9.00'],
+      [isKo ? 'Red Wine Flight' : 'Red Wine Flight', '16.00'],
+      [isKo ? 'Chocolate Lava Cake' : 'Chocolate Lava Cake', '11.00'],
+    ],
+    T1B: [
+      [isKo ? 'Double Smash Combo' : 'Double Smash Combo', '12.99'],
+      [isKo ? 'Crispy Chicken Combo' : 'Crispy Chicken Combo', '13.99'],
+      [isKo ? 'Spicy Fish Sandwich' : 'Spicy Fish Sandwich', '11.99'],
+      [isKo ? 'Classic Cheeseburger' : 'Classic Cheeseburger', '9.99'],
+      [isKo ? 'Loaded Chili Fries' : 'Loaded Chili Fries', '6.99'],
+      [isKo ? 'Mozzarella Sticks' : 'Mozzarella Sticks', '5.99'],
+      [isKo ? 'Kids Burger Meal' : 'Kids Burger Meal', '6.99'],
+      [isKo ? 'Fountain Drink' : 'Fountain Drink', '2.99'],
+      [isKo ? 'Milkshake' : 'Milkshake', '4.99'],
+      [isKo ? 'Extra Sauce' : 'Extra Sauce', '0.99'],
+    ],
+    T1C: [
+      [isKo ? 'Honey Oat Latte' : 'Honey Oat Latte', '5.95'],
+      [isKo ? 'Cold Brew Cream' : 'Cold Brew Cream', '5.75'],
+      [isKo ? 'Matcha Cloud Latte' : 'Matcha Cloud Latte', '6.25'],
+      [isKo ? 'Avocado Toast' : 'Avocado Toast', '10.50'],
+      [isKo ? 'Smoked Salmon Bagel' : 'Smoked Salmon Bagel', '12.95'],
+      [isKo ? 'Tomato Basil Soup' : 'Tomato Basil Soup', '7.95'],
+      [isKo ? 'Butter Croissant' : 'Butter Croissant', '4.75'],
+      [isKo ? 'Almond Danish' : 'Almond Danish', '5.50'],
+      [isKo ? 'Lemon Tea' : 'Lemon Tea', '4.95'],
+      [isKo ? 'Sparkling Ade' : 'Sparkling Ade', '5.25'],
+    ],
+  };
+
+  const photoSamples = {
+    T2A: [
+      [isKo ? '갈비 BBQ 플래터' : 'Galbi BBQ Platter', '29.99'],
+      [isKo ? '삼겹살 세트' : 'Pork Belly Set', '24.99'],
+      [isKo ? '불고기 라이스볼' : 'Bulgogi Rice Bowl', '15.99'],
+      [isKo ? '김치찌개' : 'Kimchi Stew', '13.99'],
+      [isKo ? '순두부찌개' : 'Soft Tofu Stew', '12.99'],
+      [isKo ? '해물칼국수' : 'Seafood Knife Noodles', '16.99'],
+      [isKo ? '왕만두' : 'King Dumplings', '9.99'],
+      [isKo ? '파전' : 'Scallion Pancake', '14.99'],
+      [isKo ? '잡채' : 'Japchae', '15.99'],
+      [isKo ? '식혜' : 'Sweet Rice Punch', '4.99'],
+    ],
+    T2B: [
+      [isKo ? 'Smash Burger Combo' : 'Smash Burger Combo', '12.99'],
+      [isKo ? 'Hot Chicken Combo' : 'Hot Chicken Combo', '13.99'],
+      [isKo ? 'Bacon BBQ Burger' : 'Bacon BBQ Burger', '11.99'],
+      [isKo ? 'Family Chicken Box' : 'Family Chicken Box', '38.99'],
+      [isKo ? 'Tender Basket' : 'Tender Basket', '10.99'],
+      [isKo ? 'Loaded Fries' : 'Loaded Fries', '6.99'],
+      [isKo ? 'Taco Trio' : 'Taco Trio', '10.99'],
+      [isKo ? 'Mac & Cheese' : 'Mac & Cheese', '4.99'],
+      [isKo ? 'House Lemonade' : 'House Lemonade', '3.99'],
+      [isKo ? 'Soft Serve Cup' : 'Soft Serve Cup', '3.49'],
+    ],
+    T2C: [
+      [isKo ? 'Market Seafood Plate' : 'Market Seafood Plate', '24.99'],
+      [isKo ? 'Grilled Shrimp Bowl' : 'Grilled Shrimp Bowl', '17.99'],
+      [isKo ? 'Citrus Salmon' : 'Citrus Salmon', '21.99'],
+      [isKo ? 'Weekend Brunch Board' : 'Weekend Brunch Board', '16.99'],
+      [isKo ? 'Lobster Roll' : 'Lobster Roll', '19.99'],
+      [isKo ? 'Truffle Fries' : 'Truffle Fries', '8.99'],
+      [isKo ? 'Strawberry Fizz' : 'Strawberry Fizz', '5.99'],
+      [isKo ? 'House Lemonade' : 'House Lemonade', '4.99'],
+      [isKo ? 'Key Lime Tart' : 'Key Lime Tart', '7.99'],
+      [isKo ? 'Chef’s Dessert' : 'Chef’s Dessert', '8.99'],
+    ],
+  };
+
+  const gridSamples = {
+    T3A: [
+      [isKo ? '오마카세 롤' : 'Omakase Roll', '18.00'],
+      [isKo ? '스파이시 튜나 크리스피' : 'Spicy Tuna Crispy', '16.00'],
+      [isKo ? '연어 유즈 사시미' : 'Salmon Yuzu Sashimi', '19.00'],
+      [isKo ? '블랙마늘 라멘' : 'Black Garlic Ramen', '17.00'],
+      [isKo ? '탄탄멘' : 'Tantanmen', '16.00'],
+      [isKo ? '쇼유 치킨 라멘' : 'Shoyu Chicken Ramen', '15.00'],
+      [isKo ? '가라아게 바오' : 'Karaage Bao', '12.00'],
+      [isKo ? '와규 고추장 타코' : 'Wagyu Gochujang Taco', '15.00'],
+      [isKo ? '김치 프라이즈' : 'Kimchi Fries', '11.00'],
+      [isKo ? '유자 하이볼' : 'Yuzu Highball', '12.00'],
+    ],
+    T3B: [
+      [isKo ? 'Chicken Bowl' : 'Chicken Bowl', '11.99'],
+      [isKo ? 'Steak Bowl' : 'Steak Bowl', '14.99'],
+      [isKo ? 'Veggie Bowl' : 'Veggie Bowl', '10.99'],
+      [isKo ? 'Street Tacos' : 'Street Tacos', '9.99'],
+      [isKo ? 'Quesadilla' : 'Quesadilla', '10.99'],
+      [isKo ? 'Nachos' : 'Nachos', '8.99'],
+      [isKo ? 'Buffalo Wings' : 'Buffalo Wings', '12.99'],
+      [isKo ? 'Garlic Fries' : 'Garlic Fries', '4.99'],
+      [isKo ? 'Soft Drink' : 'Soft Drink', '2.99'],
+      [isKo ? 'Kids Bowl' : 'Kids Bowl', '7.99'],
+      [isKo ? 'Extra Protein' : 'Extra Protein', '3.99'],
+      [isKo ? 'Side Salad' : 'Side Salad', '5.99'],
+    ],
+    T3C: [
+      [isKo ? 'Signature Cocktail' : 'Signature Cocktail', '13.00'],
+      [isKo ? 'Smoked Old Fashioned' : 'Smoked Old Fashioned', '15.00'],
+      [isKo ? 'House Wine' : 'House Wine', '9.00'],
+      [isKo ? 'Craft Beer' : 'Craft Beer', '8.00'],
+      [isKo ? 'Charcuterie' : 'Charcuterie', '18.00'],
+      [isKo ? 'Truffle Pasta' : 'Truffle Pasta', '22.00'],
+      [isKo ? 'Steak Skewers' : 'Steak Skewers', '16.00'],
+      [isKo ? 'Happy Hour Set' : 'Happy Hour Set', '16.00'],
+      [isKo ? 'Bar Snacks' : 'Bar Snacks', '7.00'],
+      [isKo ? 'Dessert Plate' : 'Dessert Plate', '12.00'],
+    ],
+  };
+
+  const sampleExtensions = {
+    T1A: [
+      ['Burrata & Tomato', '14.00'],
+      ['Crispy Calamari', '15.00'],
+      ['Wagyu Meatballs', '16.00'],
+      ['Bone-In Ribeye', '49.00'],
+      ['Braised Short Rib', '32.00'],
+      ['Herb Roasted Chicken', '24.00'],
+      ['Wild Mushroom Risotto', '22.00'],
+      ['Lobster Linguine', '35.00'],
+      ['Creamed Spinach', '9.00'],
+      ['Yukon Mash', '8.00'],
+      ['Parmesan Fries', '7.00'],
+      ['Grilled Asparagus', '10.00'],
+      ['Wedge Salad', '12.00'],
+      ['Lobster Bisque', '13.00'],
+      ['Beet & Goat Cheese', '11.00'],
+      ['Tiramisu', '10.00'],
+      ['Creme Brulee', '10.00'],
+      ['Espresso Martini', '14.00'],
+      ['Cabernet Glass', '15.00'],
+      ['Sparkling Water', '4.00'],
+    ],
+    T1B: [
+      ['Triple Stack Combo', '14.99'],
+      ['BBQ Bacon Combo', '13.99'],
+      ['Grilled Chicken Combo', '12.99'],
+      ['Nashville Chicken', '11.99'],
+      ['Mushroom Swiss Burger', '10.99'],
+      ['Jalapeno Burger', '10.99'],
+      ['Crispy Fish Combo', '12.99'],
+      ['Chicken Nugget Meal', '7.99'],
+      ['Onion Rings', '4.99'],
+      ['Seasoned Fries', '3.99'],
+      ['Cheese Curds', '5.99'],
+      ['Side Salad', '4.99'],
+      ['Chocolate Shake', '4.99'],
+      ['Strawberry Shake', '4.99'],
+      ['Iced Tea', '2.99'],
+      ['Lemonade', '3.25'],
+      ['Family Burger Pack', '34.99'],
+      ['Chicken Tender Pack', '29.99'],
+      ['Extra Patty', '2.99'],
+      ['Dipping Sauce', '0.75'],
+    ],
+    T1C: [
+      ['Vanilla Cappuccino', '5.75'],
+      ['Espresso Macchiato', '4.25'],
+      ['Rose Milk Tea', '5.95'],
+      ['Chai Latte', '5.75'],
+      ['Breakfast Sandwich', '8.95'],
+      ['Spinach Feta Wrap', '9.50'],
+      ['Turkey Pesto Panini', '11.50'],
+      ['Greek Yogurt Bowl', '8.95'],
+      ['Blueberry Muffin', '4.50'],
+      ['Chocolate Croissant', '5.25'],
+      ['Cinnamon Roll', '5.50'],
+      ['Banana Bread', '4.75'],
+      ['Iced Jasmine Tea', '4.95'],
+      ['Mint Lemonade', '5.25'],
+      ['Hot Chocolate', '4.95'],
+      ['Seasonal Ade', '5.95'],
+      ['Soup & Toast Set', '12.95'],
+      ['Brunch Plate', '14.95'],
+      ['Fruit Tart', '6.95'],
+      ['Cookie Pair', '5.25'],
+    ],
+    T2A: [
+      [isKo ? '돌솥비빔밥' : 'Stone Pot Bibimbap', '15.99'],
+      [isKo ? '제육볶음' : 'Spicy Pork Bulgogi', '16.99'],
+      [isKo ? 'LA 갈비' : 'LA Galbi', '27.99'],
+      [isKo ? '양념치킨' : 'Korean Fried Chicken', '18.99'],
+      [isKo ? '된장찌개' : 'Soybean Stew', '12.99'],
+      [isKo ? '육개장' : 'Spicy Beef Soup', '14.99'],
+      [isKo ? '설렁탕' : 'Ox Bone Soup', '13.99'],
+      [isKo ? '부대찌개' : 'Army Stew', '18.99'],
+      [isKo ? '비빔냉면' : 'Spicy Cold Noodles', '14.99'],
+      [isKo ? '물냉면' : 'Cold Noodles', '13.99'],
+      [isKo ? '짜장면' : 'Black Bean Noodles', '12.99'],
+      [isKo ? '짬뽕' : 'Spicy Seafood Noodles', '14.99'],
+      [isKo ? '떡볶이' : 'Tteokbokki', '12.99'],
+      [isKo ? '김밥' : 'Kimbap', '9.99'],
+      [isKo ? '두부김치' : 'Tofu Kimchi', '15.99'],
+      [isKo ? '계란찜' : 'Steamed Egg', '8.99'],
+      [isKo ? '보쌈' : 'Bossam', '29.99'],
+      [isKo ? '족발' : 'Jokbal', '31.99'],
+      [isKo ? '막걸리' : 'Makgeolli', '8.99'],
+      [isKo ? '수정과' : 'Cinnamon Punch', '4.99'],
+      [isKo ? '호떡' : 'Hotteok', '6.99'],
+      [isKo ? '빙수' : 'Bingsu', '12.99'],
+      [isKo ? '콘치즈' : 'Corn Cheese', '8.99'],
+      [isKo ? '감자전' : 'Potato Pancake', '13.99'],
+      [isKo ? '오징어볶음' : 'Spicy Squid', '18.99'],
+      [isKo ? '해물파전' : 'Seafood Pancake', '16.99'],
+    ],
+    T2B: [
+      ['Double Cheeseburger', '10.99'],
+      ['Mushroom Swiss Stack', '11.99'],
+      ['Crispy Fish Burger', '10.99'],
+      ['Spicy Chicken Sandwich', '10.99'],
+      ['Buffalo Tender Combo', '12.99'],
+      ['Honey Garlic Wings', '11.99'],
+      ['Chicken & Fries Box', '16.99'],
+      ['BBQ Chicken Melt', '11.99'],
+      ['Chili Cheese Fries', '7.99'],
+      ['Garlic Parmesan Fries', '5.99'],
+      ['Onion Ring Basket', '5.99'],
+      ['Side Mac Bowl', '4.99'],
+      ['Kids Cheeseburger', '6.99'],
+      ['Kids Tender Meal', '6.99'],
+      ['Cookie Shake', '5.49'],
+      ['Brownie Sundae', '5.99'],
+      ['Classic Cola', '2.99'],
+      ['Strawberry Lemonade', '3.99'],
+      ['Sweet Tea', '2.99'],
+      ['Extra Sauce Cup', '0.75'],
+      ['Family Burger Tray', '32.99'],
+      ['Twenty Wing Pack', '28.99'],
+      ['Late Night Combo', '14.99'],
+      ['Lunch Smash Special', '9.99'],
+      ['Loaded Nacho Fries', '8.99'],
+      ['Grilled Chicken Wrap', '10.99'],
+    ],
+    T2C: [
+      ['Crab Cake Starter', '15.99'],
+      ['Tuna Poke Cup', '13.99'],
+      ['Coconut Shrimp', '12.99'],
+      ['Clam Chowder', '8.99'],
+      ['Fish Taco Plate', '14.99'],
+      ['Blackened Mahi', '23.99'],
+      ['Scallop Risotto', '25.99'],
+      ['Cajun Pasta', '18.99'],
+      ['Brunch Benedict', '15.99'],
+      ['Avocado Grain Bowl', '13.99'],
+      ['Chicken Sandwich', '12.99'],
+      ['Market Salad', '11.99'],
+      ['Blueberry Spritz', '5.99'],
+      ['Cucumber Cooler', '5.99'],
+      ['Cold Brew Tonic', '5.50'],
+      ['Mint Iced Tea', '4.99'],
+      ['Chocolate Mousse', '7.99'],
+      ['Coconut Flan', '7.99'],
+      ['Seasonal Sorbet', '6.99'],
+      ['Warm Brownie', '8.99'],
+      ['Chef Seafood Tower', '39.99'],
+      ['Family Fish Basket', '32.99'],
+      ['Lunch Salmon Box', '16.99'],
+      ['Weekend Oyster Set', '22.99'],
+      ['Grilled Veggie Plate', '14.99'],
+      ['House Bread Basket', '5.99'],
+    ],
+    T3A: [
+      [isKo ? '하마치 타르타르' : 'Hamachi Tartare', '18.00'],
+      [isKo ? '크리스피 라이스' : 'Crispy Rice', '14.00'],
+      [isKo ? '드래곤 롤' : 'Dragon Roll', '17.00'],
+      [isKo ? '스캘럽 니기리' : 'Scallop Nigiri', '16.00'],
+      [isKo ? '미소 버터 콘' : 'Miso Butter Corn', '9.00'],
+      [isKo ? '에다마메 칠리' : 'Chili Edamame', '8.00'],
+      [isKo ? '스파이시 돈코츠' : 'Spicy Tonkotsu', '17.00'],
+      [isKo ? '해산물 우동' : 'Seafood Udon', '18.00'],
+      [isKo ? '야키소바' : 'Yakisoba', '15.00'],
+      [isKo ? '포크 카츠 산도' : 'Pork Katsu Sando', '14.00'],
+      [isKo ? '비프 타다키' : 'Beef Tataki', '22.00'],
+      [isKo ? '칠리 크랩 누들' : 'Chili Crab Noodles', '24.00'],
+      [isKo ? '트러플 교자' : 'Truffle Gyoza', '13.00'],
+      [isKo ? '연어 포케볼' : 'Salmon Poke Bowl', '18.00'],
+      [isKo ? '시소 칵테일' : 'Shiso Spritz', '13.00'],
+      [isKo ? '매실 마티니' : 'Plum Martini', '14.00'],
+      [isKo ? '말차 티라미수' : 'Matcha Tiramisu', '11.00'],
+      [isKo ? '모찌 아이스크림' : 'Mochi Ice Cream', '9.00'],
+      [isKo ? '흑임자 판나코타' : 'Black Sesame Panna Cotta', '10.00'],
+      [isKo ? '셰프 사케 플라이트' : 'Chef Sake Flight', '19.00'],
+      [isKo ? '라임 소다' : 'Lime Soda', '6.00'],
+      [isKo ? '망고 유자 에이드' : 'Mango Yuzu Ade', '7.00'],
+      [isKo ? '타이 바질 누들' : 'Thai Basil Noodles', '16.00'],
+      [isKo ? '칠리 새우 바오' : 'Chili Shrimp Bao', '13.00'],
+      [isKo ? '아보카도 크런치 롤' : 'Avocado Crunch Roll', '14.00'],
+      [isKo ? '토치드 살몬 롤' : 'Torched Salmon Roll', '18.00'],
+    ],
+    T3B: [
+      ['Salmon Bowl', '15.99'],
+      ['Tofu Bowl', '10.99'],
+      ['Shrimp Bowl', '13.99'],
+      ['Carnitas Tacos', '10.99'],
+      ['Chicken Tacos', '9.99'],
+      ['Veggie Tacos', '8.99'],
+      ['Honey Wings', '12.99'],
+      ['Korean Wings', '13.99'],
+      ['Lemon Pepper Wings', '12.99'],
+      ['Street Corn', '4.99'],
+      ['Chips & Salsa', '3.99'],
+      ['Loaded Nachos', '8.99'],
+      ['Protein Add-On', '3.99'],
+      ['Guacamole', '2.99'],
+      ['Rice & Beans', '4.99'],
+      ['Fountain Drink', '2.99'],
+      ['Agua Fresca', '3.99'],
+      ['Iced Tea', '2.99'],
+      ['Combo Upgrade', '3.99'],
+      ['Family Taco Kit', '29.99'],
+      ['Kids Quesadilla', '6.99'],
+      ['Side Tortillas', '1.99'],
+      ['Hot Sauce Flight', '1.99'],
+      ['Chocolate Churros', '5.99'],
+    ],
+    T3C: [
+      ['Negroni', '13.00'],
+      ['Mezcal Margarita', '14.00'],
+      ['French 75', '13.00'],
+      ['Espresso Martini', '15.00'],
+      ['Local IPA', '8.00'],
+      ['Amber Lager', '7.00'],
+      ['Sparkling Wine', '10.00'],
+      ['Zero-Proof Spritz', '8.00'],
+      ['Whipped Feta', '11.00'],
+      ['Crispy Brussels', '10.00'],
+      ['Garlic Shrimp', '16.00'],
+      ['Mini Sliders', '14.00'],
+      ['Short Rib Pasta', '24.00'],
+      ['Salmon Plate', '23.00'],
+      ['Mushroom Flatbread', '16.00'],
+      ['Pub Steak Frites', '29.00'],
+      ['Happy Hour Wings', '9.00'],
+      ['Half-Off Flatbread', '8.00'],
+      ['Late Night Fries', '6.00'],
+      ['Dessert Cocktail', '14.00'],
+      ['Chocolate Pot', '9.00'],
+      ['Cheese Board', '18.00'],
+      ['Chef Tapas Trio', '21.00'],
+      ['Bar Burger', '15.00'],
+      ['Seasonal Draft', '7.00'],
+      ['House Sangria', '10.00'],
+    ],
+  };
+
+  const structuredSamples = {
+    T2B: [
+      ['Smash Burger Combo', '12.99'],
+      ['Bacon BBQ Burger', '11.99'],
+      ['Double Cheeseburger', '10.99'],
+      ['Mushroom Swiss Stack', '11.99'],
+      ['Crispy Fish Burger', '10.99'],
+      ['Lunch Smash Special', '9.99'],
+      ['Jalapeno Burger', '10.99'],
+      ['Classic Cheeseburger', '9.99'],
+      ['BBQ Smokehouse Burger', '12.99'],
+      ['Hot Chicken Combo', '13.99'],
+      ['Family Chicken Box', '38.99'],
+      ['Tender Basket', '10.99'],
+      ['Spicy Chicken Sandwich', '10.99'],
+      ['Buffalo Tender Combo', '12.99'],
+      ['Honey Garlic Wings', '11.99'],
+      ['Chicken & Fries Box', '16.99'],
+      ['BBQ Chicken Melt', '11.99'],
+      ['Twenty Wing Pack', '28.99'],
+      ['Loaded Fries', '6.99'],
+      ['Mac & Cheese', '4.99'],
+      ['Chili Cheese Fries', '7.99'],
+      ['Garlic Parmesan Fries', '5.99'],
+      ['Onion Ring Basket', '5.99'],
+      ['Side Mac Bowl', '4.99'],
+      ['House Lemonade', '3.99'],
+      ['Cookie Shake', '5.49'],
+      ['Classic Cola', '2.99'],
+    ],
+  };
+
+  const sectionPresets = {
+    T1A: ['APPETIZERS', 'STEAK', 'SEAFOOD', 'PASTA', 'DESSERT', 'WINE'],
+    T1B: ['COMBOS', 'BURGERS', 'SIDES', 'DRINKS'],
+    T1C: ['COFFEE', 'BRUNCH', 'BAKERY', 'TEA'],
+    T2A: ['SIGNATURE', 'BBQ', 'SOUP', 'NOODLES', 'SHAREABLES', 'DESSERT'],
+    T2B: ['BURGERS', 'CHICKEN', 'SIDES & DRINKS'],
+    T2C: ['MARKET', 'BRUNCH', 'DRINKS', 'DESSERT'],
+    T3A: ['SUSHI', 'RAMEN', 'IZAKAYA', 'COCKTAILS', 'DESSERT'],
+    T3B: ['BOWLS', 'TACOS', 'WINGS', 'SIDES'],
+    T3C: ['COCKTAILS', 'DRINKS', 'TAPAS', 'DINNER'],
+  };
+
+  const makeRows = (samples, templateKey, groupKey) => {
+    const sections = sectionPresets[templateKey] || [];
+    const bucketSize = Math.max(1, Math.ceil((samples?.length || 1) / Math.max(1, sections.length || 1)));
+    return samples.map(([name, price], index) => ({
+      section: sections[Math.min(sections.length - 1, Math.floor(index / bucketSize))] || '',
+      name,
+      price,
+    }));
+  };
+
+  const getTemplateSamples = (templateKey, groupKey) => {
+    if (structuredSamples[templateKey]) return structuredSamples[templateKey];
+    const base =
+      groupKey === 'T1' ? (listSamples[templateKey] || listSamples.T1A) :
+      groupKey === 'T2' ? (photoSamples[templateKey] || photoSamples.T2A) :
+      (gridSamples[templateKey] || gridSamples.T3A);
+    const target = groupKey === 'T1' ? 30 : templateKey === 'T2B' ? 27 : 36;
+    return [...base, ...(sampleExtensions[templateKey] || [])].slice(0, target);
+  };
+
+  const premiumRows = isPremiumTemplateId(id) ? makePremiumTemplateRows(id, lang) : null;
 
   if (group === 'T1') {
     return {
       ...common,
-      title: defaultTitle,
+      title: titles[id] || (isKo ? '오늘의 메뉴' : 'Today’s Menu'),
       currency: '$',
       style: baseStyle,
-      rows: [
-        { name: isKo ? '김치찌개' : 'Kimchi Stew', price: '9.99' },
-        { name: isKo ? '불고기' : 'Bulgogi', price: '12.99' },
-        { name: isKo ? '비빔밥' : 'Bibimbap', price: '10.99' },
-      ],
+      rows: premiumRows || makeRows(getTemplateSamples(id, 'T1'), id, 'T1'),
     };
   }
 
   if (group === 'T2') {
     return {
       ...common,
-      title: defaultTitle,
+      title: titles[id] || (isKo ? '대표 메뉴' : 'Featured Plates'),
       currency: '$',
       style: baseStyle,
-      photos: [],
-      rows: [
-        { name: isKo ? '한우 국밥' : 'Beef Soup', price: '13.99' },
-        { name: isKo ? '제육볶음' : 'Spicy Pork', price: '11.99' },
-        { name: isKo ? '된장찌개' : 'Soybean Stew', price: '9.99' },
-        { name: isKo ? '비빔밥' : 'Bibimbap', price: '10.99' },
-        { name: isKo ? '불고기' : 'Bulgogi', price: '12.99' },
-        { name: isKo ? '김치전' : 'Kimchi Pancake', price: '8.99' },
-      ],
-      caption: isKo ? '사진을 업로드하세요' : 'Upload photo',
+      photos: makeTemplatePhotoSet(id, baseStyle.accentColor),
+      rows: premiumRows || makeRows(getTemplateSamples(id, 'T2'), id, 'T2'),
+      caption: isKo ? '음식 사진 업로드' : 'Upload food photo',
     };
   }
 
   return {
     ...common,
-    title: defaultTitle,
+    title: titles[id] || (isKo ? '메뉴' : 'Menu'),
     currency: '$',
     style: baseStyle,
-    columns: 2,
-    cells: [
-      { name: isKo ? '라면' : 'Ramen', price: '7.99' },
-      { name: isKo ? '만두' : 'Dumplings', price: '6.99' },
-      { name: isKo ? '튀김' : 'Fried', price: '8.99' },
-      { name: isKo ? '우동' : 'Udon', price: '9.99' },
+    columns: id === 'T3B' ? 3 : 2,
+    photos: makeTemplatePhotoSet(id, baseStyle.accentColor),
+    cells: premiumRows || makeRows(getTemplateSamples(id, 'T3'), id, 'T3'),
+  };
+}
+
+function makeTemplatePhotoSet(templateKey, accent = '#f8d36a') {
+  const realSets = {
+    T1A: ['/template-photos/steak-hero.jpg', '/template-photos/steak-board.jpg', '/template-photos/wine.jpg', '/template-photos/steak-hero.jpg'],
+    T2A: ['/template-photos/korean-hero.jpg', '/template-photos/korean-table.jpg', '/template-photos/ramen.jpg', '/template-photos/korean-hero.jpg'],
+    T3A: ['/template-photos/sushi-hero.jpg', '/template-photos/asian-plate.jpg', '/template-photos/ramen.jpg', '/template-photos/sushi-hero.jpg'],
+  };
+
+  if (realSets[templateKey]) {
+    return Array.from({ length: MAX_PHOTOS }, (_, index) => realSets[templateKey][index % realSets[templateKey].length]);
+  }
+
+  const sets = {
+    T1A: [
+      ['#2a120b', '#f8d36a', '#6b2b16', 'STEAK'],
+      ['#19110d', '#f59e0b', '#7c2d12', 'RIBEYE'],
+      ['#24130f', '#fef3c7', '#92400e', 'SALMON'],
+      ['#1f130d', '#fde68a', '#78350f', 'PASTA'],
+      ['#22160f', '#facc15', '#713f12', 'WINE'],
+      ['#120b08', '#eab308', '#854d0e', 'DESSERT'],
+      ['#21150e', '#fed7aa', '#7c2d12', 'SIDES'],
+      ['#180f0a', '#fbbf24', '#78350f', 'CHEF'],
+    ],
+    T1B: [
+      ['#2b0909', '#fb923c', '#b91c1c', 'BURGER'],
+      ['#111827', '#f97316', '#7f1d1d', 'COMBO'],
+      ['#1f0a0a', '#facc15', '#dc2626', 'CHICKEN'],
+      ['#2a0d0d', '#fdba74', '#991b1b', 'FRIES'],
+      ['#160b0b', '#fb7185', '#b45309', 'SHAKE'],
+      ['#24100a', '#f59e0b', '#991b1b', 'FISH'],
+      ['#0f0f0f', '#fed7aa', '#ef4444', 'KIDS'],
+      ['#210909', '#fb923c', '#7c2d12', 'SAUCE'],
+    ],
+    T1C: [
+      ['#0f2f2a', '#5eead4', '#f7f3e9', 'LATTE'],
+      ['#17342f', '#fef3c7', '#14b8a6', 'BRUNCH'],
+      ['#12342f', '#fde68a', '#0f766e', 'BAKERY'],
+      ['#10251f', '#f7f3e9', '#5eead4', 'TEA'],
+      ['#19342f', '#bbf7d0', '#0f766e', 'TOAST'],
+      ['#102b26', '#fed7aa', '#14b8a6', 'PASTRY'],
+      ['#0f2924', '#ccfbf1', '#0f766e', 'COLD'],
+      ['#13332e', '#fef9c3', '#2dd4bf', 'CAFE'],
+    ],
+    T2A: [
+      ['#0b0b0b', '#fbbf24', '#7f1d1d', 'K-BBQ'],
+      ['#111111', '#fde68a', '#14532d', 'GALBI'],
+      ['#080808', '#f97316', '#7c2d12', 'SOUP'],
+      ['#121212', '#facc15', '#991b1b', 'NOODLE'],
+      ['#0f0f0f', '#fed7aa', '#166534', 'PANCAKE'],
+      ['#111827', '#f59e0b', '#7f1d1d', 'BOWL'],
+      ['#080808', '#fff7ed', '#b91c1c', 'FRIED'],
+      ['#151515', '#fde68a', '#065f46', 'SIDE'],
+    ],
+    T2B: [
+      ['#111827', '#ef4444', '#facc15', 'SMASH'],
+      ['#050505', '#fb923c', '#b91c1c', 'CHICKEN'],
+      ['#1f0b0b', '#fbbf24', '#991b1b', 'BACON'],
+      ['#111111', '#f97316', '#7f1d1d', 'WINGS'],
+      ['#140909', '#fde68a', '#ef4444', 'FRIES'],
+      ['#0f172a', '#fed7aa', '#b45309', 'TACO'],
+      ['#170909', '#fb7185', '#7c2d12', 'SHAKE'],
+      ['#09090b', '#facc15', '#dc2626', 'BOX'],
+    ],
+    T2C: [
+      ['#071a2d', '#38bdf8', '#f472b6', 'SEAFOOD'],
+      ['#0f2a3a', '#bae6fd', '#0e7490', 'SHRIMP'],
+      ['#082f49', '#fde68a', '#0284c7', 'SALMON'],
+      ['#112d3d', '#f0f9ff', '#38bdf8', 'BRUNCH'],
+      ['#102a35', '#f9a8d4', '#0e7490', 'DRINK'],
+      ['#0b2532', '#fed7aa', '#0284c7', 'TART'],
+      ['#092236', '#bae6fd', '#155e75', 'FRESH'],
+      ['#112b3c', '#fef3c7', '#0891b2', 'MARKET'],
+    ],
+    T3A: [
+      ['#20152f', '#c084fc', '#5eead4', 'COFFEE'],
+      ['#101827', '#f0abfc', '#7e22ce', 'MATCHA'],
+      ['#18213a', '#fef3c7', '#a855f7', 'CAKE'],
+      ['#1f1b35', '#fed7aa', '#9333ea', 'PASTRY'],
+      ['#172033', '#ccfbf1', '#7c3aed', 'TEA'],
+      ['#1f1630', '#f5d0fe', '#6d28d9', 'ADE'],
+      ['#131827', '#fef9c3', '#c084fc', 'DESSERT'],
+      ['#211936', '#d9f99d', '#9333ea', 'COLD'],
+    ],
+    T3B: [
+      ['#052e16', '#22c55e', '#facc15', 'BOWL'],
+      ['#06110b', '#86efac', '#15803d', 'TACO'],
+      ['#062315', '#bbf7d0', '#16a34a', 'WINGS'],
+      ['#042014', '#fde68a', '#15803d', 'NACHOS'],
+      ['#0a2a18', '#fed7aa', '#16a34a', 'KIDS'],
+      ['#051b10', '#a7f3d0', '#15803d', 'DRINK'],
+      ['#052317', '#fef3c7', '#22c55e', 'SIDE'],
+      ['#061b12', '#86efac', '#14532d', 'FAST'],
+    ],
+    T3C: [
+      ['#120817', '#f472b6', '#fbbf24', 'COCKTAIL'],
+      ['#050505', '#fde68a', '#be185d', 'TAPAS'],
+      ['#1d0c16', '#f9a8d4', '#92400e', 'BEER'],
+      ['#190b12', '#fbbf24', '#db2777', 'PASTA'],
+      ['#0f070c', '#fed7aa', '#be185d', 'SLIDER'],
+      ['#180814', '#f0abfc', '#92400e', 'HOUR'],
+      ['#090909', '#fde68a', '#be185d', 'BAR'],
+      ['#160a12', '#f472b6', '#f59e0b', 'NIGHT'],
     ],
   };
+
+  return (sets[templateKey] || sets.T1A).slice(0, MAX_PHOTOS).map((item, index) => {
+    const [bg, plate, garnish, label] = item;
+    return makeDemoFoodPhoto(bg, plate, garnish || accent, label, index);
+  });
+}
+
+function makeDemoFoodPhoto(bg, plate, garnish, label, index) {
+  const rotate = (index % 2 ? -10 : 8);
+  const svg = `
+    <svg xmlns="http://www.w3.org/2000/svg" width="720" height="520" viewBox="0 0 720 520">
+      <defs>
+        <linearGradient id="bg" x1="0" y1="0" x2="1" y2="1">
+          <stop offset="0" stop-color="${bg}"/>
+          <stop offset="1" stop-color="#050505"/>
+        </linearGradient>
+        <radialGradient id="plate" cx="50%" cy="48%" r="45%">
+          <stop offset="0" stop-color="#fff7ed"/>
+          <stop offset="0.42" stop-color="${plate}"/>
+          <stop offset="0.72" stop-color="${garnish}"/>
+          <stop offset="1" stop-color="rgba(0,0,0,0)"/>
+        </radialGradient>
+        <filter id="shadow" x="-20%" y="-20%" width="140%" height="140%">
+          <feDropShadow dx="0" dy="22" stdDeviation="22" flood-color="#000" flood-opacity=".45"/>
+        </filter>
+      </defs>
+      <rect width="720" height="520" fill="url(#bg)"/>
+      <circle cx="584" cy="82" r="122" fill="${plate}" opacity=".18"/>
+      <circle cx="98" cy="430" r="170" fill="${garnish}" opacity=".14"/>
+      <g filter="url(#shadow)" transform="rotate(${rotate} 360 260)">
+        <ellipse cx="360" cy="270" rx="224" ry="152" fill="#fffaf0"/>
+        <ellipse cx="360" cy="270" rx="188" ry="122" fill="url(#plate)"/>
+        <circle cx="286" cy="242" r="48" fill="${garnish}" opacity=".9"/>
+        <circle cx="408" cy="296" r="64" fill="${plate}" opacity=".9"/>
+        <circle cx="456" cy="226" r="38" fill="#fff7ed" opacity=".78"/>
+        <path d="M224 319c86 42 232 42 314-6" fill="none" stroke="${bg}" stroke-width="22" stroke-linecap="round" opacity=".30"/>
+      </g>
+      <rect x="38" y="34" width="212" height="54" rx="10" fill="rgba(0,0,0,.42)" stroke="rgba(255,255,255,.24)"/>
+      <text x="60" y="69" font-family="Arial, Helvetica, sans-serif" font-size="26" font-weight="900" fill="#fff" letter-spacing="1">${label}</text>
+    </svg>
+  `;
+
+  return `data:image/svg+xml;utf8,${encodeURIComponent(svg)}`;
 }
 
 const styles = {
   container: { width: '100%', height: '100dvh', minHeight: '100vh', background: '#111' },
+  imagePreloadSink: {
+    position: 'fixed',
+    left: -9999,
+    top: -9999,
+    width: 1,
+    height: 1,
+    overflow: 'hidden',
+    opacity: 0,
+    pointerEvents: 'none',
+  },
+  imagePreloadSinkImg: {
+    width: 1,
+    height: 1,
+    objectFit: 'cover',
+    display: 'block',
+  },
   loadingScreen: {
     width: '100%',
     height: '100%',
     background: '#111',
+    display: 'grid',
+    placeItems: 'center',
+  },
+  loadingText: {
+    color: '#f8fafc',
+    fontSize: 18,
+    fontWeight: 800,
+    letterSpacing: 0,
   },
 
   setupWrap: {
@@ -3102,6 +6780,23 @@ const styles = {
     borderRadius: 24,
   },
 
+  editPageFrame: {
+    position: 'relative',
+    flex: '0 0 auto',
+    overflow: 'hidden',
+    borderRadius: 18,
+    background: '#000',
+    boxShadow: '0 22px 54px rgba(0,0,0,0.38)',
+    outline: '1px solid rgba(255,255,255,0.12)',
+  },
+
+  editPageMask: {
+    position: 'relative',
+    overflow: 'hidden',
+    borderRadius: 18,
+    background: '#000',
+  },
+
   page: {
     position: 'relative',
     width: PAGE_WIDTH,
@@ -3133,12 +6828,12 @@ const styles = {
 
   langWrapView: {
     position: 'fixed',
-    top: 'calc(env(safe-area-inset-top, 0px) + 32px)',
-    right: 'calc(env(safe-area-inset-right, 0px) + 20px)',
+    top: 'calc(env(safe-area-inset-top, 0px) + 22px)',
+    right: 'calc(env(safe-area-inset-right, 0px) + 18px)',
     zIndex: 99999,
     display: 'flex',
     flexDirection: 'column',
-    gap: 10,
+    gap: 8,
     alignItems: 'flex-end',
   },
 
@@ -3150,16 +6845,23 @@ const styles = {
 
   langRowView: {
     display: 'flex',
-    gap: 12,
+    gap: 4,
     alignItems: 'center',
+    padding: 5,
+    borderRadius: 999,
+    background: 'rgba(12,18,32,0.62)',
+    border: '1px solid rgba(255,255,255,0.18)',
+    boxShadow: '0 14px 34px rgba(0,0,0,0.28)',
+    backdropFilter: 'blur(14px)',
+    WebkitBackdropFilter: 'blur(14px)',
   },
 
   langBtn: {
     width: 40,
     height: 32,
-    borderRadius: 10,
-    border: '1px solid rgba(255,255,255,0.6)',
-    background: 'rgba(0,0,0,0.45)',
+    borderRadius: 999,
+    border: '1px solid rgba(255,255,255,0.28)',
+    background: 'rgba(15,23,42,0.72)',
     cursor: 'pointer',
     fontSize: 18,
     display: 'flex',
@@ -3167,28 +6869,63 @@ const styles = {
     justifyContent: 'center',
   },
   langBtnActive: {
-    border: '1px solid rgba(255,255,255,0.95)',
-    background: 'rgba(0,0,0,0.65)',
+    border: '1px solid rgba(255,255,255,0.92)',
+    background: 'rgba(15,118,110,0.82)',
   },
 
   langBtnView: {
-    width: 56,
-    height: 44,
-    borderRadius: 14,
-    border: '1px solid rgba(255,255,255,0.6)',
-    background: 'rgba(0,0,0,0.48)',
+    minWidth: 64,
+    height: 34,
+    padding: '0 10px',
+    borderRadius: 999,
+    border: '1px solid transparent',
+    background: 'transparent',
+    color: '#f8fafc',
     cursor: 'pointer',
-    fontSize: 24,
+    fontSize: 13,
     lineHeight: 1,
     display: 'flex',
     alignItems: 'center',
     justifyContent: 'center',
-    boxShadow: '0 6px 18px rgba(0,0,0,0.3)',
-    padding: 0,
+    gap: 6,
+    boxShadow: 'none',
+    fontWeight: 950,
+    letterSpacing: 0,
+    transition: 'background 160ms ease, color 160ms ease, box-shadow 160ms ease, border-color 160ms ease',
   },
   langBtnActiveView: {
-    border: '1px solid rgba(255,255,255,0.95)',
-    background: 'rgba(0,0,0,0.65)',
+    border: '1px solid rgba(255,255,255,0.78)',
+    background: 'rgba(255,255,255,0.92)',
+    color: '#0f172a',
+    boxShadow: '0 8px 18px rgba(0,0,0,0.20)',
+  },
+  langBtnDisabled: {
+    opacity: 0.62,
+    cursor: 'wait',
+  },
+
+  langFlag: {
+    fontSize: 18,
+    lineHeight: 1,
+    transform: 'translateY(-0.5px)',
+  },
+
+  langCode: {
+    fontSize: 12,
+    lineHeight: 1,
+    fontWeight: 950,
+  },
+
+  switchingLangPill: {
+    padding: '7px 10px',
+    borderRadius: 999,
+    background: 'rgba(15,23,42,0.82)',
+    border: '1px solid rgba(255,255,255,0.18)',
+    color: '#fff',
+    fontSize: 12,
+    fontWeight: 900,
+    boxShadow: '0 10px 22px rgba(0,0,0,0.26)',
+    backdropFilter: 'blur(8px)',
   },
 
   editorMenuBar: {
@@ -3200,15 +6937,22 @@ const styles = {
 
   editMenu: {
     position: 'fixed',
-    top: 'calc(env(safe-area-inset-top, 0px) + 110px)',
+    top: 'calc(env(safe-area-inset-top, 0px) + 112px)',
     right: 16,
     zIndex: 99999,
     display: 'flex',
-    flexDirection: 'row',
-    gap: 10,
+    flexDirection: 'column',
+    gap: 8,
     alignItems: 'stretch',
-    flexWrap: 'nowrap',
-    overflowX: 'auto',
+    width: 'min(286px, calc(100vw - 32px))',
+    maxHeight: 'calc(100vh - 150px)',
+    overflowY: 'auto',
+    padding: 12,
+    borderRadius: 12,
+    background: 'rgba(255,255,255,0.96)',
+    border: '1px solid rgba(17,24,39,0.10)',
+    backdropFilter: 'blur(10px)',
+    boxShadow: '0 18px 42px rgba(0,0,0,0.24)',
   },
 
   previewBar: {
@@ -3224,37 +6968,58 @@ const styles = {
     flexWrap: 'nowrap',
   },
 
+  templateActionBar: {
+    position: 'fixed',
+    left: '50%',
+    bottom: 16,
+    transform: 'translateX(-50%)',
+    zIndex: 99999,
+    display: 'flex',
+    flexDirection: 'row',
+    gap: 10,
+    alignItems: 'center',
+    flexWrap: 'nowrap',
+    padding: 8,
+    borderRadius: 14,
+    background: 'rgba(255,255,255,0.94)',
+    border: '1px solid rgba(17,24,39,0.12)',
+    boxShadow: '0 18px 40px rgba(0,0,0,0.24)',
+    backdropFilter: 'blur(10px)',
+  },
+
   menuBtn: {
-    padding: '10px 14px',
-    borderRadius: 12,
-    border: 'none',
+    padding: '11px 14px',
+    borderRadius: 10,
+    border: '1px solid #d1d5db',
     cursor: 'pointer',
     fontWeight: 900,
-    background: 'rgba(255,255,255,0.9)',
+    background: '#fff',
+    color: '#111827',
     whiteSpace: 'nowrap',
   },
 
   menuBtnDark: {
-    padding: '10px 14px',
-    borderRadius: 12,
-    border: '1px solid rgba(255,255,255,0.35)',
+    padding: '11px 14px',
+    borderRadius: 10,
+    border: '1px solid rgba(15,118,110,0.22)',
     cursor: 'pointer',
     fontWeight: 900,
-    background: 'rgba(0,0,0,0.55)',
+    background: '#0f766e',
     color: '#fff',
     whiteSpace: 'nowrap',
+    boxShadow: '0 10px 26px rgba(0,0,0,0.18)',
   },
 
   editBtn: {
     alignSelf: 'flex-end',
-    padding: '10px 14px',
-    borderRadius: 12,
-    border: '1px solid rgba(255,255,255,0.35)',
+    padding: '11px 15px',
+    borderRadius: 999,
+    border: '1px solid rgba(255,255,255,0.22)',
     cursor: 'pointer',
     fontWeight: 900,
-    background: 'rgba(0,0,0,0.7)',
+    background: 'rgba(15,23,42,0.78)',
     color: '#fff',
-    boxShadow: '0 8px 20px rgba(0,0,0,0.4)',
+    boxShadow: '0 12px 26px rgba(0,0,0,0.34)',
     minWidth: 88,
   },
 
@@ -3265,15 +7030,64 @@ const styles = {
 
   logoutBtn: {
     alignSelf: 'flex-end',
-    padding: '10px 14px',
-    borderRadius: 12,
-    border: '1px solid rgba(255, 99, 99, 0.65)',
+    padding: '11px 15px',
+    borderRadius: 999,
+    border: '1px solid rgba(248,113,113,0.40)',
     cursor: 'pointer',
     fontWeight: 900,
-    background: 'linear-gradient(135deg, #ff4d4f, #b22222)',
+    background: 'rgba(127,29,29,0.84)',
     color: '#fff',
-    boxShadow: '0 8px 20px rgba(0,0,0,0.4)',
+    boxShadow: '0 12px 26px rgba(0,0,0,0.34)',
     minWidth: 88,
+  },
+
+  pagePill: {
+    position: 'fixed',
+    left: '50%',
+    top: 'calc(env(safe-area-inset-top, 0px) + 28px)',
+    transform: 'translateX(-50%)',
+    zIndex: 99990,
+    padding: '8px 12px',
+    borderRadius: 999,
+    border: '1px solid rgba(255,255,255,0.18)',
+    background: 'rgba(15,23,42,0.78)',
+    color: '#fff',
+    fontSize: 13,
+    fontWeight: 950,
+    boxShadow: '0 10px 24px rgba(0,0,0,0.28)',
+    backdropFilter: 'blur(8px)',
+  },
+
+  pageNavBtn: {
+    position: 'fixed',
+    top: '50%',
+    transform: 'translateY(-50%)',
+    zIndex: 99990,
+    width: 42,
+    height: 54,
+    borderRadius: 999,
+    border: '1px solid rgba(255,255,255,0.18)',
+    background: 'rgba(15,23,42,0.72)',
+    color: '#fff',
+    fontSize: 34,
+    lineHeight: 1,
+    fontWeight: 700,
+    cursor: 'pointer',
+    boxShadow: '0 12px 28px rgba(0,0,0,0.30)',
+    backdropFilter: 'blur(8px)',
+    display: 'grid',
+    placeItems: 'center',
+    padding: 0,
+  },
+  pageNavLeft: {
+    left: 14,
+  },
+  pageNavRight: {
+    right: 14,
+  },
+  pageNavBtnDisabled: {
+    opacity: 0.28,
+    cursor: 'not-allowed',
   },
 
   pageCtrl: {
@@ -3327,20 +7141,46 @@ const styles = {
 
   backBtn: {
     position: 'fixed',
-    left: 16,
-    bottom: 16,
-    width: 100,
-    height: 32,
-    padding: 0,
-    borderRadius: 20,
-    border: 'none',
+    left: 'calc(env(safe-area-inset-left, 0px) + 18px)',
+    bottom: 'calc(env(safe-area-inset-bottom, 0px) + 148px)',
+    minWidth: 136,
+    height: 44,
+    padding: '0 16px 0 10px',
+    borderRadius: 999,
+    border: '1px solid rgba(255,255,255,0.18)',
     cursor: 'pointer',
     fontWeight: 900,
     zIndex: 2200,
-    background: 'rgba(255,255,255,0.9)',
+    background: 'rgba(12,18,32,0.68)',
+    color: '#fff',
     display: 'flex',
     alignItems: 'center',
     justifyContent: 'center',
+    gap: 10,
+    textDecoration: 'none',
+    boxShadow: '0 16px 34px rgba(0,0,0,0.30)',
+    backdropFilter: 'blur(14px)',
+    WebkitBackdropFilter: 'blur(14px)',
+    letterSpacing: 0,
+  },
+
+  backBtnIcon: {
+    width: 30,
+    height: 30,
+    borderRadius: 999,
+    background: 'rgba(255,255,255,0.92)',
+    display: 'grid',
+    placeItems: 'center',
+    flex: '0 0 auto',
+  },
+
+  backBtnTriangle: {
+    width: 0,
+    height: 0,
+    borderTop: '6px solid transparent',
+    borderBottom: '6px solid transparent',
+    borderLeft: '10px solid #0f172a',
+    marginLeft: 3,
   },
 
   badge: {
@@ -3387,6 +7227,8 @@ const styles = {
     background: 'rgba(0,0,0,.6)',
     display: 'grid',
     placeItems: 'center',
+    padding: 24,
+    boxSizing: 'border-box',
     zIndex: 3000,
   },
   modal: {
@@ -3394,6 +7236,15 @@ const styles = {
     background: '#fff',
     padding: 18,
     borderRadius: 16,
+  },
+  templateModal: {
+    width: 'min(1120px, calc(100vw - 48px))',
+    maxHeight: 'calc(100dvh - 48px)',
+    overflowY: 'auto',
+    padding: 24,
+    borderRadius: 18,
+    boxShadow: '0 24px 80px rgba(0,0,0,0.30)',
+    boxSizing: 'border-box',
   },
 
   pinInput: {

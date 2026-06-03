@@ -3,10 +3,14 @@
 import Image from 'next/image';
 import { useEffect, useState, useCallback } from 'react';
 import { useRouter } from 'next/navigation';
-import { clearCurrentUser, setCurrentUser } from '@/lib/session';
+import { clearCurrentUser, getCurrentUser, setCurrentUser } from '@/lib/session';
 import { supabase } from '@/lib/supabaseClient';
+import { clearUserLocalCache } from '@/lib/storage';
+import { clearMenuReadyBundles } from '@/lib/menuReadyBundle';
 
 const LANG_KEY = 'APP_LANG_V1';
+const ACCOUNT_CACHE_ISOLATION_VERSION = '2';
+const accountCacheIsolationKey = (userId) => `MENU_ACCOUNT_CACHE_ISOLATION_V${ACCOUNT_CACHE_ISOLATION_VERSION}__${userId}`;
 const TEXT = {
   ko: {
     promptSetNewPassword: '새 비밀번호를 설정해 주세요.',
@@ -16,6 +20,8 @@ const TEXT = {
     signupPasswordMismatch: '비밀번호와 비밀번호 확인이 일치하지 않습니다.',
     signupSuccess: '회원가입이 완료되었습니다!',
     signupGenericError: '회원가입 중 오류가 발생했습니다.',
+    authInvalidEmail: '인증 메일을 받을 수 없는 이메일 주소입니다. 실제로 사용하는 이메일 주소로 다시 시도해 주세요.',
+    authRateLimit: '인증 메일 요청이 너무 많습니다. 잠시 후 다시 시도해 주세요.',
     signupNeedEmail: '이메일을 입력해 주세요.',
     signupExistingEmail: '이미 가입된 이메일입니다. 로그인하거나 비밀번호 찾기를 이용해 주세요.',
     signupOtpSent: '이메일로 8자리 인증번호를 보냈습니다. 받은 번호를 입력해 주세요.',
@@ -76,6 +82,8 @@ const TEXT = {
     signupPasswordMismatch: 'Password and confirmation do not match.',
     signupSuccess: 'Sign-up completed!',
     signupGenericError: 'An error occurred during sign-up.',
+    authInvalidEmail: 'This email address cannot receive authentication email. Please try a real email address.',
+    authRateLimit: 'Too many authentication email requests. Please try again later.',
     signupNeedEmail: 'Please enter your email.',
     signupExistingEmail: 'This email is already registered. Please log in or use password recovery.',
     signupOtpSent: 'Sent an 8-digit verification code to your email. Please enter it.',
@@ -147,6 +155,13 @@ const INITIAL_PASSWORD_RECOVERY = {
 // - 회원가입 플로우를 막고 비번찾기로 유도
 const EXISTING_ACCOUNT_CUTOFF_MS = 5 * 60 * 1000; // 5 minutes
 
+function getAuthEmailErrorMessageKey(message) {
+  const text = String(message || '').toLowerCase();
+  if (text.includes('rate limit')) return 'authRateLimit';
+  if (text.includes('email address') && text.includes('invalid')) return 'authInvalidEmail';
+  return null;
+}
+
 export default function LoginPage() {
   const router = useRouter();
 
@@ -198,13 +213,15 @@ export default function LoginPage() {
     [resetAllFields]
   );
 
-  // ✅ Supabase password recovery 링크로 돌아온 경우 해시 파싱
+  // ✅ Supabase auth 링크로 돌아온 경우 해시 파싱
   useEffect(() => {
     const hash = typeof window !== 'undefined' ? window.location.hash : '';
-    if (hash.includes('type=recovery')) {
+    const hasAuthHash = hash.includes('access_token=') && hash.includes('refresh_token=');
+    if (hasAuthHash) {
       const params = new URLSearchParams(hash.replace('#', ''));
       const access_token = params.get('access_token');
       const refresh_token = params.get('refresh_token');
+      const type = params.get('type');
 
       if (access_token && refresh_token) {
         supabase.auth
@@ -212,25 +229,35 @@ export default function LoginPage() {
           .then(({ data, error }) => {
             if (!error && data?.session?.user) {
               setCurrentUser(data.session.user.id);
-              setHasRecoverySession(true);
-              setActiveView('password');
-              setPasswordRecoveryMessageKey('promptSetNewPassword');
-              setPasswordRecovery((prev) => ({
-                ...prev,
-                email: data.session.user.email || prev.email,
-                message: translate('promptSetNewPassword'),
-                messageKey: 'promptSetNewPassword',
-              }));
+              if (type === 'recovery') {
+                setHasRecoverySession(true);
+                setActiveView('password');
+                setPasswordRecoveryMessageKey('promptSetNewPassword');
+                setPasswordRecovery((prev) => ({
+                  ...prev,
+                  email: data.session.user.email || prev.email,
+                  message: translate('promptSetNewPassword'),
+                  messageKey: 'promptSetNewPassword',
+                }));
+              } else {
+                router.replace('/intro');
+              }
             }
           })
           .catch(() => {});
       }
     }
-  }, [translate]);
+  }, [router, translate]);
 
   // ✅ 로그인 페이지 접근 시 세션/입력값 초기화
   useEffect(() => {
-    if (typeof window !== 'undefined' && window.location.hash.includes('type=recovery')) return;
+    if (
+      typeof window !== 'undefined' &&
+      window.location.hash.includes('access_token=') &&
+      window.location.hash.includes('refresh_token=')
+    ) {
+      return;
+    }
 
     supabase.auth
       .signOut()
@@ -287,7 +314,7 @@ export default function LoginPage() {
 
   // ✅✅✅ 로그인 (email/password)
   const handleSubmit = async (event) => {
-    event.preventDefault();
+    event?.preventDefault?.();
     setLoginMessage('');
     setLoginMessageKey(null);
     setIsLoggingIn(true);
@@ -304,7 +331,27 @@ export default function LoginPage() {
       }
 
       const user = data?.user;
-      if (user?.id) setCurrentUser(user.id);
+      if (user?.id) {
+        const previousUserId = getCurrentUser();
+        const cacheIsolationKey = accountCacheIsolationKey(user.id);
+        const hasCurrentIsolation = (() => {
+          try {
+            return localStorage.getItem(cacheIsolationKey) === 'done';
+          } catch {
+            return false;
+          }
+        })();
+        if ((previousUserId && previousUserId !== user.id) || !hasCurrentIsolation) {
+          await Promise.all([
+            clearUserLocalCache(user.id),
+            clearMenuReadyBundles(),
+          ]);
+          try {
+            localStorage.setItem(cacheIsolationKey, 'done');
+          } catch {}
+        }
+        setCurrentUser(user.id);
+      }
 
       router.push('/intro');
     } catch {
@@ -424,8 +471,9 @@ export default function LoginPage() {
       });
 
       if (error) {
-        setSignUpMessage(error.message);
-        setSignUpMessageKey(null);
+        const messageKey = getAuthEmailErrorMessageKey(error.message);
+        setSignUpMessage(messageKey ? translate(messageKey) : error.message);
+        setSignUpMessageKey(messageKey);
         setOtpState((prev) => ({ ...prev, sending: false, sent: false }));
         return;
       }
@@ -535,6 +583,7 @@ export default function LoginPage() {
       const { error } = await supabase.auth.resetPasswordForEmail(email, { redirectTo });
 
       const notFound = (error?.message || '').toLowerCase().includes('not found');
+      const authEmailMessageKey = error ? getAuthEmailErrorMessageKey(error.message) : null;
 
       setPasswordRecovery((prev) => ({
         ...prev,
@@ -542,16 +591,18 @@ export default function LoginPage() {
         message: error
           ? notFound
             ? translate('recoverEmailNotFound')
+            : authEmailMessageKey
+            ? translate(authEmailMessageKey)
             : error.message
           : translate('recoverEmailSent'),
         messageKey: error
           ? notFound
             ? 'recoverEmailNotFound'
-            : null
+            : authEmailMessageKey
           : 'recoverEmailSent',
       }));
       setPasswordRecoveryMessageKey(
-        error ? (notFound ? 'recoverEmailNotFound' : null) : 'recoverEmailSent'
+        error ? (notFound ? 'recoverEmailNotFound' : authEmailMessageKey) : 'recoverEmailSent'
       );
     } catch {
       setPasswordRecovery((prev) => ({
@@ -642,7 +693,7 @@ export default function LoginPage() {
         display: 'flex',
         alignItems: 'center',
         justifyContent: 'center',
-        background: 'linear-gradient(135deg, #0d0d0f, #121623)',
+        background: '#0f1115',
         color: '#f4f4f4',
         padding: '24px',
         boxSizing: 'border-box',
@@ -679,13 +730,13 @@ export default function LoginPage() {
         style={{
           width: '100%',
           maxWidth: '480px',
-          background: 'rgba(18, 22, 35, 0.8)',
-          borderRadius: '16px',
-          boxShadow: '0 15px 35px rgba(0, 0, 0, 0.35)',
+          background: 'rgba(255, 255, 255, 0.055)',
+          borderRadius: '14px',
+          boxShadow: '0 22px 55px rgba(0, 0, 0, 0.36)',
           padding: '32px',
           boxSizing: 'border-box',
-          backdropFilter: 'blur(8px)',
-          border: '1px solid rgba(255, 255, 255, 0.06)',
+          backdropFilter: 'blur(12px)',
+          border: '1px solid rgba(255, 255, 255, 0.10)',
         }}
       >
         <div
@@ -731,8 +782,8 @@ export default function LoginPage() {
                   style={{
                     padding: '12px 14px',
                     borderRadius: '10px',
-                    border: '1px solid #242938',
-                    background: 'rgba(13, 15, 24, 0.85)',
+                    border: '1px solid rgba(255,255,255,0.12)',
+                    background: 'rgba(15,23,42,0.72)',
                     color: '#f4f4f4',
                     outline: 'none',
                     fontSize: '15px',
@@ -752,8 +803,8 @@ export default function LoginPage() {
                   style={{
                     padding: '12px 14px',
                     borderRadius: '10px',
-                    border: '1px solid #242938',
-                    background: 'rgba(13, 15, 24, 0.85)',
+                    border: '1px solid rgba(255,255,255,0.12)',
+                    background: 'rgba(15,23,42,0.72)',
                     color: '#f4f4f4',
                     outline: 'none',
                     fontSize: '15px',
@@ -763,21 +814,22 @@ export default function LoginPage() {
 
               <div>
                 <button
-                  type="submit"
+                  type="button"
+                  onClick={handleSubmit}
                   disabled={isLoggingIn}
                   style={{
                     width: '100%',
                     padding: '12px 14px',
                     borderRadius: '10px',
-                    border: 'none',
+                    border: '1px solid rgba(255,255,255,0.10)',
                     background: isLoggingIn
-                      ? 'rgba(92, 225, 230, 0.25)'
-                      : 'linear-gradient(135deg, #1f6feb, #5ce1e6)',
-                    color: '#0a0c12',
-                    fontWeight: 700,
+                      ? 'rgba(15,118,110,0.38)'
+                      : '#0f766e',
+                    color: '#fff',
+                    fontWeight: 900,
                     fontSize: '16px',
                     cursor: isLoggingIn ? 'not-allowed' : 'pointer',
-                    boxShadow: isLoggingIn ? 'none' : '0 8px 20px rgba(31, 111, 235, 0.35)',
+                    boxShadow: isLoggingIn ? 'none' : '0 12px 28px rgba(0, 0, 0, 0.26)',
                     transition: 'transform 0.15s ease, box-shadow 0.15s ease',
                     opacity: isLoggingIn ? 0.85 : 1,
                   }}
@@ -860,8 +912,8 @@ export default function LoginPage() {
                   style={{
                     padding: '12px 14px',
                     borderRadius: '10px',
-                    border: '1px solid #242938',
-                    background: 'rgba(13, 15, 24, 0.85)',
+                    border: '1px solid rgba(255,255,255,0.12)',
+                    background: 'rgba(15,23,42,0.72)',
                     color: '#f4f4f4',
                     outline: 'none',
                     fontSize: '15px',
@@ -875,10 +927,10 @@ export default function LoginPage() {
                   style={{
                     padding: '12px 14px',
                     borderRadius: '10px',
-                    border: '1px solid rgba(92, 225, 230, 0.35)',
-                    background: otpState.sending ? 'rgba(92, 225, 230, 0.15)' : 'rgba(92, 225, 230, 0.25)',
-                    color: '#0a0c12',
-                    fontWeight: 700,
+                    border: '1px solid rgba(255,255,255,0.12)',
+                    background: otpState.sending ? 'rgba(15,118,110,0.18)' : 'rgba(15,118,110,0.88)',
+                    color: '#fff',
+                    fontWeight: 900,
                     cursor: otpState.sending ? 'not-allowed' : 'pointer',
                     minWidth: '120px',
                   }}
@@ -905,8 +957,8 @@ export default function LoginPage() {
                   style={{
                     padding: '12px 14px',
                     borderRadius: '10px',
-                    border: '1px solid #242938',
-                    background: 'rgba(13, 15, 24, 0.85)',
+                    border: '1px solid rgba(255,255,255,0.12)',
+                    background: 'rgba(15,23,42,0.72)',
                     color: '#f4f4f4',
                     outline: 'none',
                     fontSize: '15px',
@@ -920,10 +972,10 @@ export default function LoginPage() {
                   style={{
                     padding: '12px 14px',
                     borderRadius: '10px',
-                    border: '1px solid rgba(92, 225, 230, 0.35)',
-                    background: otpState.verifying ? 'rgba(92, 225, 230, 0.15)' : 'rgba(92, 225, 230, 0.25)',
-                    color: otpState.sent ? '#0a0c12' : '#8f96a3',
-                    fontWeight: 700,
+                    border: '1px solid rgba(255,255,255,0.12)',
+                    background: otpState.verifying ? 'rgba(15,118,110,0.18)' : 'rgba(15,118,110,0.88)',
+                    color: otpState.sent ? '#fff' : '#8f96a3',
+                    fontWeight: 900,
                     cursor: !otpState.sent || otpState.verifying ? 'not-allowed' : 'pointer',
                     minWidth: '120px',
                   }}
@@ -932,7 +984,7 @@ export default function LoginPage() {
                 </button>
               </div>
               {otpState.verified && (
-                <div style={{ color: '#5ce1e6', fontSize: '13px' }}>{translate('signupVerifiedNotice')}</div>
+                <div style={{ color: '#5eead4', fontSize: '13px' }}>{translate('signupVerifiedNotice')}</div>
               )}
             </label>
 
@@ -989,13 +1041,13 @@ export default function LoginPage() {
                   border: 'none',
                   background:
                     isSigningUp || !otpState.verified
-                      ? 'rgba(92, 225, 230, 0.18)'
-                      : 'linear-gradient(135deg, #1f6feb, #5ce1e6)',
-                  color: isSigningUp || !otpState.verified ? '#8f96a3' : '#0a0c12',
-                  fontWeight: 800,
+                      ? 'rgba(15,118,110,0.20)'
+                      : '#0f766e',
+                  color: isSigningUp || !otpState.verified ? '#8f96a3' : '#fff',
+                  fontWeight: 900,
                   fontSize: '16px',
                   cursor: isSigningUp || !otpState.verified ? 'not-allowed' : 'pointer',
-                  boxShadow: isSigningUp || !otpState.verified ? 'none' : '0 8px 20px rgba(31, 111, 235, 0.35)',
+                  boxShadow: isSigningUp || !otpState.verified ? 'none' : '0 12px 28px rgba(0, 0, 0, 0.26)',
                   opacity: isSigningUp || !otpState.verified ? 0.85 : 1,
                 }}
               >
@@ -1014,9 +1066,9 @@ export default function LoginPage() {
                 style={{
                   padding: '10px 12px',
                   borderRadius: '10px',
-                  border: '1px solid rgba(92, 225, 230, 0.25)',
-                  background: 'rgba(92, 225, 230, 0.12)',
-                  color: '#d8f7ff',
+                  border: '1px solid rgba(255,255,255,0.14)',
+                  background: 'rgba(255,255,255,0.08)',
+                  color: '#f8fafc',
                   cursor: 'pointer',
                 }}
               >
@@ -1042,8 +1094,8 @@ export default function LoginPage() {
                 style={{
                   padding: '12px 14px',
                   borderRadius: '10px',
-                  border: '1px solid #242938',
-                  background: 'rgba(13, 15, 24, 0.85)',
+                  border: '1px solid rgba(255,255,255,0.12)',
+                  background: 'rgba(15,23,42,0.72)',
                   color: '#f4f4f4',
                   outline: 'none',
                   fontSize: '15px',
@@ -1059,10 +1111,10 @@ export default function LoginPage() {
                 style={{
                   padding: '12px 14px',
                   borderRadius: '10px',
-                  border: 'none',
-                  background: 'rgba(92, 225, 230, 0.15)',
-                  color: '#5ce1e6',
-                  fontWeight: 700,
+                  border: '1px solid rgba(255,255,255,0.12)',
+                  background: 'rgba(255,255,255,0.08)',
+                  color: '#f8fafc',
+                  fontWeight: 900,
                   cursor: passwordRecovery.sending ? 'not-allowed' : 'pointer',
                 }}
               >
@@ -1084,8 +1136,8 @@ export default function LoginPage() {
                     style={{
                       padding: '12px 14px',
                       borderRadius: '10px',
-                      border: '1px solid #242938',
-                      background: 'rgba(13, 15, 24, 0.85)',
+                      border: '1px solid rgba(255,255,255,0.12)',
+                      background: 'rgba(15,23,42,0.72)',
                       color: '#f4f4f4',
                       outline: 'none',
                       fontSize: '15px',
@@ -1103,10 +1155,10 @@ export default function LoginPage() {
                   borderRadius: '10px',
                   border: 'none',
                   background: hasRecoverySession
-                    ? 'linear-gradient(135deg, #1f6feb, #5ce1e6)'
-                    : 'rgba(92, 225, 230, 0.12)',
-                  color: hasRecoverySession ? '#0a0c12' : '#8f96a3',
-                  fontWeight: 700,
+                    ? '#0f766e'
+                    : 'rgba(15,118,110,0.16)',
+                  color: hasRecoverySession ? '#fff' : '#8f96a3',
+                  fontWeight: 900,
                   cursor: hasRecoverySession ? 'pointer' : 'not-allowed',
                   opacity: passwordRecovery.updating ? 0.8 : 1,
                 }}
@@ -1117,7 +1169,7 @@ export default function LoginPage() {
               </button>
 
               {passwordRecovery.message && (
-                <div style={{ color: hasRecoverySession ? '#5ce1e6' : '#f1b3b3', fontSize: '14px' }}>
+                <div style={{ color: hasRecoverySession ? '#5eead4' : '#f1b3b3', fontSize: '14px' }}>
                   {passwordRecovery.message}
                 </div>
               )}
@@ -1130,9 +1182,9 @@ export default function LoginPage() {
                 style={{
                   padding: '10px 12px',
                   borderRadius: '10px',
-                  border: '1px solid rgba(92, 225, 230, 0.25)',
-                  background: 'rgba(92, 225, 230, 0.12)',
-                  color: '#d8f7ff',
+                  border: '1px solid rgba(255,255,255,0.14)',
+                  background: 'rgba(255,255,255,0.08)',
+                  color: '#f8fafc',
                   cursor: 'pointer',
                 }}
               >
@@ -1159,26 +1211,26 @@ const langStyles = {
   },
   row: {
     display: 'flex',
-    gap: 12,
+    gap: 8,
     alignItems: 'center',
   },
   button: {
-    width: 56,
-    height: 44,
-    borderRadius: 14,
-    border: '1px solid rgba(255,255,255,0.6)',
-    background: 'rgba(0,0,0,0.48)',
+    width: 42,
+    height: 34,
+    borderRadius: 999,
+    border: '1px solid rgba(255,255,255,0.26)',
+    background: 'rgba(15,23,42,0.72)',
     cursor: 'pointer',
-    fontSize: 24,
+    fontSize: 18,
     lineHeight: 1,
     display: 'flex',
     alignItems: 'center',
     justifyContent: 'center',
-    boxShadow: '0 6px 18px rgba(0,0,0,0.3)',
+    boxShadow: '0 10px 24px rgba(0,0,0,0.28)',
     padding: 0,
   },
   buttonActive: {
     border: '1px solid rgba(255,255,255,0.95)',
-    background: 'rgba(0,0,0,0.65)',
+    background: 'rgba(15,118,110,0.82)',
   },
 };

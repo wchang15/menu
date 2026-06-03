@@ -8,8 +8,6 @@ const nextConfig = {
     // ✅ export에서 이미지 최적화 서버가 없으니 끔
     images: { unoptimized: true },
   
-    // (선택) 경로 안정화
-    trailingSlash: true,
   };
   
   module.exports = nextConfig;
