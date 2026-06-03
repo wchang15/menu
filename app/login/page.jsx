@@ -45,6 +45,7 @@ const TEXT = {
     loginPasswordPlaceholder: '비밀번호를 입력하세요',
     loginButton: '로그인',
     loginButtonLoading: '로그인 중...',
+    loginButtonPreparing: '준비 중...',
     signupLink: '회원가입',
     recoverLink: '비밀번호 찾기',
     signupTitle: '회원가입',
@@ -107,6 +108,7 @@ const TEXT = {
     loginPasswordPlaceholder: 'Enter your password',
     loginButton: 'Log in',
     loginButtonLoading: 'Logging in...',
+    loginButtonPreparing: 'Preparing...',
     signupLink: 'Sign up',
     recoverLink: 'Forgot password',
     signupTitle: 'Sign up',
@@ -181,6 +183,7 @@ export default function LoginPage() {
   // ✅ 로그인 메시지/로딩
   const [loginMessage, setLoginMessage] = useState('');
   const [isLoggingIn, setIsLoggingIn] = useState(false);
+  const [isAuthResetting, setIsAuthResetting] = useState(true);
 
   // ✅ 회원가입 메시지/로딩
   const [isSigningUp, setIsSigningUp] = useState(false);
@@ -256,17 +259,27 @@ export default function LoginPage() {
       window.location.hash.includes('access_token=') &&
       window.location.hash.includes('refresh_token=')
     ) {
+      setIsAuthResetting(false);
       return;
     }
+
+    let alive = true;
+    setIsAuthResetting(true);
 
     supabase.auth
       .signOut()
       .catch(() => {})
       .finally(() => {
+        if (!alive) return;
         clearCurrentUser();
         resetAllFields();
         setActiveView('login');
+        setIsAuthResetting(false);
       });
+
+    return () => {
+      alive = false;
+    };
   }, [resetAllFields]);
 
   // ✅ 저장된 언어 불러오기
@@ -315,6 +328,7 @@ export default function LoginPage() {
   // ✅✅✅ 로그인 (email/password)
   const handleSubmit = async (event) => {
     event?.preventDefault?.();
+    if (isAuthResetting) return;
     setLoginMessage('');
     setLoginMessageKey(null);
     setIsLoggingIn(true);
@@ -777,6 +791,7 @@ export default function LoginPage() {
                   name="id"
                   value={form.id}
                   onChange={handleChange}
+                  disabled={isAuthResetting || isLoggingIn}
                   required
                   placeholder={translate('loginEmailPlaceholder')}
                   style={{
@@ -798,6 +813,7 @@ export default function LoginPage() {
                   name="password"
                   value={form.password}
                   onChange={handleChange}
+                  disabled={isAuthResetting || isLoggingIn}
                   required
                   placeholder={translate('loginPasswordPlaceholder')}
                   style={{
@@ -814,27 +830,30 @@ export default function LoginPage() {
 
               <div>
                 <button
-                  type="button"
-                  onClick={handleSubmit}
-                  disabled={isLoggingIn}
+                  type="submit"
+                  disabled={isAuthResetting || isLoggingIn}
                   style={{
                     width: '100%',
                     padding: '12px 14px',
                     borderRadius: '10px',
                     border: '1px solid rgba(255,255,255,0.10)',
-                    background: isLoggingIn
+                    background: isAuthResetting || isLoggingIn
                       ? 'rgba(15,118,110,0.38)'
                       : '#0f766e',
                     color: '#fff',
                     fontWeight: 900,
                     fontSize: '16px',
-                    cursor: isLoggingIn ? 'not-allowed' : 'pointer',
-                    boxShadow: isLoggingIn ? 'none' : '0 12px 28px rgba(0, 0, 0, 0.26)',
+                    cursor: isAuthResetting || isLoggingIn ? 'not-allowed' : 'pointer',
+                    boxShadow: isAuthResetting || isLoggingIn ? 'none' : '0 12px 28px rgba(0, 0, 0, 0.26)',
                     transition: 'transform 0.15s ease, box-shadow 0.15s ease',
-                    opacity: isLoggingIn ? 0.85 : 1,
+                    opacity: isAuthResetting || isLoggingIn ? 0.85 : 1,
                   }}
                 >
-                  {isLoggingIn ? translate('loginButtonLoading') : translate('loginButton')}
+                  {isAuthResetting
+                    ? translate('loginButtonPreparing')
+                    : isLoggingIn
+                    ? translate('loginButtonLoading')
+                    : translate('loginButton')}
                 </button>
               </div>
 
