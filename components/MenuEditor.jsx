@@ -46,6 +46,39 @@ const DEFAULT_PIN = '0000';
 const isBlobLike = (v) =>
   v && (typeof Blob !== 'undefined') && (v instanceof Blob || v instanceof File);
 
+const blobObjectUrlCache = typeof WeakMap !== 'undefined' ? new WeakMap() : null;
+
+function getReusableBlobObjectUrl(blob) {
+  if (!isBlobLike(blob) || typeof URL === 'undefined') return null;
+  if (!blobObjectUrlCache) return URL.createObjectURL(blob);
+  const cached = blobObjectUrlCache.get(blob);
+  if (cached) return cached;
+  const nextUrl = URL.createObjectURL(blob);
+  blobObjectUrlCache.set(blob, nextUrl);
+  return nextUrl;
+}
+
+function getPreparedBackgroundUrl(source) {
+  return source?.bgObjectUrl ||
+    getReusableBlobObjectUrl(source?.bgBlob) ||
+    source?.bgSignedUrl ||
+    null;
+}
+
+function getPreparedBackgroundOverrideUrls(source) {
+  const urls = {
+    ...(source?.bgOverrideSignedUrls || {}),
+    ...(source?.bgOverrideObjectUrls || {}),
+  };
+
+  for (const [page, blob] of Object.entries(source?.bgOverrides || {})) {
+    const objectUrl = getReusableBlobObjectUrl(blob);
+    if (objectUrl) urls[page] = objectUrl;
+  }
+
+  return urls;
+}
+
 
 // ✅ 언어
 const LANG_KEY = 'APP_LANG_V1';
@@ -227,21 +260,71 @@ function getWindowReadyViewStore() {
 function readWindowReadyView(language, userId) {
   const store = getWindowReadyViewStore();
   if (!store) return null;
-  const exact = store.get?.(readyViewKey(language, userId));
+  const key = readyViewKey(language, userId);
+  const exact = store.get?.(key);
   if (exact?.userId && exact.userId !== userId) return null;
-  if (layoutMatchesLanguage(exact?.layout, language)) return exact;
+  if (layoutMatchesLanguage(exact?.layout, language) && !layoutNeedsMediaHydration(exact?.layout)) return exact;
+  try {
+    store.delete?.(key);
+  } catch {}
   return null;
 }
 
-function writeWindowReadyView({ language, userId, layout, bgSignedUrl = null, bgOverrideSignedUrls = {} }) {
+function windowReadyViewHasBackground(view) {
+  return !!view?.bgBlob ||
+    !!view?.bgObjectUrl ||
+    !!view?.bgSignedUrl ||
+    Object.keys(view?.bgOverrides || {}).length > 0 ||
+    Object.keys(view?.bgOverrideObjectUrls || {}).length > 0 ||
+    Object.keys(view?.bgOverrideSignedUrls || {}).length > 0;
+}
+
+function getInitialMenuLanguage() {
+  if (typeof window === 'undefined') return 'en';
+  try {
+    const saved = window.localStorage.getItem(LANG_KEY);
+    return saved === 'ko' || saved === 'en' ? saved : 'en';
+  } catch {
+    return 'en';
+  }
+}
+
+function getInitialReadyViewSnapshot() {
+  const language = getInitialMenuLanguage();
+  const userId = getCurrentUser();
+  const view = readWindowReadyView(language, userId);
+  return { language, userId, view };
+}
+
+function writeWindowReadyView({
+  language,
+  userId,
+  layout,
+  bgBlob = null,
+  bgOverrides = {},
+  bgObjectUrl = null,
+  bgOverrideObjectUrls = {},
+  bgSignedUrl = null,
+  bgOverrideSignedUrls = {},
+}) {
   if (!layoutMatchesLanguage(layout, language)) return;
+  if (layoutNeedsMediaHydration(layout)) return;
   const store = getWindowReadyViewStore();
   if (!store) return;
   const safeLang = language === 'ko' ? 'ko' : 'en';
+  const preparedBgObjectUrl = bgObjectUrl || getReusableBlobObjectUrl(bgBlob);
+  const preparedBgOverrideObjectUrls = {
+    ...(bgOverrideObjectUrls || {}),
+    ...getPreparedBackgroundOverrideUrls({ bgOverrides }),
+  };
   const view = {
     language: safeLang,
     userId: userId || null,
     layout,
+    bgBlob: bgBlob || null,
+    bgOverrides: bgOverrides || {},
+    bgObjectUrl: preparedBgObjectUrl || null,
+    bgOverrideObjectUrls: preparedBgOverrideObjectUrls || {},
     bgSignedUrl: bgSignedUrl || null,
     bgOverrideSignedUrls: bgOverrideSignedUrls || {},
     ts: Date.now(),
@@ -304,7 +387,11 @@ function repairMissingMediaItemsFromFallback(targetLayout, fallbackLayout) {
 
 function layoutNeedsMediaHydration(targetLayout) {
   const items = Array.isArray(targetLayout?.items) ? targetLayout.items : [];
-  return items.some((item) => isMediaItem(item) && !item.src);
+  return items.some((item) => {
+    if (!item || item.type !== 'image') return false;
+    const src = typeof item.src === 'string' ? item.src : '';
+    return (item.assetPath && (!src || isBlobUrlSrc(src))) || (!item.assetPath && isBlobUrlSrc(src));
+  });
 }
 
 // ✅✅ 페이지별 배경 오버라이드 저장 키 (언어별로 분리)
@@ -454,8 +541,9 @@ function withTimeout(promise, timeoutMs, fallback = null) {
 
 // ✅ 보기모드 페이지 전환 튜닝
 const VIEW_GUTTER_X = 0;
-const VIEW_GUTTER_Y = 24;
-const EDIT_ACTION_BAR_SPACE = 36;
+const VIEW_GUTTER_Y = 0;
+const TEMPLATE_VIEW_GUTTER_Y = 0;
+const EDIT_ACTION_BAR_SPACE = 0;
 const MIN_VIEW_SCALE = 0.22;
 const VIEW_PAGE_RENDER_RADIUS = 1;
 const LIVE_MENU_REFRESH_ENABLED = false;
@@ -1014,7 +1102,7 @@ function TemplatePicker({ onPick, lang }) {
 const tp = {
   wrap: {
     display: 'grid',
-    gap: 18,
+    gap: 10,
   },
   top: {
     display: 'flex',
@@ -1030,8 +1118,8 @@ const tp = {
     textTransform: 'uppercase',
   },
   title: {
-    marginTop: 5,
-    fontSize: 24,
+    marginTop: 3,
+    fontSize: 19,
     fontWeight: 1000,
     color: '#111827',
     lineHeight: 1.15,
@@ -1047,28 +1135,28 @@ const tp = {
   },
   grid: {
     display: 'grid',
-    gridTemplateColumns: 'repeat(auto-fit, minmax(245px, 1fr))',
-    gap: 14,
+    gridTemplateColumns: 'repeat(3, minmax(0, 1fr))',
+    gap: 10,
   },
   card: {
     appearance: 'none',
     border: '1px solid #e5e7eb',
     background: '#fff',
-    borderRadius: 14,
+    borderRadius: 12,
     padding: 0,
     overflow: 'hidden',
     cursor: 'pointer',
     textAlign: 'left',
     color: '#111827',
-    boxShadow: '0 10px 26px rgba(15,23,42,0.08)',
+    boxShadow: '0 8px 20px rgba(15,23,42,0.08)',
   },
   preview: {
     position: 'relative',
-    height: 218,
-    padding: 13,
+    height: 132,
+    padding: 9,
     boxSizing: 'border-box',
     display: 'grid',
-    gap: 10,
+    gap: 7,
     overflow: 'hidden',
   },
   previewAccentGlow: {
@@ -1084,13 +1172,13 @@ const tp = {
   },
   previewHeader: {
     display: 'grid',
-    gridTemplateColumns: '32px 1fr auto',
-    gap: 8,
+    gridTemplateColumns: '26px 1fr auto',
+    gap: 6,
     alignItems: 'center',
   },
   previewLogo: {
-    width: 30,
-    height: 30,
+    width: 24,
+    height: 24,
     borderRadius: 999,
     border: '2px solid',
     background: 'rgba(255,255,255,0.18)',
@@ -1114,14 +1202,14 @@ const tp = {
     color: '#fff',
     border: '1px solid',
     borderRadius: 999,
-    padding: '3px 7px',
-    fontSize: 10,
+    padding: '2px 6px',
+    fontSize: 9,
     fontWeight: 1000,
     background: 'rgba(0,0,0,0.22)',
   },
   previewQr: {
-    width: 30,
-    height: 30,
+    width: 24,
+    height: 24,
     borderRadius: 6,
     border: '1px solid',
     background: 'rgba(255,255,255,0.92)',
@@ -1136,18 +1224,18 @@ const tp = {
   },
   previewFeature: {
     display: 'grid',
-    gridTemplateColumns: '54px 1fr',
-    gap: 8,
-    padding: 8,
-    borderRadius: 10,
+    gridTemplateColumns: '42px 1fr',
+    gap: 6,
+    padding: 6,
+    borderRadius: 9,
     background: 'rgba(255,255,255,0.11)',
     border: '1px solid rgba(255,255,255,0.14)',
     boxShadow: '0 12px 26px rgba(0,0,0,0.14)',
   },
   previewHeroPhoto: {
-    width: 54,
-    height: 54,
-    borderRadius: 10,
+    width: 42,
+    height: 42,
+    borderRadius: 9,
     border: '2px solid rgba(255,255,255,0.64)',
     boxShadow: '0 8px 18px rgba(0,0,0,0.28)',
   },
@@ -1159,15 +1247,15 @@ const tp = {
   },
   previewRows: {
     display: 'grid',
-    gap: 8,
+    gap: 5,
   },
   previewLine: {
     display: 'grid',
     gridTemplateColumns: '1fr 40px',
     gap: 10,
     alignItems: 'center',
-    padding: '8px 9px',
-    borderRadius: 10,
+    padding: '5px 7px',
+    borderRadius: 8,
     background: 'rgba(255,255,255,0.10)',
     border: '1px solid rgba(255,255,255,0.12)',
   },
@@ -1182,20 +1270,20 @@ const tp = {
   },
   previewPhotoBlocks: {
     display: 'grid',
-    gap: 8,
+    gap: 5,
   },
   previewPhotoBlock: {
     display: 'grid',
-    gap: 8,
+    gap: 5,
     alignItems: 'center',
-    padding: 7,
-    borderRadius: 12,
+    padding: 5,
+    borderRadius: 9,
     background: 'rgba(255,255,255,0.10)',
     border: '1px solid rgba(255,255,255,0.12)',
   },
   previewPhoto: {
-    width: 50,
-    height: 50,
+    width: 36,
+    height: 36,
     borderRadius: 999,
     border: '2px solid rgba(255,255,255,0.76)',
     boxShadow: '0 8px 18px rgba(0,0,0,0.26)',
@@ -1223,15 +1311,15 @@ const tp = {
   previewGrid: {
     display: 'grid',
     gridTemplateColumns: 'repeat(2, 1fr)',
-    gap: 8,
+    gap: 5,
   },
   previewTile: {
-    minHeight: 44,
-    borderRadius: 12,
-    padding: 9,
+    minHeight: 32,
+    borderRadius: 9,
+    padding: 6,
     display: 'grid',
     alignContent: 'space-between',
-    gap: 8,
+    gap: 5,
     background: 'rgba(255,255,255,0.10)',
     border: '1px solid rgba(255,255,255,0.12)',
   },
@@ -1264,9 +1352,9 @@ const tp = {
     borderRadius: 999,
   },
   cardBody: {
-    padding: 14,
+    padding: 10,
     display: 'grid',
-    gap: 8,
+    gap: 6,
   },
   cardTop: {
     display: 'flex',
@@ -1289,35 +1377,37 @@ const tp = {
     padding: '3px 7px',
   },
   name: {
-    fontSize: 17,
+    fontSize: 15,
     fontWeight: 1000,
     lineHeight: 1.15,
   },
   desc: {
-    minHeight: 38,
+    minHeight: 0,
+    maxHeight: 34,
+    overflow: 'hidden',
     color: '#475569',
-    fontSize: 13,
+    fontSize: 11,
     fontWeight: 750,
     lineHeight: 1.35,
   },
   tags: {
     display: 'flex',
     flexWrap: 'wrap',
-    gap: 6,
+    gap: 4,
   },
   tag: {
-    fontSize: 11,
+    fontSize: 10,
     fontWeight: 900,
     color: '#334155',
     background: '#f8fafc',
     border: '1px solid #e2e8f0',
     borderRadius: 999,
-    padding: '4px 7px',
+    padding: '3px 6px',
   },
   choose: {
     marginTop: 2,
-    borderRadius: 10,
-    padding: '9px 10px',
+    borderRadius: 9,
+    padding: '7px 8px',
     textAlign: 'center',
     color: '#111827',
     fontWeight: 1000,
@@ -1325,26 +1415,37 @@ const tp = {
   note: {
     color: '#475569',
     fontWeight: 800,
-    fontSize: 13,
+    fontSize: 12,
     lineHeight: 1.4,
   },
 };
 
 export default function MenuEditor() {
   const router = useRouter();
+  const initialReadyViewRef = useRef(undefined);
+  if (initialReadyViewRef.current === undefined) {
+    initialReadyViewRef.current = getInitialReadyViewSnapshot();
+  }
+  const initialReadyView = initialReadyViewRef.current;
+  const initialWindowView = initialReadyView?.view || null;
+  const hasInitialWindowView = !!initialWindowView?.layout;
+  const initialPreparedBgUrl = getPreparedBackgroundUrl(initialWindowView);
+  const initialPreparedBgOverrideUrls = getPreparedBackgroundOverrideUrls(initialWindowView);
 
   // ✅ 기본 배경(전체 페이지 default)
-  const [bgBlob, setBgBlob] = useState(null);
-  const [bgSignedUrl, setBgSignedUrl] = useState(null);
+  const [bgBlob, setBgBlob] = useState(() => initialWindowView?.bgBlob || null);
+  const [bgSignedUrl, setBgSignedUrl] = useState(() => initialWindowView?.bgSignedUrl || null);
+  const [bgRuntimeUrl, setBgRuntimeUrl] = useState(() => initialPreparedBgUrl || null);
 
   // ✅ 페이지별 오버라이드 배경 blobs: { [pageNumber]: Blob }
-  const [bgOverrides, setBgOverrides] = useState({});
-  const [bgOverrideSignedUrls, setBgOverrideSignedUrls] = useState({});
+  const [bgOverrides, setBgOverrides] = useState(() => initialWindowView?.bgOverrides || {});
+  const [bgOverrideSignedUrls, setBgOverrideSignedUrls] = useState(() => initialWindowView?.bgOverrideSignedUrls || {});
+  const [bgRuntimeOverrideUrls, setBgRuntimeOverrideUrls] = useState(() => initialPreparedBgOverrideUrls || {});
 
-  const [layout, setLayout] = useState(DEFAULT_LAYOUT);
+  const [layout, setLayout] = useState(() => initialWindowView?.layout || DEFAULT_LAYOUT);
 
-  const [userReady, setUserReady] = useState(false);
-  const [userId, setUserId] = useState(null);
+  const [userReady, setUserReady] = useState(() => !!initialReadyView?.userId);
+  const [userId, setUserId] = useState(() => initialReadyView?.userId || null);
 
   // ✅ “편집 모드”
   const [edit, setEdit] = useState(false);
@@ -1355,6 +1456,9 @@ export default function MenuEditor() {
   const [showEditorMenu, setShowEditorMenu] = useState(false);
   const [toolsVisible, setToolsVisible] = useState(false);
   const [switchingLang, setSwitchingLang] = useState(null);
+  const [templateNotice, setTemplateNotice] = useState('');
+  const [freeLayoutOnboarding, setFreeLayoutOnboarding] = useState(false);
+  const [onboardingRequested, setOnboardingRequested] = useState(false);
 
   const fileInputRef = useRef(null);
   const introVideoInputRef = useRef(null);
@@ -1362,10 +1466,12 @@ export default function MenuEditor() {
   const backupImportInputRef = useRef(null);
 
   const [dragOver, setDragOver] = useState(false);
-  const [loading, setLoading] = useState(true);
-  const [bgLoading, setBgLoading] = useState(true);
-  const [bgResolved, setBgResolved] = useState(false);
-  const [bgAssetsReady, setBgAssetsReady] = useState(false);
+  const [loading, setLoading] = useState(() => !hasInitialWindowView);
+  const [bgLoading, setBgLoading] = useState(() => !hasInitialWindowView);
+  const [bgResolved, setBgResolved] = useState(() => hasInitialWindowView);
+  const [bgAssetsReady, setBgAssetsReady] = useState(() => (
+    hasInitialWindowView ? windowReadyViewHasBackground(initialWindowView) : false
+  ));
   const [assetUploading, setAssetUploading] = useState(false);
   const [assetUploadMessage, setAssetUploadMessage] = useState('');
 
@@ -1384,6 +1490,7 @@ export default function MenuEditor() {
 
   // ---- 자동 숨김 타이머
   const autoHideRef = useRef(null);
+  const templateNoticeTimerRef = useRef(null);
 
   // ---- 길게 누르기 타이머
   const longPressRef = useRef(null);
@@ -1408,6 +1515,14 @@ export default function MenuEditor() {
   const pairedTemplateSyncStorageKey = useMemo(() => {
     return userId ? `${PAIRED_TEMPLATE_SYNC_KEY}__${userId}` : PAIRED_TEMPLATE_SYNC_KEY;
   }, [userId]);
+
+  useEffect(() => {
+    try {
+      setOnboardingRequested(new URLSearchParams(window.location.search).get('onboarding') === '1');
+    } catch {
+      setOnboardingRequested(false);
+    }
+  }, []);
 
   useEffect(() => {
     let alive = true;
@@ -1494,11 +1609,11 @@ export default function MenuEditor() {
   const [settingsMsg, setSettingsMsg] = useState('');
 
   // ✅ 언어 상태 (hydration 이후에만 로컬 저장값을 반영해 초기 이중 로딩 방지)
-  const [lang, setLang] = useState('en');
+  const [lang, setLang] = useState(() => initialReadyView?.language || 'en');
   const [langReady, setLangReady] = useState(false);
-  const [hasInitialView, setHasInitialView] = useState(false);
+  const [hasInitialView, setHasInitialView] = useState(() => hasInitialWindowView);
   const [initialLanguageWarmupReady, setInitialLanguageWarmupReady] = useState(true);
-  const initialLangRef = useRef(null);
+  const initialLangRef = useRef(initialReadyView?.language || 'en');
   const layoutSyncedLangsRef = useRef(new Set());
   const backgroundSyncedLangsRef = useRef(new Set());
   const viewCacheRef = useRef(new Map());
@@ -1511,6 +1626,7 @@ export default function MenuEditor() {
   const pageHydrationRequestsRef = useRef(new Set());
   const backgroundImagePreloadRequestsRef = useRef(new Set());
   const visualsReadyLangsRef = useRef(new Set());
+  const [visualsReadySignal, setVisualsReadySignal] = useState(0);
   const readyBundleWriteKeysRef = useRef(new Set());
   const readyBundleAppliedRef = useRef(null);
   const [readyBundleLookup, setReadyBundleLookup] = useState({
@@ -1797,6 +1913,8 @@ export default function MenuEditor() {
       }
 
       if (!isCancelled?.() && hasLocalBg) {
+        setBgRuntimeUrl(getReusableBlobObjectUrl(localBg));
+        setBgRuntimeOverrideUrls(getPreparedBackgroundOverrideUrls({ bgOverrides: localOverrides }));
         setBgBlob(localBg);
         setBgOverrides(localOverrides);
         setBgSignedUrl(null);
@@ -1831,6 +1949,8 @@ export default function MenuEditor() {
         fastSignedBgUrl = signedBundle.bgSignedUrl || null;
         fastSignedOverrideUrls = signedBundle.bgOverrideSignedUrls || {};
         backgroundSyncedLangsRef.current.add(lang);
+        setBgRuntimeUrl(null);
+        setBgRuntimeOverrideUrls({});
         setBgBlob(null);
         setBgOverrides({});
         setBgSignedUrl(fastSignedBgUrl);
@@ -1864,6 +1984,8 @@ export default function MenuEditor() {
 
     if (!shouldRemoteSync) {
       if (!hasLocalBg && !isCancelled?.()) {
+        setBgRuntimeUrl(null);
+        setBgRuntimeOverrideUrls({});
         setBgBlob(null);
         setBgOverrides({});
         setBgSignedUrl(null);
@@ -1915,11 +2037,15 @@ export default function MenuEditor() {
       if (!isCancelled?.()) {
         if (hasAnyBg) {
           const hasDownloadedBg = !!finalBg || Object.keys(finalOverrides || {}).length > 0;
+          setBgRuntimeUrl(hasDownloadedBg ? getReusableBlobObjectUrl(finalBg) : null);
+          setBgRuntimeOverrideUrls(hasDownloadedBg ? getPreparedBackgroundOverrideUrls({ bgOverrides: finalOverrides }) : {});
           setBgBlob(hasDownloadedBg ? finalBg || null : null);
           setBgOverrides(hasDownloadedBg ? finalOverrides || {} : {});
           setBgSignedUrl(hasDownloadedBg ? null : fastSignedBgUrl);
           setBgOverrideSignedUrls(hasDownloadedBg ? {} : fastSignedOverrideUrls);
         } else {
+          setBgRuntimeUrl(null);
+          setBgRuntimeOverrideUrls({});
           setBgBlob(null);
           setBgOverrides({});
           setBgSignedUrl(null);
@@ -1943,6 +2069,8 @@ export default function MenuEditor() {
         if (isCancelled?.() || !bundle?.hasAnyBg) return;
         const nextBg = bundle.bgBlob || finalBg || null;
         const nextOverrides = bundle.bgOverrides || {};
+        setBgRuntimeUrl(getReusableBlobObjectUrl(nextBg));
+        setBgRuntimeOverrideUrls(getPreparedBackgroundOverrideUrls({ bgOverrides: nextOverrides }));
         setBgBlob(nextBg);
         setBgOverrides(nextOverrides);
         setBgSignedUrl(null);
@@ -2072,6 +2200,10 @@ export default function MenuEditor() {
       language: safeLang,
       userId,
       layout: nextLayout,
+      bgBlob: cached.bgBlob || null,
+      bgOverrides: cached.bgOverrides || {},
+      bgObjectUrl: cached.bgObjectUrl || null,
+      bgOverrideObjectUrls: cached.bgOverrideObjectUrls || {},
       bgSignedUrl: cached.bgSignedUrl || null,
       bgOverrideSignedUrls: cached.bgOverrideSignedUrls || {},
     });
@@ -2284,14 +2416,18 @@ export default function MenuEditor() {
         readyBundleAppliedRef.current = identity;
         layoutSyncedLangsRef.current.add(lang);
         const hasWindowBackground =
+          !!windowReadyView.bgBlob ||
           !!windowReadyView.bgSignedUrl ||
+          Object.keys(windowReadyView.bgOverrides || {}).length > 0 ||
           Object.keys(windowReadyView.bgOverrideSignedUrls || {}).length > 0;
         if (hasWindowBackground) backgroundSyncedLangsRef.current.add(lang);
         visualsReadyLangsRef.current.add(lang);
 
         setLayout(readyLayout);
-        setBgBlob(null);
-        setBgOverrides({});
+        setBgRuntimeUrl(getPreparedBackgroundUrl(windowReadyView));
+        setBgRuntimeOverrideUrls(getPreparedBackgroundOverrideUrls(windowReadyView));
+        setBgBlob(windowReadyView.bgBlob || null);
+        setBgOverrides(windowReadyView.bgOverrides || {});
         setBgSignedUrl(windowReadyView.bgSignedUrl || null);
         setBgOverrideSignedUrls(windowReadyView.bgOverrideSignedUrls || {});
         setBgAssetsReady(hasWindowBackground);
@@ -2303,8 +2439,10 @@ export default function MenuEditor() {
           layout: readyLayout,
           hasLayoutCache: true,
           hasFullMediaCache: !layoutNeedsMediaHydration(readyLayout),
-          bgBlob: null,
-          bgOverrides: {},
+          bgBlob: windowReadyView.bgBlob || null,
+          bgOverrides: windowReadyView.bgOverrides || {},
+          bgObjectUrl: windowReadyView.bgObjectUrl || null,
+          bgOverrideObjectUrls: windowReadyView.bgOverrideObjectUrls || {},
           bgSignedUrl: windowReadyView.bgSignedUrl || null,
           bgOverrideSignedUrls: windowReadyView.bgOverrideSignedUrls || {},
           hasBackgroundCache: hasWindowBackground,
@@ -2350,6 +2488,8 @@ export default function MenuEditor() {
       }
 
       setLayout(bundledLayout);
+      setBgRuntimeUrl(null);
+      setBgRuntimeOverrideUrls({});
       setBgBlob(null);
       setBgOverrides({});
       setBgSignedUrl(bundle.bgSignedUrl || null);
@@ -2541,6 +2681,8 @@ export default function MenuEditor() {
                   language: targetLang,
                   userId,
                   layout: finalCache.layout,
+                  bgBlob: finalCache.bgBlob || null,
+                  bgOverrides: finalCache.bgOverrides || {},
                   bgSignedUrl: finalCache.bgSignedUrl || null,
                   bgOverrideSignedUrls: finalCache.bgOverrideSignedUrls || {},
                 });
@@ -2656,6 +2798,8 @@ export default function MenuEditor() {
 
         if (nextMeta !== bgSnapshotRef.current) {
           bgSnapshotRef.current = nextMeta;
+          setBgRuntimeUrl(getReusableBlobObjectUrl(nextBg));
+          setBgRuntimeOverrideUrls(getPreparedBackgroundOverrideUrls({ bgOverrides: nextOverrides }));
           setBgBlob(nextBg);
           setBgOverrides(nextOverrides);
           setBgSignedUrl(null);
@@ -2741,8 +2885,9 @@ export default function MenuEditor() {
           const allImageUrls = getAllLayoutImageUrls(safeLay);
           preloadImageUrlsUntilReady(allImageUrls, 6000, 2)
             .then((stats) => {
-              if (!imagePreloadStatsComplete(safeLay, stats)) return;
               visualsReadyLangsRef.current.add(lang);
+              setVisualsReadySignal((value) => value + 1);
+              if (!imagePreloadStatsComplete(safeLay, stats)) return;
               const writeKey = `initial:${lang}:${userId || 'user'}:${stats.total}:${safeLay.items?.length || 0}`;
               if (readyBundleWriteKeysRef.current.has(writeKey)) return;
               readyBundleWriteKeysRef.current.add(writeKey);
@@ -2750,6 +2895,10 @@ export default function MenuEditor() {
                 language: lang,
                 userId,
                 layout: safeLay,
+                bgBlob: bgBlob || null,
+                bgOverrides: bgOverrides || {},
+                bgObjectUrl: bgRuntimeUrl || null,
+                bgOverrideObjectUrls: bgRuntimeOverrideUrls || {},
                 bgSignedUrl: bgSignedUrl || null,
                 bgOverrideSignedUrls: bgOverrideSignedUrls || {},
               });
@@ -2969,6 +3118,8 @@ export default function MenuEditor() {
     }
 
     if (cached?.hasBackgroundCache) {
+      setBgRuntimeUrl(getPreparedBackgroundUrl(cached));
+      setBgRuntimeOverrideUrls(getPreparedBackgroundOverrideUrls(cached));
       setBgBlob(cached.bgBlob || null);
       setBgOverrides(cached.bgOverrides || {});
       setBgSignedUrl(cached.bgSignedUrl || null);
@@ -2982,38 +3133,13 @@ export default function MenuEditor() {
   const preloadCachedLanguageVisuals = async (language, cached) => {
     if (!cached) return;
 
-    const tempUrls = [];
     const backgroundUrls = [];
 
     try {
-      const overrideKeys = Array.from(new Set([
-        ...Object.keys(cached.bgOverrides || {}),
-        ...Object.keys(cached.bgOverrideSignedUrls || {}),
-      ]));
-
-      overrideKeys.forEach((pageKey) => {
-        const page = Number(pageKey);
-        const pageOverrideBlob = cached.bgOverrides?.[pageKey] || cached.bgOverrides?.[page];
-        const pageOverrideSignedUrl = cached.bgOverrideSignedUrls?.[pageKey] || cached.bgOverrideSignedUrls?.[page];
-        if (pageOverrideSignedUrl) {
-          backgroundUrls.push(pageOverrideSignedUrl);
-          return;
-        }
-
-        if (isBlobLike(pageOverrideBlob) && typeof URL !== 'undefined') {
-          const objectUrl = URL.createObjectURL(pageOverrideBlob);
-          tempUrls.push(objectUrl);
-          backgroundUrls.push(objectUrl);
-        }
-      });
-
-      if (cached.bgSignedUrl) {
-        backgroundUrls.push(cached.bgSignedUrl);
-      } else if (isBlobLike(cached.bgBlob) && typeof URL !== 'undefined') {
-        const objectUrl = URL.createObjectURL(cached.bgBlob);
-        tempUrls.push(objectUrl);
-        backgroundUrls.push(objectUrl);
-      }
+      const preparedDefaultBgUrl = getPreparedBackgroundUrl(cached);
+      const preparedOverrideUrls = getPreparedBackgroundOverrideUrls(cached);
+      if (preparedDefaultBgUrl) backgroundUrls.push(preparedDefaultBgUrl);
+      backgroundUrls.push(...Object.values(preparedOverrideUrls || {}).filter(Boolean));
 
       const menuImageUrls = getAllLayoutImageUrls(cached.layout);
       const [menuStats] = await Promise.all([
@@ -3024,12 +3150,16 @@ export default function MenuEditor() {
         visualsReadyLangsRef.current.add(language);
       }
     } finally {
-      tempUrls.forEach((url) => {
-        try {
-          URL.revokeObjectURL(url);
-        } catch {}
-      });
+      // Persistent blob URLs are intentionally reused to avoid a visible background repaint.
     }
+  };
+
+  const releaseSwitchingLang = () => {
+    if (typeof window === 'undefined') {
+      setSwitchingLang(null);
+      return;
+    }
+    window.setTimeout(() => setSwitchingLang(null), 120);
   };
 
   const setLanguage = async (nextLanguage) => {
@@ -3115,7 +3245,7 @@ export default function MenuEditor() {
             localStorage.setItem(LANG_KEY, next);
           } catch {}
         } finally {
-          setSwitchingLang(null);
+          releaseSwitchingLang();
         }
         return;
       }
@@ -3198,7 +3328,7 @@ export default function MenuEditor() {
           localStorage.setItem(LANG_KEY, next);
         } catch {}
       } finally {
-        setSwitchingLang(null);
+        releaseSwitchingLang();
       }
       return;
     }
@@ -3295,7 +3425,7 @@ export default function MenuEditor() {
           localStorage.setItem(LANG_KEY, next);
         } catch {}
       } finally {
-        setSwitchingLang(null);
+        releaseSwitchingLang();
       }
       return;
     }
@@ -3421,6 +3551,10 @@ export default function MenuEditor() {
         language: next,
         userId,
         layout: cached.layout,
+        bgBlob: cached.bgBlob || null,
+        bgOverrides: cached.bgOverrides || {},
+        bgObjectUrl: cached.bgObjectUrl || null,
+        bgOverrideObjectUrls: cached.bgOverrideObjectUrls || {},
         bgSignedUrl: cached.bgSignedUrl || null,
         bgOverrideSignedUrls: cached.bgOverrideSignedUrls || {},
       });
@@ -3437,7 +3571,7 @@ export default function MenuEditor() {
     } catch (error) {
       console.error('setLanguage failed', error);
     } finally {
-      setSwitchingLang(null);
+      releaseSwitchingLang();
     }
   };
 
@@ -3555,6 +3689,8 @@ export default function MenuEditor() {
 
       if (targetLang === lang) {
         setLayout(hydratedImported);
+        setBgRuntimeUrl(getReusableBlobObjectUrl(nextBgBlob));
+        setBgRuntimeOverrideUrls(getPreparedBackgroundOverrideUrls({ bgOverrides: nextOverrideBlobs }));
         setBgBlob(nextBgBlob);
         setBgOverrides(nextOverrideBlobs);
         setBgSignedUrl(null);
@@ -3598,15 +3734,75 @@ export default function MenuEditor() {
   // ✅ 기본 배경 URL
   const bgObjectUrl = useMemo(() => {
     if (!isBlobLike(bgBlob)) return null;
-    return URL.createObjectURL(bgBlob);
+    return getReusableBlobObjectUrl(bgBlob);
   }, [bgBlob]);
-  const bgUrl = bgObjectUrl || bgSignedUrl || null;
+  const bgUrl = bgRuntimeUrl || bgObjectUrl || bgSignedUrl || null;
+
+  const clearOnboardingUrl = useCallback(() => {
+    try {
+      if (window.location.search.includes('onboarding=')) {
+        window.history.replaceState(null, '', '/menu');
+      }
+    } catch {
+      // ignore URL cleanup failures
+    }
+  }, []);
+
+  const beginFreeLayoutEdit = useCallback(() => {
+    const next = normalizeLoadedLayout({ ...DEFAULT_LAYOUT, mode: 'custom', templateId: null, templateData: null, items: [], pageCount: 1 });
+    const currentLang = lang === 'ko' ? 'ko' : 'en';
+    const draftMap = templateDraftLayoutsRef.current instanceof Map
+      ? templateDraftLayoutsRef.current
+      : new Map();
+    draftMap.set(currentLang, next);
+    templateDraftLayoutsRef.current = draftMap;
+    setLayout(next);
+    setEdit(true);
+    setPreview(false);
+    setFreeLayoutOnboarding(false);
+    setToolsVisible(false);
+    setShowEditorMenu(false);
+    setPageIndex(1);
+    clearOnboardingUrl();
+    setTimeout(() => hardResetScrollTop('auto'), 0);
+  }, [clearOnboardingUrl, lang, normalizeLoadedLayout]);
+
+  const startFreeLayoutOnboarding = useCallback(() => {
+    setEditModeModalOpen(false);
+    setPreview(false);
+    setToolsVisible(false);
+    setShowEditorMenu(false);
+    if (bgUrl) {
+      beginFreeLayoutEdit();
+      return;
+    }
+    setEdit(false);
+    setLayout(DEFAULT_LAYOUT);
+    setFreeLayoutOnboarding(true);
+    clearOnboardingUrl();
+    setPageIndex(1);
+    setTimeout(() => hardResetScrollTop('auto'), 0);
+  }, [beginFreeLayoutEdit, bgUrl, clearOnboardingUrl]);
+
+  const startTemplateOnboarding = useCallback(async (fullId) => {
+    setEditModeModalOpen(false);
+    await applyPairedTemplate(fullId);
+    setEdit(true);
+    setPreview(false);
+    setFreeLayoutOnboarding(false);
+    setTplPanelOpen(true);
+    setToolsVisible(false);
+    setShowEditorMenu(false);
+    setPageIndex(1);
+    clearOnboardingUrl();
+    setTimeout(() => hardResetScrollTop('auto'), 0);
+  }, [applyPairedTemplate, clearOnboardingUrl]);
 
   // ✅ 페이지별 배경 URL map
   const bgObjectOverrideUrls = useMemo(() => {
     const map = {};
     for (const [k, blob] of Object.entries(bgOverrides || {})) {
-      if (isBlobLike(blob)) map[k] = URL.createObjectURL(blob);
+      if (isBlobLike(blob)) map[k] = getReusableBlobObjectUrl(blob);
     }
     return map;
   }, [bgOverrides]);
@@ -3614,21 +3810,15 @@ export default function MenuEditor() {
     () => ({
       ...(bgOverrideSignedUrls || {}),
       ...(bgObjectOverrideUrls || {}),
+      ...(bgRuntimeOverrideUrls || {}),
     }),
-    [bgObjectOverrideUrls, bgOverrideSignedUrls]
+    [bgObjectOverrideUrls, bgOverrideSignedUrls, bgRuntimeOverrideUrls]
   );
 
   // ✅ URL revoke cleanup
   useEffect(() => {
-    return () => {
-      if (bgObjectUrl) URL.revokeObjectURL(bgObjectUrl);
-      for (const u of Object.values(bgObjectOverrideUrls || {})) {
-        try {
-          URL.revokeObjectURL(u);
-        } catch {}
-      }
-    };
-  }, [bgObjectUrl, bgObjectOverrideUrls]);
+    return () => {};
+  }, []);
 
   // ✅ 배경 이미지 로드 완료까지 대기(초기 표시용 현재 페이지만 선로딩)
   useEffect(() => {
@@ -3705,10 +3895,34 @@ export default function MenuEditor() {
 
   useEffect(() => {
     if (hasInitialView) return;
-    if (!loading && (isUsableMenuLayout(layout) || bgResolved || readyBundleLookup.checked)) {
+    const hasMenuLayout = isUsableMenuLayout(layout);
+    const imageCount = hasMenuLayout ? getAllLayoutImageUrls(layout).length : 0;
+    const mediaHydrated = hasMenuLayout && !layoutNeedsMediaHydration(layout);
+    const imagesReady = imageCount === 0 || visualsReadyLangsRef.current.has(lang);
+    const customBackgroundReady =
+      !hasMenuLayout ||
+      layout?.mode !== 'custom' ||
+      (bgResolved && (!bgUrl || bgAssetsReady));
+    const readyToShowMenu =
+      hasMenuLayout &&
+      mediaHydrated &&
+      customBackgroundReady &&
+      (imagesReady || imageCount > 0);
+
+    if (!loading && readyToShowMenu) {
       setHasInitialView(true);
     }
-  }, [hasInitialView, loading, layout, bgResolved, readyBundleLookup.checked]);
+  }, [
+    hasInitialView,
+    loading,
+    layout,
+    lang,
+    bgResolved,
+    bgUrl,
+    bgAssetsReady,
+    readyBundleLookup.checked,
+    visualsReadySignal,
+  ]);
 
   useEffect(() => {
     if (!hasInitialView || !userReady || !langReady) return;
@@ -3723,10 +3937,14 @@ export default function MenuEditor() {
       language: lang,
       userId,
       layout,
+      bgBlob: bgBlob || null,
+      bgOverrides: bgOverrides || {},
+      bgObjectUrl: bgRuntimeUrl || null,
+      bgOverrideObjectUrls: bgRuntimeOverrideUrls || {},
       bgSignedUrl: bgSignedUrl || null,
       bgOverrideSignedUrls: bgOverrideSignedUrls || {},
     });
-  }, [hasInitialView, userReady, userId, langReady, lang, layout, bgSignedUrl, bgOverrideSignedUrls]);
+  }, [hasInitialView, userReady, userId, langReady, lang, layout, bgBlob, bgOverrides, bgRuntimeUrl, bgRuntimeOverrideUrls, bgSignedUrl, bgOverrideSignedUrls]);
 
   useEffect(() => {
     if (!hasInitialView || !layout?.items?.length) return;
@@ -3746,6 +3964,7 @@ export default function MenuEditor() {
       preloadImageUrls(urls, 8000).then((stats) => {
         if (imagePreloadStatsComplete(layout, stats)) {
           visualsReadyLangsRef.current.add(lang);
+          setVisualsReadySignal((value) => value + 1);
           const writeKey = `${lang}:${userId || 'user'}:${stats.total}:${layout.items?.length || 0}:${bgSignedUrl || ''}:${Object.keys(bgOverrideSignedUrls || {}).join(',')}`;
           if (!readyBundleWriteKeysRef.current.has(writeKey)) {
             readyBundleWriteKeysRef.current.add(writeKey);
@@ -3753,6 +3972,10 @@ export default function MenuEditor() {
               language: lang,
               userId,
               layout,
+              bgBlob: bgBlob || null,
+              bgOverrides: bgOverrides || {},
+              bgObjectUrl: bgRuntimeUrl || null,
+              bgOverrideObjectUrls: bgRuntimeOverrideUrls || {},
               bgSignedUrl: bgSignedUrl || null,
               bgOverrideSignedUrls: bgOverrideSignedUrls || {},
             });
@@ -3805,8 +4028,12 @@ export default function MenuEditor() {
       console.error(e);
     }
 
+    setBgRuntimeUrl(getReusableBlobObjectUrl(file));
+    setBgRuntimeOverrideUrls({});
     setBgBlob(file);
     setBgSignedUrl(null);
+    setBgResolved(true);
+    setBgAssetsReady(true);
 
     // ✅ "배경(전체) 선택"은 페이지별 override보다 우선해서 전체 페이지에 바로 반영
     setBgOverrides({});
@@ -3819,6 +4046,11 @@ export default function MenuEditor() {
 
     if (fileInputRef.current) {
       fileInputRef.current.value = '';
+    }
+
+    if (freeLayoutOnboarding) {
+      beginFreeLayoutEdit();
+      return;
     }
 
     // ✅ 업로드 즉시 맨위로
@@ -3855,6 +4087,7 @@ export default function MenuEditor() {
       console.error(e);
     }
 
+    setBgRuntimeOverrideUrls((prev) => ({ ...(prev || {}), [p]: getReusableBlobObjectUrl(file) }));
     setBgOverrides((prev) => ({ ...(prev || {}), [p]: file }));
     setBgOverrideSignedUrls((prev) => {
       const next = { ...(prev || {}) };
@@ -3881,6 +4114,12 @@ export default function MenuEditor() {
     const p = Number(pageNum);
     if (!Number.isFinite(p) || p < 1) return;
 
+    setBgRuntimeOverrideUrls((prev) => {
+      const next = { ...(prev || {}) };
+      delete next[p];
+      delete next[String(p)];
+      return next;
+    });
     setBgOverrides((prev) => {
       const next = { ...(prev || {}) };
       delete next[p];
@@ -3961,7 +4200,9 @@ export default function MenuEditor() {
   // ✅ 길게 누르기 (3초)
   const startLongPress = (e) => {
     if (edit) return;
-    e.preventDefault();
+    if (String(e?.type || '').startsWith('touch')) {
+      e.preventDefault();
+    }
 
     if (longPressRef.current) clearTimeout(longPressRef.current);
     longPressRef.current = setTimeout(() => {
@@ -3983,6 +4224,7 @@ export default function MenuEditor() {
       if (tapTimerRef.current) clearTimeout(tapTimerRef.current);
       if (autoHideRef.current) clearTimeout(autoHideRef.current);
       if (longPressRef.current) clearTimeout(longPressRef.current);
+      if (templateNoticeTimerRef.current) clearTimeout(templateNoticeTimerRef.current);
     };
   }, []);
 
@@ -4077,19 +4319,20 @@ export default function MenuEditor() {
 
   const T = {
     ko: {
-      pickBgTitle: '메뉴판 배경을 선택하세요',
-      pickBgDesc1: '메뉴판에 깔릴 ',
+      pickBgTitle: '백그라운드를 업로드하세요',
+      pickBgDesc1: '자유 배치 메뉴판에 사용할 ',
       pickBgDesc2: '배경 이미지',
-      pickBgDesc3: '를 업로드해 주세요.',
-      pickBgDesc4: '업로드 후에는 배경이 자동 적용됩니다.',
-      drop1: '여기로 이미지를 드래그해서 놓거나',
-      drop2: '클릭해서 배경을 선택',
-      drop3: '하세요',
-      hint: '권장: JPG/PNG · 가로형(16:9)',
-      keep: '* 배경은 브라우저에 저장되어 다음 실행에도 유지됩니다.',
+      pickBgDesc3: '를 먼저 넣어주세요.',
+      pickBgDesc4: '업로드하면 바로 편집 화면으로 넘어갑니다.',
+      drop1: '배경 이미지 업로드',
+      drop2: '파일 선택',
+      drop3: '',
+      hint: '권장: JPG/PNG · 태블릿 세로 화면에 맞는 메뉴판 이미지',
+      keep: '자유 배치도에서만 필요한 단계입니다. 템플릿은 자체 배경을 사용합니다.',
       logout: '로그아웃',
       edit: '수정',
       changeBg: '배경(전체) 선택',
+      templateBgNotAvailable: '템플릿 모드에서는 배경을 따로 변경할 수 없습니다. 템플릿 자체 디자인 배경이 적용됩니다. 배경을 직접 바꾸려면 편집 방식 변경에서 자유 배치로 바꿔 주세요.',
       introVideo: '인트로 비디오 변경',
       pageBg: '페이지 배경',
       pinSettings: '비밀번호 설정',
@@ -4105,7 +4348,7 @@ export default function MenuEditor() {
       newPin2: '새 비밀번호 확인',
       change: '변경',
       help: '우측 상단 모서리를 5번 클릭하거나 3초 길게 누르면 수정 버튼이 나타납니다. (5초 후 자동으로 숨김)\n*백업: Shift+E',
-      backToVideo: '영상으로',
+      backToVideo: '인트로',
       editModePick: '수정 방식 선택',
       freeEdit: '자유 배치로 편집하기',
       templateBadge: '템플릿 모드: ',
@@ -4139,19 +4382,20 @@ export default function MenuEditor() {
       backupImportFail: '백업 파일을 불러오지 못했습니다.',
     },
     en: {
-      pickBgTitle: 'Select a menu background',
-      pickBgDesc1: 'Upload a ',
+      pickBgTitle: 'Upload a menu background',
+      pickBgDesc1: 'Add the ',
       pickBgDesc2: 'background image',
-      pickBgDesc3: ' for the menu.',
-      pickBgDesc4: 'It will apply automatically after upload.',
-      drop1: 'Drag & drop an image here, or',
-      drop2: 'click to choose a background',
+      pickBgDesc3: ' for your free-layout board first.',
+      pickBgDesc4: 'After upload, the editor opens automatically.',
+      drop1: 'Upload background image',
+      drop2: 'Choose file',
       drop3: '',
-      hint: 'Recommended: JPG/PNG · Landscape (16:9)',
-      keep: '* Saved in your browser and will persist.',
+      hint: 'Recommended: JPG/PNG · portrait tablet menu artwork',
+      keep: 'This step is only for Free Layout. Templates use their own designed background.',
       logout: 'Log out',
       edit: 'Edit',
       changeBg: 'Background (All Pages)',
+      templateBgNotAvailable: 'Background editing is not available in template mode. Templates use their own designed background. Switch to Free Layout if you need a custom background.',
       introVideo: 'Change intro video',
       pageBg: 'Page Background',
       pinSettings: 'PIN Settings',
@@ -4167,7 +4411,7 @@ export default function MenuEditor() {
       newPin2: 'Confirm New PIN',
       change: 'Update',
       help: 'Tap the top-right corner 5 times or press & hold for 3 seconds to reveal the Edit button. (Auto hides in 5s)\n*Backup: Shift+E',
-      backToVideo: 'Back to Video',
+      backToVideo: 'Intro',
       editModePick: 'Choose edit mode',
       freeEdit: 'Edit with Free Layout',
       templateBadge: 'Template Mode: ',
@@ -4202,6 +4446,32 @@ export default function MenuEditor() {
   }[lang];
 
   const isOverlayOpen = pinModalOpen || settingsOpen || editModeModalOpen || pageBgModalOpen;
+
+  const notifyTemplateBackgroundLocked = useCallback(() => {
+    setShowEditorMenu(false);
+    setTemplateNotice(T.templateBgNotAvailable);
+    if (templateNoticeTimerRef.current) clearTimeout(templateNoticeTimerRef.current);
+    templateNoticeTimerRef.current = window.setTimeout(() => {
+      setTemplateNotice('');
+      templateNoticeTimerRef.current = null;
+    }, 3400);
+  }, [T.templateBgNotAvailable]);
+
+  const openPageBackgroundFromManage = useCallback(() => {
+    if (layout.mode === 'template') {
+      notifyTemplateBackgroundLocked();
+      return;
+    }
+    setPageBgModalOpen(true);
+  }, [layout.mode, notifyTemplateBackgroundLocked]);
+
+  const openAllPagesBackgroundFromManage = useCallback(() => {
+    if (layout.mode === 'template') {
+      notifyTemplateBackgroundLocked();
+      return;
+    }
+    openFilePicker();
+  }, [layout.mode, notifyTemplateBackgroundLocked, openFilePicker]);
 
   const handleToolsVisibleChange = (visible) => {
     setToolsVisible(!!visible);
@@ -4287,10 +4557,13 @@ export default function MenuEditor() {
   // ✅ 보기모드 스케일: 손님용 메뉴 화면은 세로 화면을 채우되 crop 없이 높이는 맞춤
   const viewScaleY = useMemo(() => {
     const viewportHeight = Math.max(320, Number(vh) || PAGE_HEIGHT);
-    const fitByHeight = Math.max(0.01, (viewportHeight - VIEW_GUTTER_Y * 2) / PAGE_HEIGHT);
+    const verticalGutter = layout.mode === 'template' && !edit && !preview
+      ? TEMPLATE_VIEW_GUTTER_Y
+      : VIEW_GUTTER_Y;
+    const fitByHeight = Math.max(0.01, (viewportHeight - verticalGutter * 2) / PAGE_HEIGHT);
 
     return Math.max(MIN_VIEW_SCALE, fitByHeight);
-  }, [vh]);
+  }, [edit, layout.mode, preview, vh]);
 
   const viewScaleX = useMemo(() => {
     const viewportWidth = Math.max(320, Number(vw) || PAGE_WIDTH);
@@ -4318,7 +4591,7 @@ export default function MenuEditor() {
     if (isWideDesktop) {
       const reservedSideSpace = editSidePanelOpen ? 620 : 260;
       const fitByWorkspaceWidth = Math.max(0.5, (viewportWidth - reservedSideSpace) / PAGE_WIDTH);
-      const comfortableHeight = Math.max(0.5, (viewportHeight - 180) / PAGE_HEIGHT);
+      const comfortableHeight = Math.max(0.5, viewportHeight / PAGE_HEIGHT);
       return Math.min(0.72, Math.max(comfortableHeight, fitByWorkspaceWidth));
     }
 
@@ -4567,6 +4840,7 @@ export default function MenuEditor() {
 
   // ✅✅ 배경 렌더: 페이지별 오버라이드가 있으면 그거, 없으면 default(bgUrl)
   const renderBgPages = () => {
+    if (layout?.mode === 'template') return null;
     if (!bgUrl) return null;
 
     const pagesForBg = pageTurnEnabled ? totalPages : totalPages; // 동일, 구조만 명시
@@ -4600,6 +4874,7 @@ export default function MenuEditor() {
   };
 
   const renderBgPage = (pageNum, top = 0) => {
+    if (layout?.mode === 'template') return null;
     const useUrl = getPageBgUrl(pageNum);
     if (!useUrl) return null;
 
@@ -4681,7 +4956,10 @@ export default function MenuEditor() {
             editing={edit}
             uiMode={preview ? 'preview' : edit ? 'edit' : 'view'}
             panelOpen={tplPanelOpen}
-            onTogglePanel={(open) => setTplPanelOpen(open)}
+            onTogglePanel={(open) => {
+              setTplPanelOpen(open);
+              if (!open) setShowEditorMenu(false);
+            }}
             directTouchEdit
             pageHeight={PAGE_HEIGHT}
             pageGap={PAGE_GAP}
@@ -4939,40 +5217,14 @@ export default function MenuEditor() {
             <div style={{ display: 'grid', gap: 12 }}>
               <TemplatePicker
                 lang={lang}
-                onPick={async (fullId) => {
-                  setEditModeModalOpen(false);
-                  await applyPairedTemplate(fullId);
-                  setEdit(true);
-                  setPreview(false);
-                  setTplPanelOpen(true);
-                  setToolsVisible(false);
-                  setShowEditorMenu(false);
-                  setPageIndex(1);
-                  setTimeout(() => hardResetScrollTop('auto'), 0);
-                }}
+                onPick={startTemplateOnboarding}
               />
 
               <div style={{ height: 12 }} />
 
               <button
                 style={styles.primaryBtn}
-                onClick={() => {
-                  const next = { ...layout, mode: 'custom', templateId: null, templateData: null };
-                  const currentLang = lang === 'ko' ? 'ko' : 'en';
-                  const draftMap = templateDraftLayoutsRef.current instanceof Map
-                    ? templateDraftLayoutsRef.current
-                    : new Map();
-                  draftMap.set(currentLang, normalizeLoadedLayout(next));
-                  templateDraftLayoutsRef.current = draftMap;
-                  setLayout(next);
-                  setEditModeModalOpen(false);
-                  setEdit(true);
-                  setPreview(false);
-                  setToolsVisible(false);
-                  setShowEditorMenu(false);
-                  setPageIndex(1);
-                  setTimeout(() => hardResetScrollTop('auto'), 0);
-                }}
+                onClick={startFreeLayoutOnboarding}
               >
                 {T.freeEdit}
               </button>
@@ -5003,7 +5255,7 @@ export default function MenuEditor() {
           width: '100%',
           height: '100%',
           display: 'flex',
-          alignItems: 'center',
+          alignItems: 'stretch',
           justifyContent: 'center',
           scrollSnapAlign: 'center',
           scrollSnapStop: 'always',
@@ -5111,7 +5363,7 @@ export default function MenuEditor() {
           scrollSnapAlign: 'center',
           scrollSnapStop: 'always',
           minHeight: '100%',
-          padding: isWideEditViewport ? '84px 24px 110px' : 0,
+          padding: 0,
           boxSizing: 'border-box',
         }}
       >
@@ -5205,7 +5457,7 @@ export default function MenuEditor() {
       >
         {Array.from({ length: totalPages }).map((_, index) => {
           const pageNum = index + 1;
-          const shouldRenderContent = pageNum === pageIndex;
+          const shouldRenderContent = layout.mode === 'template' || pageNum === pageIndex;
 
           return renderEditPageSegment(pageNum, shouldRenderContent);
         })}
@@ -5243,6 +5495,11 @@ export default function MenuEditor() {
               </div>
             ) : (
               <div style={langRowStyle}>
+                <a href="/intro" style={styles.backBtn} onClick={goIntro} aria-label={T.backToVideo} title={T.backToVideo}>
+                  <span style={styles.backBtnIcon} aria-hidden="true">
+                    <span style={styles.backBtnTriangle} />
+                  </span>
+                </a>
                 <button
                   style={{ ...langBtnStyle, ...(lang === 'en' ? langBtnActiveStyle : {}), ...(switchingLang ? styles.langBtnDisabled : {}) }}
                   onClick={() => setLanguage('en')}
@@ -5312,15 +5569,6 @@ export default function MenuEditor() {
           />
         )}
 
-        {!isOverlayOpen && !edit && (
-          <a href="/intro" style={styles.backBtn} onClick={goIntro}>
-            <span style={styles.backBtnIcon} aria-hidden="true">
-              <span style={styles.backBtnTriangle} />
-            </span>
-            <span>{T.backToVideo}</span>
-          </a>
-        )}
-
         {editPageTurnEnabled && !isOverlayOpen && !toolsVisible && (
           <div style={styles.editorMenuBar} onMouseDown={(e) => e.stopPropagation()}>
             <button
@@ -5350,7 +5598,7 @@ export default function MenuEditor() {
               {T.changeMode}
             </button>
 
-            <button style={styles.menuBtn} onClick={() => setPageBgModalOpen(true)}>
+            <button style={styles.menuBtn} onClick={openPageBackgroundFromManage}>
               {T.pageBg}
             </button>
 
@@ -5369,7 +5617,7 @@ export default function MenuEditor() {
               {T.pinSettings}
             </button>
 
-            <button style={styles.menuBtn} onClick={openFilePicker}>
+            <button style={styles.menuBtn} onClick={openAllPagesBackgroundFromManage}>
               {T.changeBg}
             </button>
 
@@ -5473,27 +5721,52 @@ export default function MenuEditor() {
   };
 
   const hasRenderableMenu = isUsableMenuLayout(layout);
+  const initialLayoutImageCount = hasRenderableMenu ? getAllLayoutImageUrls(layout).length : 0;
+  const initialMediaHydrated = hasRenderableMenu && !layoutNeedsMediaHydration(layout);
+  const initialLayoutImagesReady =
+    initialLayoutImageCount === 0 ||
+    initialMediaHydrated ||
+    (visualsReadySignal >= 0 && visualsReadyLangsRef.current.has(lang));
+  const initialCustomBackgroundReady =
+    !hasRenderableMenu ||
+    layout?.mode !== 'custom' ||
+    (bgResolved && (!bgUrl || bgAssetsReady));
+  const initialMenuReadyToDisplay =
+    hasRenderableMenu &&
+    initialMediaHydrated &&
+    initialCustomBackgroundReady &&
+    initialLayoutImagesReady;
   const initialLoadResolved =
     !loading &&
-    (hasRenderableMenu || bgResolved || readyBundleLookup.checked);
+    (!hasRenderableMenu || initialMenuReadyToDisplay);
   const isInitialLoading = !hasInitialView && !initialLoadResolved;
+  const showInitialTemplatePicker = !hasRenderableMenu && !freeLayoutOnboarding && (!loading || onboardingRequested);
+  const showFreeLayoutBackgroundSetup = freeLayoutOnboarding || (bgResolved && !bgUrl && !hasRenderableMenu);
 
   return (
     <div style={styles.container}>
-      {isInitialLoading ? (
-        <div style={styles.loadingScreen} aria-label="loading-screen">
-          <div style={styles.loadingText}>{lang === 'ko' ? '메뉴 준비 중...' : 'Preparing menu...'}</div>
+      {showInitialTemplatePicker ? (
+        <div style={styles.setupWrap}>
+          <div style={{ ...styles.setupCard, ...styles.onboardingCard }}>
+            <TemplatePicker lang={lang} onPick={startTemplateOnboarding} />
+            <button style={{ ...styles.primaryBtn, ...styles.onboardingFreeButton }} onClick={startFreeLayoutOnboarding}>
+              {T.freeEdit}
+            </button>
+          </div>
         </div>
-      ) : bgResolved && !bgUrl && !hasRenderableMenu ? (
+      ) : showFreeLayoutBackgroundSetup ? (
         <div style={styles.setupWrap}>
           <div style={styles.setupCard}>
-            <div style={styles.title}>{T.pickBgTitle}</div>
-            <div style={styles.desc}>
-              {T.pickBgDesc1}
-              <b>{T.pickBgDesc2}</b>
-              {T.pickBgDesc3}
-              <br />
-              {T.pickBgDesc4}
+            <div style={styles.setupHeader}>
+              <div style={styles.setupEyebrow}>{T.freeEdit}</div>
+              <div style={styles.title}>{T.pickBgTitle}</div>
+              <div style={styles.desc}>
+                {T.pickBgDesc1}
+                <b>{T.pickBgDesc2}</b>
+                {T.pickBgDesc3}
+                <br />
+                {T.pickBgDesc4}
+              </div>
             </div>
 
             <div
@@ -5508,7 +5781,7 @@ export default function MenuEditor() {
               role="button"
               tabIndex={0}
             >
-              <div style={styles.dropIcon}>🖼️</div>
+              <div style={styles.dropIcon}>BG</div>
               <div style={styles.dropText}>
                 {T.drop1}
                 <br />
@@ -5526,13 +5799,7 @@ export default function MenuEditor() {
             />
 
             {assetUploadMessage && (
-              <div
-                style={{
-                  marginTop: 10,
-                  fontSize: 13,
-                  color: assetUploading ? '#7dd3fc' : '#e5e7eb',
-                }}
-              >
+              <div style={{ ...styles.setupUploadMessage, ...(assetUploading ? styles.setupUploadMessageBusy : {}) }}>
                 {assetUploadMessage}
               </div>
             )}
@@ -5650,7 +5917,7 @@ export default function MenuEditor() {
                     {T.changeMode}
                   </button>
 
-                  <button style={styles.menuBtn} onClick={() => setPageBgModalOpen(true)}>
+                  <button style={styles.menuBtn} onClick={openPageBackgroundFromManage}>
                     {T.pageBg}
                   </button>
 
@@ -5669,7 +5936,7 @@ export default function MenuEditor() {
                     {T.pinSettings}
                   </button>
 
-                  <button style={styles.menuBtn} onClick={openFilePicker}>
+                  <button style={styles.menuBtn} onClick={openAllPagesBackgroundFromManage}>
                     {T.changeBg}
                   </button>
 
@@ -5761,26 +6028,29 @@ export default function MenuEditor() {
                     setShowEditorMenu(false);
                   }}
                 >
-                <TemplateCanvas
-                  lang={lang}
-                  editing={edit}
-                  uiMode={preview ? 'preview' : edit ? 'edit' : 'view'}
-                  panelOpen={tplPanelOpen}
-                  onTogglePanel={(open) => setTplPanelOpen(open)}
-                  directTouchEdit
-                  pageHeight={PAGE_HEIGHT}
-                  pageGap={PAGE_GAP}
-                  fullScrollHeight={fullScrollHeight}
-                  templateId={layout.templateId}
-                  data={layout.templateData}
-                  onChange={(nextData) => {
-                    const next = { ...layout, mode: 'template', templateData: nextData };
-                    updateTemplateDraftLayout(next);
-                  }}
-                  onCancel={(items) => {
-                    handleCancelEdit();
-                  }}
-                />
+                  <TemplateCanvas
+                    lang={lang}
+                    editing={edit}
+                    uiMode={preview ? 'preview' : edit ? 'edit' : 'view'}
+                    panelOpen={tplPanelOpen}
+                    onTogglePanel={(open) => {
+                      setTplPanelOpen(open);
+                      if (!open) setShowEditorMenu(false);
+                    }}
+                    directTouchEdit
+                    pageHeight={PAGE_HEIGHT}
+                    pageGap={PAGE_GAP}
+                    fullScrollHeight={fullScrollHeight}
+                    templateId={layout.templateId}
+                    data={layout.templateData}
+                    onChange={(nextData) => {
+                      const next = { ...layout, mode: 'template', templateData: nextData };
+                      updateTemplateDraftLayout(next);
+                    }}
+                    onCancel={(items) => {
+                      handleCancelEdit();
+                    }}
+                  />
                 </div>
               )}
 
@@ -5850,38 +6120,14 @@ export default function MenuEditor() {
                   <div style={{ ...styles.modal, ...styles.templateModal }} onClick={(e) => e.stopPropagation()}>
                     <TemplatePicker
                       lang={lang}
-                      onPick={async (fullId) => {
-                        await applyPairedTemplate(fullId);
-                        setEdit(true);
-                        setPreview(false);
-                        setTplPanelOpen(true);
-                        setToolsVisible(false);
-                        setShowEditorMenu(false);
-                        setPageIndex(1);
-                        setTimeout(() => hardResetScrollTop('auto'), 0);
-                      }}
+                      onPick={startTemplateOnboarding}
                     />
 
                     <div style={{ height: 12 }} />
 
                     <button
                       style={styles.primaryBtn}
-                      onClick={() => {
-                        const next = { ...layout, mode: 'custom', templateId: null, templateData: null };
-                        const currentLang = lang === 'ko' ? 'ko' : 'en';
-                        const draftMap = templateDraftLayoutsRef.current instanceof Map
-                          ? templateDraftLayoutsRef.current
-                          : new Map();
-                        draftMap.set(currentLang, normalizeLoadedLayout(next));
-                        templateDraftLayoutsRef.current = draftMap;
-                        setLayout(next);
-                        setEdit(true);
-                        setPreview(false);
-                        setToolsVisible(false);
-                        setShowEditorMenu(false);
-                        setPageIndex(1);
-                        setTimeout(() => hardResetScrollTop('auto'), 0);
-                      }}
+                      onClick={startFreeLayoutOnboarding}
                     >
                       {T.freeEdit}
                     </button>
@@ -5923,6 +6169,11 @@ export default function MenuEditor() {
         </div>
       )}
       {!isInitialLoading && renderFloatingUi()}
+      {!isInitialLoading && templateNotice && (
+        <div style={styles.templateNotice} role="status">
+          {templateNotice}
+        </div>
+      )}
       {!isInitialLoading && renderModals()}
     </div>
   );
@@ -6672,37 +6923,105 @@ const styles = {
     height: '100%',
     display: 'grid',
     placeItems: 'center',
-    padding: 24,
+    padding: 18,
     boxSizing: 'border-box',
+    overflow: 'hidden',
+    background: 'linear-gradient(145deg, #071014, #111827 58%, #0f172a)',
   },
   setupCard: {
-    width: 'min(720px, 92vw)',
-    background: '#fff',
-    borderRadius: 18,
+    width: 'min(760px, calc(100vw - 36px))',
+    maxHeight: 'calc(100dvh - 36px)',
+    background: 'linear-gradient(145deg, rgba(255,255,255,0.98), rgba(240,253,250,0.94))',
+    border: '1px solid rgba(255,255,255,0.72)',
+    borderRadius: 26,
     padding: 22,
-    boxShadow: '0 10px 30px rgba(0,0,0,0.25)',
+    boxSizing: 'border-box',
+    boxShadow: '0 26px 80px rgba(0,0,0,0.38)',
+    overflow: 'hidden',
   },
-  title: { fontSize: 22, fontWeight: 900, marginBottom: 8 },
-  desc: { fontSize: 14, lineHeight: 1.45, opacity: 0.85, marginBottom: 16 },
+  onboardingCard: {
+    width: 'min(1080px, calc(100vw - 36px))',
+    maxHeight: 'calc(100dvh - 36px)',
+    padding: 16,
+    overflow: 'hidden',
+  },
+  onboardingFreeButton: {
+    minHeight: 44,
+    padding: '10px 14px',
+    borderRadius: 12,
+    fontSize: 14,
+  },
+  setupHeader: {
+    display: 'grid',
+    gap: 7,
+    marginBottom: 16,
+  },
+  setupEyebrow: {
+    color: '#0f766e',
+    fontSize: 12,
+    fontWeight: 1000,
+    textTransform: 'uppercase',
+    letterSpacing: 0,
+  },
+  title: { fontSize: 26, lineHeight: 1.05, fontWeight: 1000, marginBottom: 0, color: '#0f172a' },
+  desc: { fontSize: 14, lineHeight: 1.45, opacity: 0.85, marginBottom: 0, color: '#334155', fontWeight: 750 },
 
   dropZone: {
-    border: '2px dashed #bbb',
-    borderRadius: 16,
-    padding: 20,
+    border: '2px dashed rgba(15,118,110,0.30)',
+    borderRadius: 22,
+    padding: 22,
     textAlign: 'center',
     cursor: 'pointer',
     userSelect: 'none',
     transition: 'all 0.15s ease',
+    background: 'linear-gradient(145deg, rgba(15,118,110,0.08), rgba(15,23,42,0.04))',
+    display: 'grid',
+    gap: 9,
+    placeItems: 'center',
   },
   dropZoneActive: {
-    borderColor: '#222',
-    background: 'rgba(0,0,0,0.04)',
+    borderColor: 'rgba(15,118,110,0.92)',
+    background: 'linear-gradient(145deg, rgba(20,184,166,0.16), rgba(15,118,110,0.08))',
+    transform: 'translateY(-1px)',
   },
-  dropIcon: { fontSize: 42, marginBottom: 6 },
-  dropText: { fontSize: 15, lineHeight: 1.45 },
-  linkLike: { textDecoration: 'underline', fontWeight: 900 },
-  hint: { marginTop: 10, fontSize: 12, opacity: 0.65 },
-  smallNote: { marginTop: 12, fontSize: 12, opacity: 0.7 },
+  dropIcon: {
+    width: 68,
+    height: 68,
+    borderRadius: 20,
+    background: '#0f766e',
+    color: '#fff',
+    display: 'grid',
+    placeItems: 'center',
+    fontSize: 15,
+    fontWeight: 1000,
+    boxShadow: '0 18px 34px rgba(15,118,110,0.28)',
+  },
+  dropText: { fontSize: 18, lineHeight: 1.35, fontWeight: 950, color: '#0f172a' },
+  linkLike: {
+    display: 'inline-flex',
+    marginTop: 6,
+    minHeight: 38,
+    padding: '0 18px',
+    borderRadius: 999,
+    alignItems: 'center',
+    justifyContent: 'center',
+    background: '#0f766e',
+    color: '#fff',
+    fontWeight: 950,
+    textDecoration: 'none',
+  },
+  hint: { marginTop: 0, fontSize: 12, opacity: 0.72, color: '#475569', fontWeight: 800 },
+  setupUploadMessage: {
+    marginTop: 10,
+    fontSize: 13,
+    fontWeight: 850,
+    color: '#0f766e',
+    textAlign: 'center',
+  },
+  setupUploadMessageBusy: {
+    color: '#0369a1',
+  },
+  smallNote: { marginTop: 12, fontSize: 12, opacity: 0.76, color: '#475569', fontWeight: 800, textAlign: 'center' },
 
   stage: {
     position: 'relative',
@@ -6757,7 +7076,7 @@ const styles = {
     position: 'relative',
     width: '100%',
     height: '100%',
-    borderRadius: 24,
+    borderRadius: 0,
     overflow: 'hidden',
     background: 'transparent',
     willChange: 'box-shadow',
@@ -6777,23 +7096,23 @@ const styles = {
     zIndex: 2,
     overflow: 'hidden',
     width: '100%',
-    borderRadius: 24,
+    borderRadius: 0,
   },
 
   editPageFrame: {
     position: 'relative',
     flex: '0 0 auto',
     overflow: 'hidden',
-    borderRadius: 18,
+    borderRadius: 0,
     background: '#000',
-    boxShadow: '0 22px 54px rgba(0,0,0,0.38)',
-    outline: '1px solid rgba(255,255,255,0.12)',
+    boxShadow: 'none',
+    outline: 'none',
   },
 
   editPageMask: {
     position: 'relative',
     overflow: 'hidden',
-    borderRadius: 18,
+    borderRadius: 0,
     background: '#000',
   },
 
@@ -6926,6 +7245,26 @@ const styles = {
     fontWeight: 900,
     boxShadow: '0 10px 22px rgba(0,0,0,0.26)',
     backdropFilter: 'blur(8px)',
+  },
+
+  templateNotice: {
+    position: 'fixed',
+    left: '50%',
+    top: 'calc(env(safe-area-inset-top, 0px) + 18px)',
+    transform: 'translateX(-50%)',
+    zIndex: 100000,
+    width: 'min(620px, calc(100vw - 28px))',
+    padding: '13px 18px',
+    borderRadius: 16,
+    background: 'rgba(15,23,42,0.94)',
+    border: '1px solid rgba(255,255,255,0.18)',
+    color: '#fff',
+    fontSize: 14,
+    lineHeight: 1.35,
+    fontWeight: 850,
+    textAlign: 'center',
+    boxShadow: '0 18px 42px rgba(0,0,0,0.32)',
+    backdropFilter: 'blur(12px)',
   },
 
   editorMenuBar: {
@@ -7140,33 +7479,28 @@ const styles = {
   },
 
   backBtn: {
-    position: 'fixed',
-    left: 'calc(env(safe-area-inset-left, 0px) + 18px)',
-    bottom: 'calc(env(safe-area-inset-bottom, 0px) + 148px)',
-    minWidth: 136,
-    height: 44,
-    padding: '0 16px 0 10px',
+    width: 34,
+    minWidth: 34,
+    height: 34,
+    padding: 0,
     borderRadius: 999,
-    border: '1px solid rgba(255,255,255,0.18)',
+    border: '1px solid rgba(255,255,255,0.22)',
     cursor: 'pointer',
-    fontWeight: 900,
-    zIndex: 2200,
-    background: 'rgba(12,18,32,0.68)',
+    fontWeight: 950,
+    background: 'rgba(255,255,255,0.10)',
     color: '#fff',
     display: 'flex',
     alignItems: 'center',
     justifyContent: 'center',
-    gap: 10,
+    gap: 0,
     textDecoration: 'none',
-    boxShadow: '0 16px 34px rgba(0,0,0,0.30)',
-    backdropFilter: 'blur(14px)',
-    WebkitBackdropFilter: 'blur(14px)',
+    boxShadow: 'none',
     letterSpacing: 0,
   },
 
   backBtnIcon: {
-    width: 30,
-    height: 30,
+    width: 24,
+    height: 24,
     borderRadius: 999,
     background: 'rgba(255,255,255,0.92)',
     display: 'grid',
@@ -7177,10 +7511,10 @@ const styles = {
   backBtnTriangle: {
     width: 0,
     height: 0,
-    borderTop: '6px solid transparent',
-    borderBottom: '6px solid transparent',
-    borderLeft: '10px solid #0f172a',
-    marginLeft: 3,
+    borderTop: '4px solid transparent',
+    borderBottom: '4px solid transparent',
+    borderLeft: '7px solid #0f172a',
+    marginLeft: 2,
   },
 
   badge: {

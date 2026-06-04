@@ -266,8 +266,10 @@ export default function LoginPage() {
     let alive = true;
     setIsAuthResetting(true);
 
-    supabase.auth
-      .signOut()
+    Promise.race([
+      supabase.auth.signOut().catch(() => {}),
+      new Promise((resolve) => window.setTimeout(resolve, 900)),
+    ])
       .catch(() => {})
       .finally(() => {
         if (!alive) return;
@@ -438,7 +440,16 @@ export default function LoginPage() {
         return;
       }
 
-      if (data?.user?.id) setCurrentUser(data.user.id);
+      if (data?.user?.id) {
+        await Promise.all([
+          clearUserLocalCache(data.user.id),
+          clearMenuReadyBundles(),
+        ]);
+        setCurrentUser(data.user.id);
+        try {
+          localStorage.setItem(accountCacheIsolationKey(data.user.id), 'done');
+        } catch {}
+      }
 
       setSignUpMessage(translate('signupSuccess'));
       setSignUpMessageKey('signupSuccess');
@@ -549,7 +560,6 @@ export default function LoginPage() {
       }
 
       const user = data?.session?.user;
-      if (user?.id) setCurrentUser(user.id);
 
       // ✅ 기존 계정 안전장치 (verify 단계에서 바로 차단)
       const createdAt = user?.created_at ? Date.parse(user.created_at) : 0;
@@ -564,6 +574,17 @@ export default function LoginPage() {
         await supabase.auth.signOut().catch(() => {});
         clearCurrentUser();
         return;
+      }
+
+      if (user?.id) {
+        await Promise.all([
+          clearUserLocalCache(user.id),
+          clearMenuReadyBundles(),
+        ]);
+        setCurrentUser(user.id);
+        try {
+          localStorage.setItem(accountCacheIsolationKey(user.id), 'done');
+        } catch {}
       }
 
       setOtpState((prev) => ({ ...prev, verifying: false, verified: true }));
