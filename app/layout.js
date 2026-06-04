@@ -1,3 +1,5 @@
+import RouteTransitionLayer from '@/components/RouteTransitionLayer';
+
 export const metadata = {
   title: "Menu Board App",
   description: "Digital Menu Board",
@@ -24,6 +26,7 @@ export default function RootLayout({ children }) {
         }}
       >
         {children}
+        <RouteTransitionLayer />
       </body>
     </html>
   );

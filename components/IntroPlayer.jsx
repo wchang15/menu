@@ -4,10 +4,11 @@ import { useCallback, useEffect, useRef, useState } from 'react';
 import { useRouter } from 'next/navigation';
 import { KEYS, loadLocalBlob, loadLocalJson, saveBlob, saveJson, syncBlobFromCloud, syncJsonFromCloud } from '@/lib/storage';
 import { getSignedAssetUrl } from '@/lib/cloudAssets';
-import { clearCurrentUser, setCurrentUser } from '@/lib/session';
+import { clearCurrentUser, getCurrentUser, setCurrentUser } from '@/lib/session';
 import { supabase } from '@/lib/supabaseClient';
 import * as layoutMedia from '@/lib/layoutMedia';
 import { readMenuReadyBundle, readMenuReadyBundleAsync, writeMenuReadyBundleAsync } from '@/lib/menuReadyBundle';
+import { startRouteTransition } from './RouteTransitionLayer';
 
 const LANG_KEY = 'APP_LANG_V1';
 const INTRO_ASSET_KEY = KEYS.INTRO_VIDEO;
@@ -20,8 +21,11 @@ const MENU_IMAGE_PRELOAD_TIMEOUT_MS = 10000;
 const MENU_IMAGE_PRELOAD_ATTEMPTS = 2;
 const MENU_IMAGE_PRELOAD_CONCURRENCY = 16;
 const MENU_WARMUP_MAX_WAIT_MS = 45000;
+const PREMIUM_TEMPLATE_IDS = new Set(['T1A', 'T2A', 'T3A']);
+const PAIRED_TEMPLATE_SYNC_KEY = 'MENU_PAIRED_TEMPLATE_SYNC_V1';
 const pendingMenuWarmups = new Map();
 const WINDOW_READY_VIEW_STORE = '__MENU_READY_VIEW_STORE_V1__';
+const WINDOW_INTRO_VIDEO_STORE = '__MENU_INTRO_VIDEO_STORE_V1__';
 const blobObjectUrlCache = typeof WeakMap !== 'undefined' ? new WeakMap() : null;
 const BLACK_POSTER = `data:image/svg+xml;charset=UTF-8,${encodeURIComponent(
   '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 2 2"><rect width="100%" height="100%" fill="black"/></svg>'
@@ -38,6 +42,40 @@ function getReusableBlobObjectUrl(blob) {
   const nextUrl = URL.createObjectURL(blob);
   blobObjectUrlCache.set(blob, nextUrl);
   return nextUrl;
+}
+
+function getWindowIntroVideoStore() {
+  if (typeof window === 'undefined') return null;
+  try {
+    if (!window[WINDOW_INTRO_VIDEO_STORE]) {
+      window[WINDOW_INTRO_VIDEO_STORE] = new Map();
+    }
+    return window[WINDOW_INTRO_VIDEO_STORE];
+  } catch {
+    return null;
+  }
+}
+
+function readWindowIntroVideo(userId) {
+  if (!userId) return null;
+  try {
+    const entry = getWindowIntroVideoStore()?.get?.(userId);
+    return entry?.url ? entry : null;
+  } catch {
+    return null;
+  }
+}
+
+function writeWindowIntroVideo(userId, patch) {
+  if (!userId || !patch) return;
+  try {
+    const store = getWindowIntroVideoStore();
+    if (!store) return;
+    const previous = store.get?.(userId) || {};
+    store.set?.(userId, { ...previous, ...patch, ts: Date.now() });
+  } catch {
+    // ignore intro handoff cache failures
+  }
 }
 
 function getLayoutImageUrls(layout) {
@@ -77,8 +115,9 @@ function hasBundleBackground(bundle) {
     Object.keys(bundle?.bgOverrideSignedUrls || {}).length > 0;
 }
 
-function menuBundleVisuallyReady(bundle) {
+function menuBundleVisuallyReady(bundle, userId = null) {
   if (!bundle?.layout || typeof bundle.layout !== 'object') return false;
+  if (layoutConflictsWithStoredTemplate(bundle.layout, userId)) return false;
   if (!layoutMediaRenderable(bundle.layout)) return false;
   if (!imagePreloadStatsComplete(bundle.layout, bundle.imagePreloadStats)) return false;
   if (bundle.layout.mode === 'custom' && !hasBundleBackground(bundle)) return false;
@@ -89,7 +128,40 @@ function isUsableMenuLayout(layout) {
   return layout?.mode === 'custom' || layout?.mode === 'template';
 }
 
+function isPremiumTemplateId(templateId) {
+  return PREMIUM_TEMPLATE_IDS.has(String(templateId || ''));
+}
+
+function getLayoutPremiumTemplateId(layout) {
+  const styleKey = String(layout?.templateData?.style?.templateKey || '');
+  const layoutKey = String(layout?.templateId || '');
+  if (isPremiumTemplateId(styleKey)) return styleKey;
+  if (isPremiumTemplateId(layoutKey)) return layoutKey;
+  return null;
+}
+
+function readStoredPairedTemplateId(userId) {
+  if (!userId || typeof window === 'undefined') return null;
+  try {
+    const raw = window.localStorage.getItem(`${PAIRED_TEMPLATE_SYNC_KEY}__${userId}`);
+    if (!raw) return null;
+    const parsed = JSON.parse(raw);
+    return isPremiumTemplateId(parsed?.templateId) ? String(parsed.templateId) : null;
+  } catch {
+    return null;
+  }
+}
+
+function layoutConflictsWithStoredTemplate(layout, userId) {
+  const storedTemplateId = readStoredPairedTemplateId(userId);
+  if (!storedTemplateId) return false;
+  if (!isUsableMenuLayout(layout)) return false;
+  if (layout.mode !== 'template') return true;
+  return getLayoutPremiumTemplateId(layout) !== storedTemplateId;
+}
+
 function hasWindowReadyMenu(language, userId) {
+  if (!userId) return false;
   if (typeof window === 'undefined') return false;
   try {
     const store = window[WINDOW_READY_VIEW_STORE];
@@ -99,6 +171,12 @@ function hasWindowReadyMenu(language, userId) {
     if (!(exact?.layout?.mode === 'custom' || exact?.layout?.mode === 'template')) return false;
     if (!layoutMediaRenderable(exact.layout)) return false;
     if (exact.layout.mode === 'custom' && !hasBundleBackground(exact)) return false;
+    if (layoutConflictsWithStoredTemplate(exact.layout, userId)) {
+      try {
+        store?.delete?.(`${userId}:${safeLang}`);
+      } catch {}
+      return false;
+    }
     return true;
   } catch {
     return false;
@@ -116,10 +194,12 @@ function writeWindowReadyMenu({
   bgSignedUrl = null,
   bgOverrideSignedUrls = {},
 }) {
+  if (!userId) return;
   if (typeof window === 'undefined') return;
   if (!(layout?.mode === 'custom' || layout?.mode === 'template')) return;
   if (!layoutMediaRenderable(layout)) return;
   if (layout.mode === 'custom' && !hasBundleBackground({ bgBlob, bgOverrides, bgSignedUrl, bgOverrideSignedUrls })) return;
+  if (layoutConflictsWithStoredTemplate(layout, userId)) return;
 
   try {
     if (!window[WINDOW_READY_VIEW_STORE]) {
@@ -241,6 +321,16 @@ function withTimeout(promise, timeoutMs, fallback = null) {
   ]);
 }
 
+function waitForRouteCurtain() {
+  return new Promise((resolve) => {
+    if (typeof window === 'undefined') {
+      resolve();
+      return;
+    }
+    window.setTimeout(resolve, 70);
+  });
+}
+
 async function preloadImageUrls(urls, timeoutMs = MENU_IMAGE_PRELOAD_TIMEOUT_MS) {
   const uniqueUrls = Array.from(new Set((urls || []).filter(Boolean)));
   if (!uniqueUrls.length || typeof window === 'undefined') {
@@ -288,17 +378,33 @@ async function preloadImageUrlsUntilReady(urls, timeoutMs = MENU_IMAGE_PRELOAD_T
   };
 }
 
-export default function IntroPlayer() {
+export default function IntroPlayer({ navigateToMenu = null } = {}) {
   const router = useRouter();
   const videoRef = useRef(null);
   const introUploadInputRef = useRef(null);
+  const initialIntroUserIdRef = useRef(null);
+  if (initialIntroUserIdRef.current === null) {
+    try {
+      initialIntroUserIdRef.current = getCurrentUser() || '';
+    } catch {
+      initialIntroUserIdRef.current = '';
+    }
+  }
+  const initialIntroCacheRef = useRef(undefined);
+  if (initialIntroCacheRef.current === undefined) {
+    initialIntroCacheRef.current = readWindowIntroVideo(initialIntroUserIdRef.current) || null;
+  }
+  const initialIntroCache = initialIntroCacheRef.current;
+  const posterCapturedRef = useRef(!!initialIntroCache?.posterUrl);
 
   const [videoBlob, setVideoBlob] = useState(null);
-  const [videoUrl, setVideoUrl] = useState(null);
-  const [videoVisible, setVideoVisible] = useState(false);
+  const [videoUrl, setVideoUrl] = useState(() => initialIntroCache?.url || null);
+  const [videoPoster, setVideoPoster] = useState(() => initialIntroCache?.posterUrl || BLACK_POSTER);
+  const [videoVisible, setVideoVisible] = useState(() => !!initialIntroCache?.posterUrl);
   const [muted, setMuted] = useState(true);
-  const [loading, setLoading] = useState(true);
-  const [introResolved, setIntroResolved] = useState(false);
+  const [loading, setLoading] = useState(false);
+  const [introResolved, setIntroResolved] = useState(true);
+  const [introLookupPending, setIntroLookupPending] = useState(() => !initialIntroCache?.url);
   const [introUploading, setIntroUploading] = useState(false);
   const [introUploadMessage, setIntroUploadMessage] = useState('');
   const [introDragOver, setIntroDragOver] = useState(false);
@@ -345,6 +451,15 @@ export default function IntroPlayer() {
       if (alive) {
         setUserId(uid);
         setUserReady(true);
+        const cachedIntro = readWindowIntroVideo(uid);
+        if (cachedIntro?.url) {
+          setIntroLookupPending(false);
+          setVideoUrl(cachedIntro.url);
+          setVideoPoster(cachedIntro.posterUrl || BLACK_POSTER);
+          setVideoVisible(!!cachedIntro.posterUrl);
+          setIntroResolved(true);
+          setLoading(false);
+        }
       }
     };
 
@@ -403,21 +518,36 @@ export default function IntroPlayer() {
     let cancelled = false;
 
     (async () => {
-      setIntroResolved(false);
-      setVideoBlob(null);
-      setVideoUrl(null);
-      setVideoVisible(false);
+      setIntroLookupPending(true);
+      const cachedIntro = readWindowIntroVideo(userId);
+      if (cachedIntro?.url) {
+        setIntroLookupPending(false);
+        setVideoUrl(cachedIntro.url);
+        setVideoPoster(cachedIntro.posterUrl || BLACK_POSTER);
+        setVideoVisible(!!cachedIntro.posterUrl);
+        setIntroResolved(true);
+        setLoading(false);
+      } else {
+        setIntroResolved(true);
+        setVideoBlob(null);
+        setVideoUrl(null);
+        setVideoPoster(BLACK_POSTER);
+        setVideoVisible(false);
+      }
       let localBlob = null;
-      let hasPlayableVideo = false;
+      let hasPlayableVideo = !!cachedIntro?.url;
 
-      try {
-        localBlob = await loadLocalBlob(KEYS.INTRO_VIDEO);
-        if (!cancelled && localBlob) {
-          setVideoBlob(localBlob);
-          hasPlayableVideo = true;
+      if (!hasPlayableVideo) {
+        try {
+          localBlob = await loadLocalBlob(KEYS.INTRO_VIDEO);
+          if (!cancelled && localBlob) {
+            setIntroLookupPending(false);
+            setVideoBlob(localBlob);
+            hasPlayableVideo = true;
+          }
+        } catch {
+          // ignore
         }
-      } catch {
-        // ignore
       }
 
       if (!hasPlayableVideo) {
@@ -429,7 +559,9 @@ export default function IntroPlayer() {
         }
 
         if (!cancelled && signedUrl) {
+          setIntroLookupPending(false);
           setVideoUrl(signedUrl);
+          writeWindowIntroVideo(userId, { url: signedUrl, posterUrl: cachedIntro?.posterUrl || null });
           hasPlayableVideo = true;
         }
       }
@@ -440,6 +572,7 @@ export default function IntroPlayer() {
       }
 
       if (hasPlayableVideo) {
+        if (!cancelled) setIntroLookupPending(false);
         return;
       }
 
@@ -452,8 +585,10 @@ export default function IntroPlayer() {
         const syncedBlob = syncResult?.data || null;
 
         if (!cancelled && syncedBlob && !hasPlayableVideo) {
+          setIntroLookupPending(false);
           setVideoBlob(syncedBlob);
           setVideoUrl(null);
+          setVideoPoster(BLACK_POSTER);
           setIntroResolved(true);
         }
       } catch {
@@ -462,6 +597,7 @@ export default function IntroPlayer() {
         if (!cancelled) {
           setIntroResolved(true);
           setLoading(false);
+          setIntroLookupPending(false);
         }
       }
     })();
@@ -479,17 +615,17 @@ export default function IntroPlayer() {
       const readyBundle =
         readMenuReadyBundle(language, effectiveUserId) ||
         await withTimeout(readMenuReadyBundleAsync(language, effectiveUserId), 500, null);
-      if (menuBundleVisuallyReady(readyBundle)) return true;
+      if (menuBundleVisuallyReady(readyBundle, effectiveUserId)) return true;
     }
 
     for (const language of languages) {
       const localLayout = await withTimeout(loadLocalJson(menuLayoutKey(language)), 700, null);
-      if (isUsableMenuLayout(localLayout)) return true;
+      if (isUsableMenuLayout(localLayout) && !layoutConflictsWithStoredTemplate(localLayout, effectiveUserId)) return true;
     }
 
     for (const language of languages) {
       const remoteLayout = await withTimeout(syncJsonFromCloud(menuLayoutKey(language)), 1800, null);
-      if (isUsableMenuLayout(remoteLayout?.data)) return true;
+      if (isUsableMenuLayout(remoteLayout?.data) && !layoutConflictsWithStoredTemplate(remoteLayout.data, effectiveUserId)) return true;
     }
 
     return false;
@@ -529,7 +665,7 @@ export default function IntroPlayer() {
         })
       );
 
-      if (languages.every((language) => menuBundleVisuallyReady(cachedBundles[language]))) {
+      if (languages.every((language) => menuBundleVisuallyReady(cachedBundles[language], effectiveUserId))) {
         return cachedBundles[preferredLang];
       }
 
@@ -549,7 +685,7 @@ export default function IntroPlayer() {
       );
 
       const warmLanguage = async (targetLang) => {
-        if (menuBundleVisuallyReady(cachedBundles[targetLang])) return cachedBundles[targetLang];
+        if (menuBundleVisuallyReady(cachedBundles[targetLang], effectiveUserId)) return cachedBundles[targetLang];
 
         const fallbackLang = fallbackLanguageFor(targetLang);
         let rawLayout = rawLayouts[targetLang];
@@ -688,7 +824,10 @@ export default function IntroPlayer() {
     setIntroUploading(true);
     setIntroUploadMessage(T.introUploading);
     setVideoVisible(false);
+    setIntroLookupPending(false);
     setVideoUrl(null);
+    setVideoPoster(BLACK_POSTER);
+    posterCapturedRef.current = false;
     setVideoBlob(file);
     setIntroResolved(true);
     setLoading(false);
@@ -707,13 +846,19 @@ export default function IntroPlayer() {
   useEffect(() => {
     if (!videoBlob) return;
 
-    const url = URL.createObjectURL(videoBlob);
+    const url = getReusableBlobObjectUrl(videoBlob);
     setVideoUrl(url);
+    if (url) {
+      writeWindowIntroVideo(userId, {
+        url,
+        posterUrl: videoPoster !== BLACK_POSTER ? videoPoster : null,
+      });
+    }
 
     return () => {
-      URL.revokeObjectURL(url);
+      // Keep the object URL alive for smooth route handoff back to intro.
     };
-  }, [videoBlob]);
+  }, [userId, videoBlob, videoPoster]);
 
   const playIntroVideo = useCallback(async () => {
     const v = videoRef.current;
@@ -733,7 +878,14 @@ export default function IntroPlayer() {
   useEffect(() => {
     if (!videoUrl) return;
 
-    setVideoVisible(false);
+    const cachedIntro = readWindowIntroVideo(userId);
+    const hasCachedVisual = cachedIntro?.url === videoUrl && !!cachedIntro?.posterUrl;
+    if (hasCachedVisual) {
+      setVideoPoster(cachedIntro.posterUrl);
+      setVideoVisible(true);
+    } else {
+      setVideoVisible(false);
+    }
 
     let cancelled = false;
     const timers = [0, 120, 600, 1500].map((delay) => window.setTimeout(() => {
@@ -765,12 +917,33 @@ export default function IntroPlayer() {
   const goMenu = async (event) => {
     event?.preventDefault();
     if (menuLoading) return;
-    setMenuLoading(true);
+    let loadingTimer = null;
+    const showLoadingIfSlow = () => {
+      loadingTimer = window.setTimeout(() => setMenuLoading(true), 180);
+    };
+    const clearLoadingTimer = () => {
+      if (loadingTimer) {
+        window.clearTimeout(loadingTimer);
+        loadingTimer = null;
+      }
+    };
+    showLoadingIfSlow();
 
     try {
       let effectiveUserId = userId;
       if (!effectiveUserId) {
-        const sessionResult = await withTimeout(supabase.auth.getSession(), 8000, null);
+        try {
+          effectiveUserId = getCurrentUser() || null;
+        } catch {
+          effectiveUserId = null;
+        }
+        if (effectiveUserId) {
+          setUserId(effectiveUserId);
+          setUserReady(true);
+        }
+      }
+      if (!effectiveUserId) {
+        const sessionResult = await withTimeout(supabase.auth.getSession(), 1200, null);
         effectiveUserId = sessionResult?.data?.session?.user?.id || null;
         if (effectiveUserId) {
           setCurrentUser(effectiveUserId);
@@ -780,16 +953,51 @@ export default function IntroPlayer() {
       }
 
       if (!effectiveUserId) {
+        clearLoadingTimer();
         router.replace('/login');
         return;
       }
 
+      const isIntroSetupOnly = introResolved && !videoUrl;
+      if (isIntroSetupOnly) {
+        const quickExistingLayout = await withTimeout(loadLocalJson(menuLayoutKey(lang)), 250, null);
+        const hasQuickExistingMenu =
+          hasWindowReadyMenu(lang, effectiveUserId) ||
+          menuBundleVisuallyReady(readMenuReadyBundle(lang, effectiveUserId), effectiveUserId) ||
+          (
+            isUsableMenuLayout(quickExistingLayout) &&
+            !layoutConflictsWithStoredTemplate(quickExistingLayout, effectiveUserId)
+          );
+
+        if (!hasQuickExistingMenu) {
+          clearLoadingTimer();
+          if (typeof navigateToMenu === 'function') {
+            navigateToMenu('/menu?onboarding=1');
+            return;
+          }
+          startRouteTransition();
+          await waitForRouteCurtain();
+          router.push('/menu?onboarding=1');
+          window.setTimeout(() => {
+            if (window.location.pathname !== '/menu') window.location.assign('/menu?onboarding=1');
+          }, 500);
+          return;
+        }
+      }
+
       const hasExistingMenu =
         hasWindowReadyMenu(lang, effectiveUserId) ||
-        menuBundleVisuallyReady(readMenuReadyBundle(lang, effectiveUserId)) ||
+        menuBundleVisuallyReady(readMenuReadyBundle(lang, effectiveUserId), effectiveUserId) ||
         await hasStoredMenuLayout(lang, effectiveUserId);
 
       if (!hasExistingMenu) {
+        clearLoadingTimer();
+        if (typeof navigateToMenu === 'function') {
+          navigateToMenu('/menu?onboarding=1');
+          return;
+        }
+        startRouteTransition();
+        await waitForRouteCurtain();
         router.push('/menu?onboarding=1');
         window.setTimeout(() => {
           if (window.location.pathname !== '/menu') window.location.assign('/menu?onboarding=1');
@@ -811,9 +1019,16 @@ export default function IntroPlayer() {
 
       const readyToOpen =
         hasWindowReadyMenu(lang, effectiveUserId) ||
-        menuBundleVisuallyReady(readMenuReadyBundle(lang, effectiveUserId));
+        menuBundleVisuallyReady(readMenuReadyBundle(lang, effectiveUserId), effectiveUserId);
 
       if (!readyToOpen) {
+        clearLoadingTimer();
+        if (typeof navigateToMenu === 'function') {
+          navigateToMenu('/menu?onboarding=1');
+          return;
+        }
+        startRouteTransition();
+        await waitForRouteCurtain();
         router.push('/menu?onboarding=1');
         window.setTimeout(() => {
           if (window.location.pathname !== '/menu') window.location.assign('/menu?onboarding=1');
@@ -821,12 +1036,20 @@ export default function IntroPlayer() {
         return;
       }
 
+      clearLoadingTimer();
+      if (typeof navigateToMenu === 'function') {
+        navigateToMenu('/menu');
+        return;
+      }
+      startRouteTransition();
+      await waitForRouteCurtain();
       router.push('/menu');
       window.setTimeout(() => {
         if (window.location.pathname !== '/menu') window.location.assign('/menu');
       }, 500);
     } catch (error) {
       console.error('Go to menu failed', error);
+      clearLoadingTimer();
       setMenuLoading(false);
     }
   };
@@ -872,6 +1095,21 @@ export default function IntroPlayer() {
     if (!v) return;
     if (v.readyState >= 2) {
       setVideoVisible(true);
+      if (!posterCapturedRef.current && v.videoWidth > 0 && v.videoHeight > 0) {
+        posterCapturedRef.current = true;
+        try {
+          const canvas = document.createElement('canvas');
+          canvas.width = Math.min(720, v.videoWidth);
+          canvas.height = Math.max(1, Math.round((canvas.width / v.videoWidth) * v.videoHeight));
+          const ctx = canvas.getContext('2d');
+          ctx?.drawImage(v, 0, 0, canvas.width, canvas.height);
+          const posterUrl = canvas.toDataURL('image/jpeg', 0.74);
+          setVideoPoster(posterUrl);
+          writeWindowIntroVideo(userId, { url: videoUrl, posterUrl });
+        } catch {
+          writeWindowIntroVideo(userId, { url: videoUrl, posterUrl: null });
+        }
+      }
     }
   };
 
@@ -905,7 +1143,7 @@ export default function IntroPlayer() {
 
       {(
         <>
-          {introResolved && !videoUrl && (
+          {introResolved && !introLookupPending && !videoUrl && (
             <div style={styles.emptyIntroCard}>
               <div style={styles.emptyIntroContent}>
                 <div>
@@ -978,7 +1216,7 @@ export default function IntroPlayer() {
               ref={videoRef}
               key={videoUrl}
               src={videoUrl}
-              poster={BLACK_POSTER}
+              poster={videoPoster || BLACK_POSTER}
               autoPlay
               muted={muted}
               playsInline
@@ -1002,13 +1240,11 @@ export default function IntroPlayer() {
             />
           )}
 
-          {videoUrl && (
+          {videoUrl && videoVisible && (
           <div style={styles.actionRow}>
-            {videoUrl && (
-              <button onClick={toggleSound} style={styles.soundBtn}>
-                {muted ? T.soundOn : T.soundOff}
-              </button>
-            )}
+            <button onClick={toggleSound} style={styles.soundBtn}>
+              {muted ? T.soundOn : T.soundOff}
+            </button>
             <a
               href="/menu"
               onClick={goMenu}

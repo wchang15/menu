@@ -1,5 +1,6 @@
 'use client';
-import IntroPlayer from '@/components/IntroPlayer';
+import MenuIntroShell from '@/components/MenuIntroShell';
+
 export default function IntroPage() {
-  return <IntroPlayer />;
+  return <MenuIntroShell initialView="intro" />;
 }

@@ -31,6 +31,7 @@ export default function TemplateCanvas({
   onTogglePanel,
   viewPageNumber = null,
   directTouchEdit = false,
+  directEditCloseSignal = 0,
 }) {
   const isPreview = uiMode === 'preview';
   const isEdit = !!editing && !isPreview;
@@ -80,6 +81,10 @@ export default function TemplateCanvas({
   useEffect(() => {
     setActiveTarget(null);
   }, [templateId]);
+
+  useEffect(() => {
+    setActiveTarget(null);
+  }, [directEditCloseSignal]);
 
   useEffect(() => {
     setPortalHost(document.body);

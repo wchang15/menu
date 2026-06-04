@@ -266,21 +266,27 @@ export default function LoginPage() {
     let alive = true;
     setIsAuthResetting(true);
 
-    Promise.race([
-      supabase.auth.signOut().catch(() => {}),
-      new Promise((resolve) => window.setTimeout(resolve, 900)),
-    ])
+    let finished = false;
+    const finishReset = () => {
+      if (!alive || finished) return;
+      finished = true;
+      clearCurrentUser();
+      resetAllFields();
+      setActiveView('login');
+      setIsAuthResetting(false);
+    };
+
+    const fallbackTimer = window.setTimeout(finishReset, 900);
+    Promise.resolve(supabase.auth.signOut())
       .catch(() => {})
       .finally(() => {
-        if (!alive) return;
-        clearCurrentUser();
-        resetAllFields();
-        setActiveView('login');
-        setIsAuthResetting(false);
+        window.clearTimeout(fallbackTimer);
+        finishReset();
       });
 
     return () => {
       alive = false;
+      window.clearTimeout(fallbackTimer);
     };
   }, [resetAllFields]);
 

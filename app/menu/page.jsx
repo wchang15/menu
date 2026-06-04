@@ -1,5 +1,6 @@
 'use client';
-import MenuEditor from '@/components/MenuEditor';
+import MenuIntroShell from '@/components/MenuIntroShell';
+
 export default function MenuPage() {
-  return <MenuEditor />;
+  return <MenuIntroShell initialView="menu" />;
 }

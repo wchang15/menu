@@ -23,6 +23,7 @@ import {
   readMenuReadyBundleAsync,
   writeMenuReadyBundleAsync,
 } from '@/lib/menuReadyBundle';
+import { startRouteTransition } from './RouteTransitionLayer';
 import CustomCanvas from './CustomCanvas';
 import TemplateCanvas from './TemplateCanvas';
 
@@ -31,6 +32,7 @@ const menuLayoutKey = (language) => `${KEYS.MENU_LAYOUT}_${language || 'en'}`;
 const PREMIUM_TEMPLATE_IDS = new Set(['T1A', 'T2A', 'T3A']);
 const isPremiumTemplateId = (templateId) => PREMIUM_TEMPLATE_IDS.has(String(templateId || ''));
 const PAIRED_TEMPLATE_SYNC_KEY = 'MENU_PAIRED_TEMPLATE_SYNC_V1';
+const WINDOW_INTRO_VIDEO_STORE = '__MENU_INTRO_VIDEO_STORE_V1__';
 
 // ✅ 옵션들
 const SECRET_TAPS = 5;
@@ -56,6 +58,57 @@ function getReusableBlobObjectUrl(blob) {
   const nextUrl = URL.createObjectURL(blob);
   blobObjectUrlCache.set(blob, nextUrl);
   return nextUrl;
+}
+
+function getWindowIntroVideoStore() {
+  if (typeof window === 'undefined') return null;
+  try {
+    if (!window[WINDOW_INTRO_VIDEO_STORE]) {
+      window[WINDOW_INTRO_VIDEO_STORE] = new Map();
+    }
+    return window[WINDOW_INTRO_VIDEO_STORE];
+  } catch {
+    return null;
+  }
+}
+
+function readWindowIntroVideo(userId) {
+  if (!userId) return null;
+  try {
+    const entry = getWindowIntroVideoStore()?.get?.(userId);
+    return entry?.url ? entry : null;
+  } catch {
+    return null;
+  }
+}
+
+function writeWindowIntroVideo(userId, patch) {
+  if (!userId || !patch) return;
+  try {
+    const store = getWindowIntroVideoStore();
+    if (!store) return;
+    const previous = store.get?.(userId) || {};
+    store.set?.(userId, { ...previous, ...patch, ts: Date.now() });
+  } catch {
+    // ignore intro handoff cache failures
+  }
+}
+
+async function warmIntroVideoForRoute(userId) {
+  if (!userId || readWindowIntroVideo(userId)?.url) return;
+  const blob = await withTimeout(loadLocalBlob(KEYS.INTRO_VIDEO), 1000, null);
+  const url = getReusableBlobObjectUrl(blob);
+  if (url) writeWindowIntroVideo(userId, { url });
+}
+
+function waitForRouteCurtain() {
+  return new Promise((resolve) => {
+    if (typeof window === 'undefined') {
+      resolve();
+      return;
+    }
+    window.setTimeout(resolve, 70);
+  });
 }
 
 function getPreparedBackgroundUrl(source) {
@@ -245,6 +298,36 @@ function readyViewKey(language, userId) {
   return `${userId || 'user'}:${language === 'ko' ? 'ko' : 'en'}`;
 }
 
+function getLayoutPremiumTemplateId(value) {
+  const styleKey = String(value?.templateData?.style?.templateKey || '');
+  const layoutKey = String(value?.templateId || '');
+  if (isPremiumTemplateId(styleKey)) return styleKey;
+  if (isPremiumTemplateId(layoutKey)) return layoutKey;
+  return null;
+}
+
+function readStoredPairedTemplateId(userId) {
+  if (!userId) return null;
+  if (typeof window === 'undefined') return null;
+  try {
+    const userScopedKey = `${PAIRED_TEMPLATE_SYNC_KEY}__${userId}`;
+    const raw = window.localStorage.getItem(userScopedKey);
+    if (!raw) return null;
+    const parsed = JSON.parse(raw);
+    return isPremiumTemplateId(parsed?.templateId) ? String(parsed.templateId) : null;
+  } catch {
+    return null;
+  }
+}
+
+function layoutConflictsWithStoredTemplate(value, userId) {
+  const storedTemplateId = readStoredPairedTemplateId(userId);
+  if (!storedTemplateId) return false;
+  if (!isUsableMenuLayout(value)) return false;
+  if (value.mode !== 'template') return true;
+  return getLayoutPremiumTemplateId(value) !== storedTemplateId;
+}
+
 function getWindowReadyViewStore() {
   if (typeof window === 'undefined') return null;
   try {
@@ -258,12 +341,19 @@ function getWindowReadyViewStore() {
 }
 
 function readWindowReadyView(language, userId) {
+  if (!userId) return null;
   const store = getWindowReadyViewStore();
   if (!store) return null;
   const key = readyViewKey(language, userId);
   const exact = store.get?.(key);
   if (exact?.userId && exact.userId !== userId) return null;
-  if (layoutMatchesLanguage(exact?.layout, language) && !layoutNeedsMediaHydration(exact?.layout)) return exact;
+  if (
+    layoutMatchesLanguage(exact?.layout, language) &&
+    !layoutNeedsMediaHydration(exact?.layout) &&
+    !layoutConflictsWithStoredTemplate(exact?.layout, userId)
+  ) {
+    return exact;
+  }
   try {
     store.delete?.(key);
   } catch {}
@@ -307,8 +397,10 @@ function writeWindowReadyView({
   bgSignedUrl = null,
   bgOverrideSignedUrls = {},
 }) {
+  if (!userId) return;
   if (!layoutMatchesLanguage(layout, language)) return;
   if (layoutNeedsMediaHydration(layout)) return;
+  if (layoutConflictsWithStoredTemplate(layout, userId)) return;
   const store = getWindowReadyViewStore();
   if (!store) return;
   const safeLang = language === 'ko' ? 'ko' : 'en';
@@ -928,7 +1020,7 @@ function getTemplateCards(lang) {
       id: 'T1A',
       group: ko ? 'Template A' : 'Template A',
       name: ko ? '프리미엄 스테이크하우스' : 'Premium Steakhouse',
-      desc: ko ? '다크 호텔 레스토랑 무드, 대형 스테이크 사진, 골드 포인트, 와인/디저트까지 한 화면에 보이는 태블릿 메뉴판' : 'Dark hotel dining mood with large steak photography, gold accents, wine, dessert, and QR ordering guidance.',
+      desc: ko ? '대형 스테이크 사진, 골드 포인트, QR 주문 영역을 갖춘 다크 메뉴판' : 'Large steak photos, gold accents, and a polished QR order area.',
       tags: ko ? ['다크', '골드', '스테이크'] : ['Dark', 'Gold', 'Steak'],
       accent: '#d7b46a',
       tone: '#080604',
@@ -937,7 +1029,7 @@ function getTemplateCards(lang) {
       id: 'T2A',
       group: ko ? 'Template B' : 'Template B',
       name: ko ? '현대적인 한식 레스토랑' : 'Modern Korean Restaurant',
-      desc: ko ? '밝은 우드톤, 감성적인 미니멀 구성, 한식 사진 콜라주와 큼직한 메뉴 리스트가 결합된 메뉴판' : 'Warm wood tone, minimal editorial layout, Korean food collage, clear menu columns, and QR ordering guidance.',
+      desc: ko ? '밝은 우드톤, 한식 사진, 큼직한 메뉴 리스트가 어우러진 메뉴판' : 'Warm wood tone, Korean food photos, and clear menu sections.',
       tags: ko ? ['우드톤', '한식', '미니멀'] : ['Wood', 'Korean', 'Minimal'],
       accent: '#7a4b25',
       tone: '#efe3cf',
@@ -946,7 +1038,7 @@ function getTemplateCards(lang) {
       id: 'T3A',
       group: ko ? 'Template C' : 'Template C',
       name: ko ? '트렌디 아시안 퓨전' : 'Trendy Asian Fusion',
-      desc: ko ? '강한 비주얼, 네온 포인트, 스시/라멘/이자카야 메뉴를 SNS 감성으로 보여주는 프리미엄 메뉴판' : 'Bold visual-first Asian fusion menu with neon accents, sushi, ramen, izakaya plates, drinks, and QR ordering guidance.',
+      desc: ko ? '네온 포인트와 강한 음식 비주얼이 돋보이는 아시안 퓨전 메뉴판' : 'Neon accents and bold food visuals for Asian fusion dining.',
       tags: ko ? ['퓨전', '네온', '비주얼'] : ['Fusion', 'Neon', 'Visual'],
       accent: '#ff3d9a',
       tone: '#080816',
@@ -1055,15 +1147,29 @@ function TemplatePreview({ card }) {
 function TemplatePicker({ onPick, lang }) {
   const ko = lang === 'ko';
   const cards = getTemplateCards(lang);
+  const featurePills = ko
+    ? ['3페이지 완성본', 'QR 주문 영역 포함', '텍스트·사진 직접 수정']
+    : ['3-page finished set', 'QR order area included', 'Tap text/photos to edit'];
 
   return (
     <div style={tp.wrap}>
       <div style={tp.top}>
         <div>
-          <div style={tp.kicker}>{ko ? '레스토랑 바로 사용 템플릿' : 'Ready-to-use restaurant templates'}</div>
-          <div style={tp.title}>{ko ? '로고, 사진, 메뉴명, 가격만 바꾸면 됩니다' : 'Replace logo, photos, menu names, and prices'}</div>
+          <div style={tp.kicker}>{ko ? '템플릿 선택' : 'Template Library'}</div>
+          <div style={tp.title}>{ko ? '매장에 맞는 메뉴판 스타일을 고르세요' : 'Choose a menu board style for this restaurant'}</div>
+          <div style={tp.subtitle}>
+            {ko
+              ? '고른 뒤에는 메뉴판 위 로고, 사진, 메뉴명, 가격을 손으로 눌러 바로 수정할 수 있습니다.'
+              : 'After choosing, merchants can tap the logo, photos, menu names, and prices directly on the board.'}
+          </div>
         </div>
-        <div style={tp.count}>{ko ? `${cards.length}개 · 각 3페이지 세트` : `${cards.length} templates · 3 pages each`}</div>
+        <div style={tp.count}>{ko ? `${cards.length}개 스타일` : `${cards.length} styles`}</div>
+      </div>
+
+      <div style={tp.featureRow}>
+        {featurePills.map((pill) => (
+          <span key={pill} style={tp.featurePill}>{pill}</span>
+        ))}
       </div>
 
       <div style={tp.grid}>
@@ -1092,8 +1198,8 @@ function TemplatePicker({ onPick, lang }) {
 
       <div style={tp.note}>
         {ko
-          ? '상인은 템플릿을 고른 뒤 메뉴판 위의 로고, 글자, 가격, 사진을 손으로 눌러 바로 바꾸면 됩니다.'
-          : 'After choosing a template, merchants can tap the logo, text, prices, and photos directly on the board to edit them.'}
+          ? '자유 배치는 배경부터 직접 만드는 방식이고, 템플릿은 완성된 3페이지 메뉴판을 고른 뒤 필요한 부분만 바꾸는 방식입니다.'
+          : 'Free Layout starts from a custom background. Templates start from a finished 3-page menu board and let you edit only what you need.'}
       </div>
     </div>
   );
@@ -1108,55 +1214,91 @@ const tp = {
     display: 'flex',
     justifyContent: 'space-between',
     alignItems: 'flex-start',
-    gap: 16,
+    gap: 12,
+    padding: 12,
+    borderRadius: 16,
+    background: 'linear-gradient(135deg, #08111f, #102436 58%, #0f766e)',
+    color: '#f8fafc',
+    boxShadow: '0 16px 38px rgba(15,23,42,0.22)',
   },
   kicker: {
-    fontSize: 13,
+    fontSize: 12,
     fontWeight: 950,
-    color: '#0f766e',
-    letterSpacing: 0.4,
+    color: '#99f6e4',
+    letterSpacing: 0,
     textTransform: 'uppercase',
   },
   title: {
-    marginTop: 3,
-    fontSize: 19,
+    marginTop: 4,
+    fontSize: 18,
     fontWeight: 1000,
-    color: '#111827',
-    lineHeight: 1.15,
+    color: '#ffffff',
+    lineHeight: 1.08,
+  },
+  subtitle: {
+    marginTop: 6,
+    maxWidth: 620,
+    fontSize: 11,
+    lineHeight: 1.25,
+    color: 'rgba(248,250,252,0.78)',
+    fontWeight: 750,
   },
   count: {
-    padding: '8px 10px',
+    padding: '7px 10px',
     borderRadius: 999,
-    background: '#f1f5f9',
-    color: '#334155',
+    background: 'rgba(255,255,255,0.13)',
+    border: '1px solid rgba(255,255,255,0.22)',
+    color: '#ffffff',
     fontWeight: 900,
-    fontSize: 12,
+    fontSize: 11,
     whiteSpace: 'nowrap',
+  },
+  featureRow: {
+    display: 'flex',
+    flexWrap: 'wrap',
+    gap: 7,
+  },
+  featurePill: {
+    minHeight: 26,
+    display: 'inline-flex',
+    alignItems: 'center',
+    borderRadius: 999,
+    padding: '4px 9px',
+    background: '#ecfeff',
+    border: '1px solid #bae6fd',
+    color: '#155e75',
+    fontWeight: 950,
+    fontSize: 11.5,
   },
   grid: {
     display: 'grid',
     gridTemplateColumns: 'repeat(3, minmax(0, 1fr))',
-    gap: 10,
+    gap: 12,
+    alignItems: 'stretch',
   },
   card: {
     appearance: 'none',
-    border: '1px solid #e5e7eb',
+    border: '1px solid rgba(148,163,184,0.24)',
     background: '#fff',
-    borderRadius: 12,
+    borderRadius: 18,
     padding: 0,
     overflow: 'hidden',
     cursor: 'pointer',
     textAlign: 'left',
     color: '#111827',
-    boxShadow: '0 8px 20px rgba(15,23,42,0.08)',
+    boxShadow: '0 14px 32px rgba(15,23,42,0.12)',
+    transition: 'transform 0.14s ease, box-shadow 0.14s ease, border-color 0.14s ease',
+    display: 'grid',
+    gridTemplateRows: '88px 1fr',
+    minHeight: 0,
   },
   preview: {
     position: 'relative',
-    height: 132,
-    padding: 9,
+    height: 88,
+    padding: 8,
     boxSizing: 'border-box',
     display: 'grid',
-    gap: 7,
+    gap: 5,
     overflow: 'hidden',
   },
   previewAccentGlow: {
@@ -1247,14 +1389,14 @@ const tp = {
   },
   previewRows: {
     display: 'grid',
-    gap: 5,
+    gap: 4,
   },
   previewLine: {
     display: 'grid',
     gridTemplateColumns: '1fr 40px',
     gap: 10,
     alignItems: 'center',
-    padding: '5px 7px',
+    padding: '4px 7px',
     borderRadius: 8,
     background: 'rgba(255,255,255,0.10)',
     border: '1px solid rgba(255,255,255,0.12)',
@@ -1270,13 +1412,13 @@ const tp = {
   },
   previewPhotoBlocks: {
     display: 'grid',
-    gap: 5,
+    gap: 4,
   },
   previewPhotoBlock: {
     display: 'grid',
     gap: 5,
     alignItems: 'center',
-    padding: 5,
+    padding: 4,
     borderRadius: 9,
     background: 'rgba(255,255,255,0.10)',
     border: '1px solid rgba(255,255,255,0.12)',
@@ -1311,12 +1453,12 @@ const tp = {
   previewGrid: {
     display: 'grid',
     gridTemplateColumns: 'repeat(2, 1fr)',
-    gap: 5,
+    gap: 4,
   },
   previewTile: {
     minHeight: 32,
     borderRadius: 9,
-    padding: 6,
+    padding: 5,
     display: 'grid',
     alignContent: 'space-between',
     gap: 5,
@@ -1352,9 +1494,11 @@ const tp = {
     borderRadius: 999,
   },
   cardBody: {
-    padding: 10,
+    padding: 9,
     display: 'grid',
-    gap: 6,
+    gap: 5,
+    alignContent: 'start',
+    minHeight: 0,
   },
   cardTop: {
     display: 'flex',
@@ -1377,18 +1521,17 @@ const tp = {
     padding: '3px 7px',
   },
   name: {
-    fontSize: 15,
+    fontSize: 14.5,
     fontWeight: 1000,
     lineHeight: 1.15,
   },
   desc: {
-    minHeight: 0,
-    maxHeight: 34,
-    overflow: 'hidden',
+    minHeight: 28,
+    overflow: 'visible',
     color: '#475569',
-    fontSize: 11,
+    fontSize: 10,
     fontWeight: 750,
-    lineHeight: 1.35,
+    lineHeight: 1.25,
   },
   tags: {
     display: 'flex',
@@ -1405,22 +1548,23 @@ const tp = {
     padding: '3px 6px',
   },
   choose: {
-    marginTop: 2,
-    borderRadius: 9,
+    marginTop: 4,
+    borderRadius: 12,
     padding: '7px 8px',
     textAlign: 'center',
     color: '#111827',
     fontWeight: 1000,
+    fontSize: 12.5,
   },
   note: {
     color: '#475569',
     fontWeight: 800,
-    fontSize: 12,
-    lineHeight: 1.4,
+    fontSize: 11.5,
+    lineHeight: 1.35,
   },
 };
 
-export default function MenuEditor() {
+export default function MenuEditor({ navigateToIntro = null } = {}) {
   const router = useRouter();
   const initialReadyViewRef = useRef(undefined);
   if (initialReadyViewRef.current === undefined) {
@@ -1455,10 +1599,18 @@ export default function MenuEditor() {
 
   const [showEditorMenu, setShowEditorMenu] = useState(false);
   const [toolsVisible, setToolsVisible] = useState(false);
+  const [templateDirectEditCloseSignal, setTemplateDirectEditCloseSignal] = useState(0);
   const [switchingLang, setSwitchingLang] = useState(null);
   const [templateNotice, setTemplateNotice] = useState('');
   const [freeLayoutOnboarding, setFreeLayoutOnboarding] = useState(false);
-  const [onboardingRequested, setOnboardingRequested] = useState(false);
+  const [onboardingRequested, setOnboardingRequested] = useState(() => {
+    if (typeof window === 'undefined') return false;
+    try {
+      return new URLSearchParams(window.location.search).get('onboarding') === '1';
+    } catch {
+      return false;
+    }
+  });
 
   const fileInputRef = useRef(null);
   const introVideoInputRef = useRef(null);
@@ -1474,6 +1626,7 @@ export default function MenuEditor() {
   ));
   const [assetUploading, setAssetUploading] = useState(false);
   const [assetUploadMessage, setAssetUploadMessage] = useState('');
+  const [savingEdit, setSavingEdit] = useState(false);
 
   const layoutSnapshotRef = useRef('');
   const bgSnapshotRef = useRef('');
@@ -1558,7 +1711,6 @@ export default function MenuEditor() {
       if (!alive) return;
       setUserId(uid);
       setUserReady(true);
-      setLoading(false);
     };
 
     const getSessionWithTimeout = (timeoutMs = 1200) =>
@@ -2938,7 +3090,7 @@ export default function MenuEditor() {
           }
         }
       } finally {
-        if (!cancelled) setLoading(false);
+        if (!cancelled && hasLocalLayout) setLoading(false);
       }
 
       const shouldRemoteSync =
@@ -3165,6 +3317,16 @@ export default function MenuEditor() {
   const setLanguage = async (nextLanguage) => {
     const next = nextLanguage === 'ko' ? 'ko' : 'en';
     if (switchingLang || next === lang) return;
+
+    if (!edit && !isUsableMenuLayout(layout)) {
+      setLang(next);
+      setPageIndex(1);
+      hardResetScrollTop('auto');
+      try {
+        localStorage.setItem(LANG_KEY, next);
+      } catch {}
+      return;
+    }
 
     if (edit) {
       const currentLang = lang === 'ko' ? 'ko' : 'en';
@@ -3714,8 +3876,23 @@ export default function MenuEditor() {
   };
 
   // ✅ 영상으로 돌아가기
-  const goIntro = (event) => {
+  const goIntro = async (event) => {
     event?.preventDefault();
+    if (savingEdit) return;
+
+    const currentLang = lang === 'ko' ? 'ko' : 'en';
+    if (isUsableMenuLayout(layout) && !layoutNeedsMediaHydration(layout)) {
+      rememberReadyLayout(currentLang, layout);
+      writeReadyLayoutBundle(currentLang, layout).catch(() => {});
+    }
+
+    await warmIntroVideoForRoute(userId).catch(() => {});
+    if (typeof navigateToIntro === 'function') {
+      navigateToIntro();
+      return;
+    }
+    startRouteTransition();
+    await waitForRouteCurtain();
     router.push('/intro');
     window.setTimeout(() => {
       if (window.location.pathname !== '/intro') window.location.assign('/intro');
@@ -4363,6 +4540,7 @@ export default function MenuEditor() {
 
       preview: '미리보기',
       save: '저장',
+      saving: '저장 중...',
       back: '뒤로가기',
 
       showTplPanel: '템플릿 입력 열기',
@@ -4426,6 +4604,7 @@ export default function MenuEditor() {
 
       preview: 'Preview',
       save: 'Save',
+      saving: 'Saving...',
       back: 'Back',
 
       showTplPanel: 'Show Template Input',
@@ -4478,12 +4657,29 @@ export default function MenuEditor() {
     if (visible) setShowEditorMenu(false);
   };
 
+  const closeTemplateDirectEdit = useCallback(() => {
+    setTemplateDirectEditCloseSignal((prev) => prev + 1);
+  }, []);
+
+  const toggleEditorMenu = useCallback(() => {
+    closeTemplateDirectEdit();
+    setShowEditorMenu((prev) => {
+      const next = !prev;
+      if (next) {
+        setToolsVisible(false);
+        setTplPanelOpen(false);
+      }
+      return next;
+    });
+  }, [closeTemplateDirectEdit]);
+
   useEffect(() => {
     if (!edit || preview || isOverlayOpen) {
       setShowEditorMenu(false);
       setToolsVisible(false);
+      closeTemplateDirectEdit();
     }
-  }, [edit, preview, isOverlayOpen]);
+  }, [edit, preview, isOverlayOpen, closeTemplateDirectEdit]);
 
   // ✅ 페이지 계산
   const computedPages = useMemo(() => {
@@ -4755,35 +4951,46 @@ export default function MenuEditor() {
   }, [pageIndex, edit, pageView, preview, editPageTurnEnabled]);
 
   const handleSaveAll = async () => {
-    const currentLang = lang === 'ko' ? 'ko' : 'en';
-    const draftMap = templateDraftLayoutsRef.current instanceof Map
-      ? templateDraftLayoutsRef.current
-      : new Map();
-    const pendingTemplateDraft = draftMap.get(currentLang);
-    const pendingTemplateId = getCanonicalTemplateId(pendingTemplateDraft);
-    const saveSource =
-      pendingTemplateDraft?.mode === 'template' && isPremiumTemplateId(pendingTemplateId)
-        ? pendingTemplateDraft
-        : layout;
-    const next = normalizeLoadedLayout({ ...saveSource });
-    setLayout(next);
-    await persistLayout(next);
-    editStartLayoutRef.current = null;
-    editStartLayoutsRef.current = new Map();
-    editStartLangRef.current = null;
-    editStartTemplateSyncRef.current = null;
-    templateDraftLayoutsRef.current = new Map();
+    if (savingEdit) return;
+    setSavingEdit(true);
 
-    setPreview(false);
-    setEdit(false);
-    setShowEditorMenu(false);
-    setToolsVisible(false);
-    hideEditButton();
-    setPageIndex(1);
-    setTimeout(() => hardResetScrollTop('auto'), 0);
+    try {
+      const currentLang = lang === 'ko' ? 'ko' : 'en';
+      const draftMap = templateDraftLayoutsRef.current instanceof Map
+        ? templateDraftLayoutsRef.current
+        : new Map();
+      const pendingTemplateDraft = draftMap.get(currentLang);
+      const pendingTemplateId = getCanonicalTemplateId(pendingTemplateDraft);
+      const saveSource =
+        pendingTemplateDraft?.mode === 'template' && isPremiumTemplateId(pendingTemplateId)
+          ? pendingTemplateDraft
+          : layout;
+      const next = normalizeLoadedLayout({ ...saveSource });
+      setLayout(next);
+      await persistLayout(next);
+      editStartLayoutRef.current = null;
+      editStartLayoutsRef.current = new Map();
+      editStartLangRef.current = null;
+      editStartTemplateSyncRef.current = null;
+      templateDraftLayoutsRef.current = new Map();
+
+      setPreview(false);
+      setEdit(false);
+      setShowEditorMenu(false);
+      setToolsVisible(false);
+      hideEditButton();
+      setPageIndex(1);
+      setTimeout(() => hardResetScrollTop('auto'), 0);
+    } catch (error) {
+      console.error('Save menu failed', error);
+      window.alert(lang === 'ko' ? '저장 중 문제가 발생했습니다.' : 'Saving failed.');
+    } finally {
+      setSavingEdit(false);
+    }
   };
 
-  const handleCancelEdit = async () => {
+  const handleCancelEdit = () => {
+    if (savingEdit) return;
     const previous = editStartLayoutRef.current;
     const previousSnapshots = editStartLayoutsRef.current instanceof Map
       ? editStartLayoutsRef.current
@@ -4798,12 +5005,10 @@ export default function MenuEditor() {
 
     const restoreEntries = Array.from(previousSnapshots.entries())
       .filter(([, snapshot]) => isUsableMenuLayout(snapshot));
-    await Promise.all(restoreEntries.map(async ([language, snapshot]) => {
+    restoreEntries.forEach(([language, snapshot]) => {
       const safeLang = language === 'ko' ? 'ko' : 'en';
-      const sanitized = sanitizeLayoutMediaSafe(snapshot);
       rememberLanguageView(safeLang, cacheOptionsForLayout(snapshot));
-      await saveJson(menuLayoutKey(safeLang), sanitized);
-    }));
+    });
 
     if (previousLang && previousLang !== lang) {
       setLang(previousLang);
@@ -4826,6 +5031,15 @@ export default function MenuEditor() {
     hideEditButton();
     setPageIndex(1);
     setTimeout(() => hardResetScrollTop('auto'), 0);
+
+    Promise.all(restoreEntries.map(async ([language, snapshot]) => {
+      const safeLang = language === 'ko' ? 'ko' : 'en';
+      const sanitized = sanitizeLayoutMediaSafe(snapshot);
+      await saveJson(menuLayoutKey(safeLang), sanitized);
+      await writeReadyLayoutBundle(safeLang, snapshot);
+    })).catch((error) => {
+      console.error('Cancel rollback persistence failed', error);
+    });
   };
 
   const handleExitPreview = () => {
@@ -4961,6 +5175,7 @@ export default function MenuEditor() {
               if (!open) setShowEditorMenu(false);
             }}
             directTouchEdit
+            directEditCloseSignal={templateDirectEditCloseSignal}
             pageHeight={PAGE_HEIGHT}
             pageGap={PAGE_GAP}
             fullScrollHeight={fullScrollHeight}
@@ -5220,18 +5435,21 @@ export default function MenuEditor() {
                 onPick={startTemplateOnboarding}
               />
 
-              <div style={{ height: 12 }} />
+              <div style={styles.templatePickerActions}>
+                <button
+                  style={{ ...styles.primaryBtn, ...styles.templatePickerActionButton }}
+                  onClick={startFreeLayoutOnboarding}
+                >
+                  {T.freeEdit}
+                </button>
 
-              <button
-                style={styles.primaryBtn}
-                onClick={startFreeLayoutOnboarding}
-              >
-                {T.freeEdit}
-              </button>
-
-              <button style={styles.secondaryBtn} onClick={() => setEditModeModalOpen(false)}>
-                {T.close}
-              </button>
+                <button
+                  style={{ ...styles.secondaryBtn, ...styles.templatePickerActionButton }}
+                  onClick={() => setEditModeModalOpen(false)}
+                >
+                  {T.close}
+                </button>
+              </div>
             </div>
           </div>
         </div>
@@ -5573,13 +5791,7 @@ export default function MenuEditor() {
           <div style={styles.editorMenuBar} onMouseDown={(e) => e.stopPropagation()}>
             <button
               style={styles.menuBtnDark}
-              onClick={() => {
-                setShowEditorMenu((prev) => {
-                  const next = !prev;
-                  if (next) setToolsVisible(false);
-                  return next;
-                });
-              }}
+              onClick={toggleEditorMenu}
             >
               {T.editorMenu}
             </button>
@@ -5672,10 +5884,18 @@ export default function MenuEditor() {
 
         {edit && !preview && layout.mode === 'template' && !isOverlayOpen && (
           <div style={styles.templateActionBar} onMouseDown={(e) => e.stopPropagation()}>
-            <button style={styles.menuBtnDark} onClick={handleSaveAll}>
-              {T.save}
+            <button
+              style={{ ...styles.menuBtnDark, ...(savingEdit ? styles.menuBtnDisabled : {}) }}
+              onClick={handleSaveAll}
+              disabled={savingEdit}
+            >
+              {savingEdit ? T.saving : T.save}
             </button>
-            <button style={styles.menuBtn} onClick={handleCancelEdit}>
+            <button
+              style={{ ...styles.menuBtn, ...(savingEdit ? styles.menuBtnDisabled : {}) }}
+              onClick={handleCancelEdit}
+              disabled={savingEdit}
+            >
               {T.cancel}
             </button>
           </div>
@@ -5739,9 +5959,13 @@ export default function MenuEditor() {
   const initialLoadResolved =
     !loading &&
     (!hasRenderableMenu || initialMenuReadyToDisplay);
-  const isInitialLoading = !hasInitialView && !initialLoadResolved;
+  const isInitialLoading = !onboardingRequested && !hasInitialView && !initialLoadResolved;
   const showInitialTemplatePicker = !hasRenderableMenu && !freeLayoutOnboarding && (!loading || onboardingRequested);
   const showFreeLayoutBackgroundSetup = freeLayoutOnboarding || (bgResolved && !bgUrl && !hasRenderableMenu);
+
+  if (isInitialLoading) {
+    return <div style={styles.container} />;
+  }
 
   return (
     <div style={styles.container}>
@@ -5891,13 +6115,7 @@ export default function MenuEditor() {
                 <div style={styles.editorMenuBar} onMouseDown={(e) => e.stopPropagation()}>
                   <button
                     style={styles.menuBtnDark}
-                    onClick={() => {
-                      setShowEditorMenu((prev) => {
-                        const next = !prev;
-                        if (next) setToolsVisible(false);
-                        return next;
-                      });
-                    }}
+                    onClick={toggleEditorMenu}
                   >
                     {T.editorMenu}
                   </button>
@@ -5993,8 +6211,12 @@ export default function MenuEditor() {
               {/* ✅ 미리보기 상단 바 */}
               {edit && preview && !isOverlayOpen && (
                 <div style={styles.previewBar} onMouseDown={(e) => e.stopPropagation()}>
-                  <button style={styles.menuBtnDark} onClick={handleSaveAll}>
-                    {T.save}
+                  <button
+                    style={{ ...styles.menuBtnDark, ...(savingEdit ? styles.menuBtnDisabled : {}) }}
+                    onClick={handleSaveAll}
+                    disabled={savingEdit}
+                  >
+                    {savingEdit ? T.saving : T.save}
                   </button>
                   <button style={styles.menuBtn} onClick={handleExitPreview}>
                     {T.back}
@@ -6038,6 +6260,7 @@ export default function MenuEditor() {
                       if (!open) setShowEditorMenu(false);
                     }}
                     directTouchEdit
+                    directEditCloseSignal={templateDirectEditCloseSignal}
                     pageHeight={PAGE_HEIGHT}
                     pageGap={PAGE_GAP}
                     fullScrollHeight={fullScrollHeight}
@@ -6123,27 +6346,27 @@ export default function MenuEditor() {
                       onPick={startTemplateOnboarding}
                     />
 
-                    <div style={{ height: 12 }} />
+                    <div style={styles.templatePickerActions}>
+                      <button
+                        style={{ ...styles.primaryBtn, ...styles.templatePickerActionButton }}
+                        onClick={startFreeLayoutOnboarding}
+                      >
+                        {T.freeEdit}
+                      </button>
 
-                    <button
-                      style={styles.primaryBtn}
-                      onClick={startFreeLayoutOnboarding}
-                    >
-                      {T.freeEdit}
-                    </button>
-
-                    <button
-                      style={styles.secondaryBtn}
-                      onClick={() => {
-                        setEdit(false);
-                        setPreview(false);
-                        hideEditButton();
-                        setPageIndex(1);
-                        setTimeout(() => hardResetScrollTop('auto'), 0);
-                      }}
-                    >
-                      {T.close}
-                    </button>
+                      <button
+                        style={{ ...styles.secondaryBtn, ...styles.templatePickerActionButton }}
+                        onClick={() => {
+                          setEdit(false);
+                          setPreview(false);
+                          hideEditButton();
+                          setPageIndex(1);
+                          setTimeout(() => hardResetScrollTop('auto'), 0);
+                        }}
+                      >
+                        {T.close}
+                      </button>
+                    </div>
                   </div>
                 </div>
               )}
@@ -6925,7 +7148,7 @@ const styles = {
     placeItems: 'center',
     padding: 18,
     boxSizing: 'border-box',
-    overflow: 'hidden',
+    overflow: 'auto',
     background: 'linear-gradient(145deg, #071014, #111827 58%, #0f172a)',
   },
   setupCard: {
@@ -6937,17 +7160,17 @@ const styles = {
     padding: 22,
     boxSizing: 'border-box',
     boxShadow: '0 26px 80px rgba(0,0,0,0.38)',
-    overflow: 'hidden',
+    overflow: 'auto',
   },
   onboardingCard: {
     width: 'min(1080px, calc(100vw - 36px))',
     maxHeight: 'calc(100dvh - 36px)',
     padding: 16,
-    overflow: 'hidden',
+    overflow: 'auto',
   },
   onboardingFreeButton: {
-    minHeight: 44,
-    padding: '10px 14px',
+    minHeight: 40,
+    padding: '9px 14px',
     borderRadius: 12,
     fontSize: 14,
   },
@@ -7348,6 +7571,11 @@ const styles = {
     whiteSpace: 'nowrap',
     boxShadow: '0 10px 26px rgba(0,0,0,0.18)',
   },
+  menuBtnDisabled: {
+    opacity: 0.68,
+    cursor: 'default',
+    pointerEvents: 'none',
+  },
 
   editBtn: {
     alignSelf: 'flex-end',
@@ -7575,10 +7803,22 @@ const styles = {
     width: 'min(1120px, calc(100vw - 48px))',
     maxHeight: 'calc(100dvh - 48px)',
     overflowY: 'auto',
-    padding: 24,
+    padding: 16,
     borderRadius: 18,
     boxShadow: '0 24px 80px rgba(0,0,0,0.30)',
     boxSizing: 'border-box',
+  },
+  templatePickerActions: {
+    display: 'grid',
+    gridTemplateColumns: 'minmax(0, 1fr) minmax(120px, 0.38fr)',
+    gap: 10,
+    alignItems: 'stretch',
+  },
+  templatePickerActionButton: {
+    minHeight: 40,
+    padding: '9px 12px',
+    borderRadius: 12,
+    fontSize: 14,
   },
 
   pinInput: {
