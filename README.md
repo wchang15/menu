@@ -1,5 +1,7 @@
 # Restaurant Tablet Menu Platform
 
+[![CI](https://github.com/wchang15/menu/actions/workflows/ci.yml/badge.svg)](https://github.com/wchang15/menu/actions/workflows/ci.yml)
+
 An authenticated bilingual menu-board application for restaurant tablets. The product lets staff build and publish portrait menus, upload private media, and play the finished experience inside an Android application.
 
 [Portfolio case study](https://woochangchang.com/restaurant-platform.html)
