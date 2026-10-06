@@ -99,6 +99,13 @@ npx cap sync android
 npx cap open android
 ```
 
+The October 2026 review updates Capacitor to 8.5.2. Rebuild and reinstall native
+apps after syncing: changing JavaScript dependencies does not patch an APK or iOS
+binary already on a device. CI verifies the web export, not native packages.
+
 ## Related System
 
-This repository covers the restaurant-facing tablet menu surface. Customer QR ordering, payment, staff fulfillment, and kitchen-print dispatch are maintained as a separate operational service and are documented in the portfolio case study.
+This repository covers the restaurant-facing tablet menu surface. Review the
+[TypeScript ordering companion](https://github.com/wchang15/restaurant-ordering-demo)
+for customer QR ordering, payment, staff fulfillment, kitchen-print dispatch, and
+its independent test suite. Both are internal-test demonstrations.
